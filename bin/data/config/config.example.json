@@ -1,0 +1,23 @@
+{
+  "cameras": [
+    {
+      "id": "north_dual",
+      "enabled": true,
+      "host": "192.168.178.230",
+      "user": "admin",
+      "password": "",
+      "stream": "full",
+      "fps": 0,
+      "preview": false,
+      "previewSize": "1280x720",
+      "quality": 60
+    },
+    {
+      "id": "west_brightness",
+      "enabled": false,
+      "host": "0.0.0.0",
+      "user": "admin",
+      "password": ""
+    }
+  ]
+}

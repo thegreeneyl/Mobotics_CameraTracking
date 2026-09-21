@@ -1,0 +1,8 @@
+# Local credentials — copy bin/data/config/config.example.json and fill in
+/bin/data/config/config.json
+
+# Build artifacts
+/obj/
+/bin/YOUniverse_CameraTracking.app/
+/bin/YOUniverse_CameraTrackingDebug.app/
+/bin/libs/
