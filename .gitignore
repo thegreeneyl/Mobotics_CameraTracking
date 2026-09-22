@@ -6,3 +6,6 @@
 /bin/YOUniverse_CameraTracking.app/
 /bin/YOUniverse_CameraTrackingDebug.app/
 /bin/libs/
+
+# Stream recordings (large .mjpeg dumps + sidecars)
+/bin/data/recordings/

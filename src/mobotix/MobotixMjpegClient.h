@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -37,6 +38,13 @@ public:
 
 	StreamStats getStats() const;
 	std::string getStreamUrl() const;
+
+	// Raw-frame tap: called on the stream thread with the exact bytes of every
+	// complete JPEG (before decode) plus the steady-clock receive time in ms.
+	// The callback must be fast (copy into a queue) — it runs on the stream
+	// thread. Pass nullptr to clear.
+	using RawFrameCallback = std::function<void(const uint8_t * data, size_t size, double receivedAtMs)>;
+	void setRawFrameCallback(RawFrameCallback callback);
 
 	// Steady-clock "now" in ms, same timebase as receivedAtMs.
 	static double nowMs();
@@ -79,4 +87,8 @@ private:
 	// shared stats
 	mutable std::mutex statsMutex;
 	StreamStats stats;
+
+	// raw-frame tap (recording)
+	mutable std::mutex rawFrameMutex;
+	RawFrameCallback rawFrameCallback;
 };

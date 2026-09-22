@@ -106,6 +106,11 @@ std::string MobotixMjpegClient::getStreamUrl() const {
 	return config.buildStreamUrl();
 }
 
+void MobotixMjpegClient::setRawFrameCallback(RawFrameCallback callback){
+	std::lock_guard<std::mutex> lock(rawFrameMutex);
+	rawFrameCallback = std::move(callback);
+}
+
 double MobotixMjpegClient::nowMs(){
 	using namespace std::chrono;
 	return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
@@ -283,6 +288,11 @@ void MobotixMjpegClient::processBuffer(){
 }
 
 void MobotixMjpegClient::handleCompleteJpeg(const uint8_t * data, size_t size){
+	{
+		std::lock_guard<std::mutex> lock(rawFrameMutex);
+		if(rawFrameCallback) rawFrameCallback(data, size, nowMs());
+	}
+
 	std::string comDump;
 	SensorSnapshot sensors = JpegCommentParser::parse(data, size, &comDump);
 

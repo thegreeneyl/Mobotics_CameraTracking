@@ -1,4 +1,5 @@
 {
+  "recordingsDir": "recordings",
   "cameras": [
     {
       "id": "north_dual",

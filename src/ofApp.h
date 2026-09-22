@@ -5,6 +5,8 @@
 
 #include "mobotix/MobotixMjpegClient.h"
 #include "mobotix/MobotixTypes.h"
+#include "recording/MjpegPlayer.h"
+#include "recording/MjpegRecorder.h"
 
 class ofApp : public ofBaseApp {
 public:
@@ -15,9 +17,12 @@ public:
 	void keyPressed(int key) override;
 
 private:
+	enum class AppMode { Live, Playback };
+
 	void loadConfig();
 	void applyStreamSettings();
 	void drawVideo();
+	void drawRecordingIndicator();
 	void drawSensorPanel();
 	void drawStatsBar();
 	void drawComDump();
@@ -34,11 +39,24 @@ private:
 	double lastFrameReceivedMs = 0;   // client steady-clock ms
 	double lastUploadLatencyMs = 0;   // receive-complete -> texture upload
 
+	// recording & playback
+	AppMode mode = AppMode::Live;
+	std::string recordingsDir; // absolute
+	MjpegRecorder recorder;
+	MjpegPlayer player;
+	ofTexture playbackTexture;
+	void startRecording();
+	void stopRecording();
+	void enterPlayback();
+	void exitPlayback();
+
 	// gui
 	ofxPanel gui;
 	ofParameter<bool> previewParam{"preview (downscale)", false};
 	ofParameter<int> qualityParam{"jpeg quality (preview)", 60, 10, 90};
 	ofParameter<bool> showComDumpParam{"show COM dump", false};
+	ofParameter<bool> recordParam{"record (SPACE)", false};
+	ofParameter<bool> playbackParam{"playback mode (TAB)", false};
 	ofxButton reconnectButton;
 
 	// debounced restart when stream params change
@@ -53,5 +71,7 @@ private:
 
 	void onPreviewChanged(bool & value);
 	void onQualityChanged(int & value);
+	void onRecordChanged(bool & value);
+	void onPlaybackChanged(bool & value);
 	void onReconnectPressed();
 };

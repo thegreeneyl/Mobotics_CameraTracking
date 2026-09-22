@@ -39,7 +39,29 @@ entry is a stub for later.
 - `p` — toggle preview (downscaled) stream
 - `c` — toggle raw JPEG COM metadata dump
 - `s` — save a screenshot to `bin/data/`
-- GUI: preview toggle, JPEG quality (preview only), COM dump toggle
+- `SPACE` — start/stop recording the incoming stream (live mode only)
+- `TAB` — toggle LIVE / PLAYBACK mode
+- `LEFT` / `RIGHT` — previous / next recording (playback mode, wraps)
+- GUI: preview toggle, JPEG quality (preview only), COM dump toggle,
+  record toggle, playback-mode toggle
+
+### Recording & playback
+
+Recording taps the raw bytes of every complete JPEG on the stream thread
+(before decode) and appends them unchanged to
+`bin/data/<recordingsDir>/rec_YYYY-MM-DD_HH-MM-SS.mjpeg` (`recordingsDir`
+in `config.json`, default `recordings`, created on demand; each recording
+gets a fresh timestamp). A JSON sidecar (`rec_<same-stamp>.json`) with
+per-frame `{offset, size, tMs}` entries is written on stop, so playback is
+paced exactly like the original stream. No re-encoding — the JPEG COM
+sensor metadata stays intact, and the sensor panel keeps working during
+playback.
+
+Playback (`TAB`) starts with the most recent recording, plays it to the end,
+then cycles onward through all recordings newest to oldest (wrapping).
+Arrow keys jump within that cycle. While in playback mode the live stream
+keeps running in the background but is ignored; `TAB` returns to it
+instantly. Entering playback stops an active recording first.
 
 Headless check: `CAMTRACK_AUTOSHOT=/tmp/shot.png ./YOUniverse_CameraTracking`
 streams for ~8 s, saves a screenshot, and exits. Stats are logged every 5 s.
