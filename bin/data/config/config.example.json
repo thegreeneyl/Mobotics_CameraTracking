@@ -1,5 +1,60 @@
 {
   "recordingsDir": "recordings",
+  "display": {
+    "decodeScale": 2
+  },
+  "tracking": {
+    "enabled": true,
+    "detector": "bgs",
+    "analysisReduce": 2,
+    "bgs": {
+      "history": 500,
+      "varThreshold": 16,
+      "learningRate": -1,
+      "minAreaNorm": 0.0005,
+      "maxAreaNorm": 0.5,
+      "morphOpen": 3,
+      "morphClose": 9
+    },
+    "tracker": {
+      "confirmFrames": 5,
+      "maxMisses": 12,
+      "minIoU": 0.1,
+      "maxDist": 0.05
+    },
+    "zones": {
+      "M1": [
+        {
+          "label": "train",
+          "y0": 0.55,
+          "y1": 0.75
+        },
+        {
+          "label": "boat",
+          "y0": 0.75,
+          "y1": 1.0
+        }
+      ],
+      "M2": []
+    },
+    "yolo": {
+      "model": "models/yolov8n.onnx",
+      "inputSize": 640,
+      "confThreshold": 0.35,
+      "nmsThreshold": 0.45,
+      "classes": [
+        "train",
+        "boat",
+        "car",
+        "truck",
+        "bus"
+      ]
+    },
+    "overlay": {
+      "arrowScale": 1.0,
+      "trailFrames": 30
+    }
+  },
   "cameras": [
     {
       "id": "north_dual",

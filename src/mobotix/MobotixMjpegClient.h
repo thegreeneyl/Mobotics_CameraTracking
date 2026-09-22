@@ -46,6 +46,10 @@ public:
 	using RawFrameCallback = std::function<void(const uint8_t * data, size_t size, double receivedAtMs)>;
 	void setRawFrameCallback(RawFrameCallback callback);
 
+	// Display decode scale: 1 = full resolution, 2 = DCT-domain half-size
+	// decode (quarter cost). Takes effect on the next frame, no restart.
+	void setDecodeScale(int scale);
+
 	// Steady-clock "now" in ms, same timebase as receivedAtMs.
 	static double nowMs();
 
@@ -67,6 +71,7 @@ private:
 
 	std::thread streamThread;
 	std::atomic<bool> running{false};
+	std::atomic<int> decodeScale{1};
 
 	// stream-thread only
 	std::vector<uint8_t> receiveBuffer;

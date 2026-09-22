@@ -39,11 +39,14 @@ entry is a stub for later.
 - `p` — toggle preview (downscaled) stream
 - `c` — toggle raw JPEG COM metadata dump
 - `s` — save a screenshot to `bin/data/`
+- `t` — toggle object tracking
+- `o` — toggle the tracking debug overlay
 - `SPACE` — start/stop recording the incoming stream (live mode only)
 - `TAB` — toggle LIVE / PLAYBACK mode
 - `LEFT` / `RIGHT` — previous / next recording (playback mode, wraps)
 - GUI: preview toggle, JPEG quality (preview only), COM dump toggle,
-  record toggle, playback-mode toggle
+  record toggle, playback-mode toggle, tracking/overlay toggles,
+  detector switch (BGS/YOLO), half-res display decode toggle
 
 ### Recording & playback
 
@@ -65,6 +68,8 @@ instantly. Entering playback stops an active recording first.
 
 Headless check: `CAMTRACK_AUTOSHOT=/tmp/shot.png ./YOUniverse_CameraTracking`
 streams for ~8 s, saves a screenshot, and exits. Stats are logged every 5 s.
+Add `CAMTRACK_AUTOPLAYBACK=1` to start in playback mode instead (verifies
+recording playback + tracking without a reachable camera).
 
 ## Stream ingest (what was chosen and why)
 
@@ -98,6 +103,56 @@ Alternatives considered and rejected for v1:
   an extra decoder, and loses the JPEG comment metadata.
 - **MxPEG** — lowest bandwidth but requires the Mobotix decoder; unnecessary
   on a LAN at these rates.
+
+## Object tracking & detection
+
+Multi-object tracking (unique ids, position, velocity, bbox, class tag) runs
+in both LIVE and PLAYBACK mode. It is tracking-by-detection: a per-frame
+detector feeds a SORT-style tracker (one constant-velocity Kalman filter per
+track, greedy IoU association with a centroid-distance fallback, tentative →
+confirmed → dead lifecycle). Code lives in `src/tracking/` (no UI
+dependencies, reusable by Steuerung).
+
+Two detectors, swappable at runtime (GUI toggle, `tracking.detector`):
+
+- **`bgs` (default)** — OpenCV MOG2 background subtraction + morphology +
+  contours. Cheap, full frame rate, no model. Class tags come from
+  configurable image zones per module (`tracking.zones`): a detection whose
+  centroid lies in the "train" band is tagged `train`, etc. Tune the bands
+  with the overlay against the real view.
+- **`yolo` (experiment)** — YOLOv8/YOLO11 ONNX via OpenCV DNN (CPU only,
+  ~100+ ms per pane). Real appearance-based COCO labels. Download a model
+  (e.g. `yolov8n.onnx`, exported with `yolo export model=yolov8n.pt
+  format=onnx`) into `bin/data/models/`. Missing model → warning + BGS
+  fallback. Slow inference never stalls the app: stale frames are dropped
+  and the Kalman prediction bridges the gaps.
+
+The frame is split into the two module panes (M1 | M2) by aspect ratio and
+each pane gets its own detector + tracker. Coordinates are normalized by the
+module width: position x is 0..1 across the module, velocity is in
+module-widths per second.
+
+The debug overlay (`o`) draws per object, in a stable per-id color: bounding
+box, center point, velocity arrow (1 s lookahead × `overlay.arrowScale`),
+fading trail, and `#id label speed`. Tentative tracks are dimmed with a `?`.
+
+### Threading & decode
+
+The main thread only uploads textures and draws. Raw JPEG bytes are the
+currency between threads; each consumer decodes what it needs:
+
+| Thread | Work |
+|---|---|
+| stream thread | curl receive, JPEG framing, COM parse, display decode |
+| playback thread | sidecar pacing, disk reads, display decode |
+| tracking thread | own reduced decode (DCT-domain, `tracking.analysisReduce`, grayscale for BGS / BGR for YOLO), detector + tracker |
+| main thread | texture upload, UI, overlay |
+
+All hand-offs are latest-only slots (drop stale, never queue). Display
+decode uses `cv::imdecode` (libjpeg-turbo); `display.decodeScale: 2` decodes
+at half size in the DCT domain (quarter cost, still larger than the
+on-screen panes — overlay coordinates are normalized, so unaffected). The
+stats bar shows per-stage timings (`dec`, `det`, `trk`).
 
 ## Brightness / sensor values
 

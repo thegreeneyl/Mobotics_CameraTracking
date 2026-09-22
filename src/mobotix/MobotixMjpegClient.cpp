@@ -5,8 +5,9 @@
 
 #include <curl/curl.h>
 
-#include "ofImage.h"
 #include "ofLog.h"
+
+#include "../util/JpegDecode.h"
 
 namespace {
 constexpr size_t kMaxBufferBytes = 32 * 1024 * 1024; // runaway guard
@@ -109,6 +110,14 @@ std::string MobotixMjpegClient::getStreamUrl() const {
 void MobotixMjpegClient::setRawFrameCallback(RawFrameCallback callback){
 	std::lock_guard<std::mutex> lock(rawFrameMutex);
 	rawFrameCallback = std::move(callback);
+}
+
+void MobotixMjpegClient::setDecodeScale(int scale){
+	if(scale >= 8) scale = 8;
+	else if(scale >= 4) scale = 4;
+	else if(scale >= 2) scale = 2;
+	else scale = 1;
+	decodeScale = scale;
 }
 
 double MobotixMjpegClient::nowMs(){
@@ -296,12 +305,13 @@ void MobotixMjpegClient::handleCompleteJpeg(const uint8_t * data, size_t size){
 	std::string comDump;
 	SensorSnapshot sensors = JpegCommentParser::parse(data, size, &comDump);
 
-	ofBuffer jpegBuffer(reinterpret_cast<const char *>(data), size);
+	const double decodeStartMs = nowMs();
 	ofPixels pixels;
-	if(!ofLoadImage(pixels, jpegBuffer)){
+	if(!jpegdecode::decodeToPixels(data, size, pixels, decodeScale)){
 		ofLogWarning("MobotixMjpegClient") << "failed to decode JPEG frame (" << size << " bytes)";
 		return;
 	}
+	const double decodeMs = nowMs() - decodeStartMs;
 
 	const double now = nowMs();
 	{
@@ -322,6 +332,7 @@ void MobotixMjpegClient::handleCompleteJpeg(const uint8_t * data, size_t size){
 	{
 		std::lock_guard<std::mutex> lock(statsMutex);
 		stats.framesDecoded++;
+		stats.lastDecodeMs = decodeMs;
 		stats.state = "streaming";
 		const double windowMs = now - statWindowStartMs;
 		if(windowMs >= kStatWindowMs){

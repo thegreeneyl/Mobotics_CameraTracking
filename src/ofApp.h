@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+
 #include "ofMain.h"
 #include "ofxGui.h"
 
@@ -7,6 +9,7 @@
 #include "mobotix/MobotixTypes.h"
 #include "recording/MjpegPlayer.h"
 #include "recording/MjpegRecorder.h"
+#include "tracking/TrackingManager.h"
 
 class ofApp : public ofBaseApp {
 public:
@@ -20,8 +23,10 @@ private:
 	enum class AppMode { Live, Playback };
 
 	void loadConfig();
+	void loadTrackingConfig(const ofJson & json);
 	void applyStreamSettings();
 	void drawVideo();
+	void drawTrackingOverlay();
 	void drawRecordingIndicator();
 	void drawSensorPanel();
 	void drawStatsBar();
@@ -40,15 +45,29 @@ private:
 	double lastUploadLatencyMs = 0;   // receive-complete -> texture upload
 
 	// recording & playback
-	AppMode mode = AppMode::Live;
+	// mode is atomic: the raw-frame taps read it on the stream / playback
+	// threads to decide where frames go.
+	std::atomic<AppMode> mode{AppMode::Live};
 	std::string recordingsDir; // absolute
 	MjpegRecorder recorder;
 	MjpegPlayer player;
 	ofTexture playbackTexture;
+	uint64_t playbackSeenFrameId = 0;
+	double playbackFrameTMs = 0;
 	void startRecording();
 	void stopRecording();
 	void enterPlayback();
 	void exitPlayback();
+
+	// tracking (worker thread; fed by the raw-frame taps of client/player)
+	tracking::TrackingManager trackingManager;
+	tracking::TrackingConfig trackingConfig;
+	tracking::TrackingResults trackResults;
+	uint64_t trackResultsRevision = 0;
+	int displayDecodeScale = 2;      // config display.decodeScale
+	float overlayArrowScale = 1.0f;  // config tracking.overlay.arrowScale
+	// screen rects of the module panes, rebuilt every drawVideo()
+	std::vector<ofRectangle> paneRects;
 
 	// gui
 	ofxPanel gui;
@@ -57,6 +76,10 @@ private:
 	ofParameter<bool> showComDumpParam{"show COM dump", false};
 	ofParameter<bool> recordParam{"record (SPACE)", false};
 	ofParameter<bool> playbackParam{"playback mode (TAB)", false};
+	ofParameter<bool> trackingParam{"tracking (t)", true};
+	ofParameter<bool> overlayParam{"overlay (o)", true};
+	ofParameter<bool> yoloParam{"detector: YOLO", false};
+	ofParameter<bool> halfResParam{"half-res decode", true};
 	ofxButton reconnectButton;
 
 	// debounced restart when stream params change
@@ -73,5 +96,8 @@ private:
 	void onQualityChanged(int & value);
 	void onRecordChanged(bool & value);
 	void onPlaybackChanged(bool & value);
+	void onTrackingChanged(bool & value);
+	void onYoloChanged(bool & value);
+	void onHalfResChanged(bool & value);
 	void onReconnectPressed();
 };

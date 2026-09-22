@@ -70,6 +70,7 @@ struct StreamStats {
 	double bytesPerSecond = 0.0;
 	uint64_t framesDecoded = 0;
 	uint64_t framesDropped = 0; // decoded but replaced before the app consumed them
+	double lastDecodeMs = 0.0;  // display-decode cost of the newest frame
 	long httpStatus = 0;
 	std::string lastError;
 };

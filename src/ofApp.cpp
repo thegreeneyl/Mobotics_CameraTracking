@@ -31,6 +31,10 @@ void ofApp::setup(){
 	gui.add(showComDumpParam);
 	gui.add(recordParam);
 	gui.add(playbackParam);
+	gui.add(trackingParam);
+	gui.add(overlayParam);
+	gui.add(yoloParam);
+	gui.add(halfResParam);
 	reconnectButton.setup("reconnect (r)");
 	gui.add(&reconnectButton);
 	gui.setPosition(10, 10);
@@ -39,11 +43,34 @@ void ofApp::setup(){
 	qualityParam = camConfig.quality;
 	recordParam = false;   // never restore a stale "recording" state from gui.xml
 	playbackParam = false; // always start live
+	trackingParam = trackingConfig.enabled;
+	yoloParam = (trackingConfig.detector == "yolo");
+	halfResParam = (displayDecodeScale >= 2);
 	previewParam.addListener(this, &ofApp::onPreviewChanged);
 	qualityParam.addListener(this, &ofApp::onQualityChanged);
 	recordParam.addListener(this, &ofApp::onRecordChanged);
 	playbackParam.addListener(this, &ofApp::onPlaybackChanged);
+	trackingParam.addListener(this, &ofApp::onTrackingChanged);
+	yoloParam.addListener(this, &ofApp::onYoloChanged);
+	halfResParam.addListener(this, &ofApp::onHalfResChanged);
 	reconnectButton.addListener(this, &ofApp::onReconnectPressed);
+
+	// tracking worker (fed below by the raw-frame taps)
+	trackingConfig.enabled = trackingParam;
+	trackingManager.setup(trackingConfig);
+
+	// Raw-frame taps: the exact JPEG bytes of every complete frame, called
+	// on the stream / playback thread. Recording and tracking both hang off
+	// these; the main thread never touches raw frames.
+	client.setDecodeScale(halfResParam ? 2 : 1);
+	client.setRawFrameCallback([this](const uint8_t * data, size_t size, double tsMs){
+		if(recorder.isRecording()) recorder.addFrame(data, size, tsMs);
+		if(mode == AppMode::Live) trackingManager.submitRawJpeg(data, size, tsMs);
+	});
+	player.setDecodeScale(halfResParam ? 2 : 1);
+	player.setRawFrameCallback([this](const uint8_t * data, size_t size, double tMs){
+		if(mode == AppMode::Playback) trackingManager.submitRawJpeg(data, size, tMs);
+	});
 
 	if(camConfig.enabled && !camConfig.host.empty()){
 		ofLogNotice("ofApp") << "starting stream: " << camConfig.buildStreamUrl();
@@ -53,10 +80,15 @@ void ofApp::setup(){
 	}
 
 	// Headless verification: CAMTRACK_AUTOSHOT=<path> saves a screenshot
-	// after ~8 s of streaming and quits.
+	// after ~8 s of streaming and quits. CAMTRACK_AUTOPLAYBACK=1 additionally
+	// starts in playback mode (tracking against a recording, no camera).
 	if(const char * autoshot = std::getenv("CAMTRACK_AUTOSHOT")){
 		autoshotPath = autoshot;
 		ofLogNotice("ofApp") << "autoshot enabled -> " << autoshotPath;
+	}
+	if(std::getenv("CAMTRACK_AUTOPLAYBACK")){
+		ofLogNotice("ofApp") << "autoplayback enabled";
+		playbackParam = true;
 	}
 }
 
@@ -77,6 +109,13 @@ void ofApp::loadConfig(){
 		return;
 	}
 	recordingsDir = ofToDataPath(json.value("recordingsDir", std::string("recordings")), true);
+
+	displayDecodeScale = 2;
+	if(json.contains("display")){
+		displayDecodeScale = json["display"].value("decodeScale", 2);
+	}
+	loadTrackingConfig(json);
+
 	if(!json.contains("cameras") || !json["cameras"].is_array()){
 		ofLogError("ofApp") << path << " has no cameras array";
 		return;
@@ -98,6 +137,74 @@ void ofApp::loadConfig(){
 }
 
 //--------------------------------------------------------------
+void ofApp::loadTrackingConfig(const ofJson & json){
+	trackingConfig = tracking::TrackingConfig{};
+	overlayArrowScale = 1.0f;
+	if(!json.contains("tracking")) return;
+	const auto & t = json["tracking"];
+
+	trackingConfig.enabled = t.value("enabled", true);
+	trackingConfig.detector = t.value("detector", std::string("bgs"));
+	trackingConfig.analysisReduce = t.value("analysisReduce", 2);
+
+	if(t.contains("bgs")){
+		const auto & b = t["bgs"];
+		trackingConfig.bgs.history = b.value("history", 500);
+		trackingConfig.bgs.varThreshold = b.value("varThreshold", 16.0);
+		trackingConfig.bgs.learningRate = b.value("learningRate", -1.0);
+		trackingConfig.bgs.minAreaNorm = b.value("minAreaNorm", 0.0005f);
+		trackingConfig.bgs.maxAreaNorm = b.value("maxAreaNorm", 0.5f);
+		trackingConfig.bgs.morphOpenPx = b.value("morphOpen", 3);
+		trackingConfig.bgs.morphClosePx = b.value("morphClose", 9);
+	}
+	if(t.contains("tracker")){
+		const auto & k = t["tracker"];
+		trackingConfig.tracker.confirmFrames = k.value("confirmFrames", 5);
+		trackingConfig.tracker.maxMisses = k.value("maxMisses", 12);
+		trackingConfig.tracker.minIoU = k.value("minIoU", 0.1f);
+		trackingConfig.tracker.maxDist = k.value("maxDist", 0.05f);
+	}
+	if(t.contains("yolo")){
+		const auto & y = t["yolo"];
+		trackingConfig.yolo.modelPath = ofToDataPath(y.value("model", std::string("models/yolov8n.onnx")), true);
+		trackingConfig.yolo.inputSize = y.value("inputSize", 640);
+		trackingConfig.yolo.confThreshold = y.value("confThreshold", 0.35f);
+		trackingConfig.yolo.nmsThreshold = y.value("nmsThreshold", 0.45f);
+		trackingConfig.yolo.classFilter.clear();
+		if(y.contains("classes") && y["classes"].is_array()){
+			for(const auto & c : y["classes"]){
+				trackingConfig.yolo.classFilter.push_back(c.get<std::string>());
+			}
+		}
+	}
+	if(t.contains("overlay")){
+		const auto & o = t["overlay"];
+		overlayArrowScale = o.value("arrowScale", 1.0f);
+		trackingConfig.tracker.trailLen = o.value("trailFrames", 30);
+	}
+	// zones: {"M1": [ {label,y0,y1,x0,x1}, ... ], "M2": [...]}
+	trackingConfig.moduleZones.assign(2, {});
+	if(t.contains("zones")){
+		const auto parseZones = [](const ofJson & arr){
+			std::vector<tracking::Zone> zones;
+			if(!arr.is_array()) return zones;
+			for(const auto & z : arr){
+				tracking::Zone zone;
+				zone.label = z.value("label", std::string(""));
+				zone.y0 = z.value("y0", 0.0f);
+				zone.y1 = z.value("y1", 1.0f);
+				zone.x0 = z.value("x0", 0.0f);
+				zone.x1 = z.value("x1", 1.0f);
+				zones.push_back(zone);
+			}
+			return zones;
+		};
+		if(t["zones"].contains("M1")) trackingConfig.moduleZones[0] = parseZones(t["zones"]["M1"]);
+		if(t["zones"].contains("M2")) trackingConfig.moduleZones[1] = parseZones(t["zones"]["M2"]);
+	}
+}
+
+//--------------------------------------------------------------
 void ofApp::applyStreamSettings(){
 	camConfig.preview = previewParam;
 	camConfig.quality = qualityParam;
@@ -107,9 +214,11 @@ void ofApp::applyStreamSettings(){
 //--------------------------------------------------------------
 void ofApp::update(){
 	if(mode == AppMode::Playback){
-		// live stream keeps running in the background but is ignored
+		// live stream keeps running in the background but is ignored;
+		// the player paces/reads/decodes on its own thread.
 		ofPixels pixels;
-		if(player.update(pixels, sensors, showComDumpParam ? &comDump : nullptr)){
+		if(player.getLatestFrame(pixels, sensors, playbackSeenFrameId, playbackFrameTMs,
+		                         showComDumpParam ? &comDump : nullptr)){
 			playbackTexture.loadData(pixels);
 		}
 	}else{
@@ -122,6 +231,9 @@ void ofApp::update(){
 			lastUploadLatencyMs = MobotixMjpegClient::nowMs() - receivedAtMs;
 		}
 	}
+
+	// newest tracking results (published by the tracking thread)
+	trackingManager.getLatestResults(trackResults, trackResultsRevision);
 
 	if(settingsDirty && MobotixMjpegClient::nowMs() - settingsDirtySinceMs > kSettingsDebounceMs){
 		settingsDirty = false;
@@ -173,6 +285,8 @@ void ofApp::drawVideo(){
 	const bool playback = (mode == AppMode::Playback);
 	const ofTexture & tex = playback ? playbackTexture : texture;
 
+	paneRects.clear();
+
 	if(!tex.isAllocated()){
 		ofSetColor(160);
 		const std::string msg = playback
@@ -200,6 +314,8 @@ void ofApp::drawVideo(){
 		const float x1 = viewport.x + paneW + gap + (paneW - drawW) / 2.0f;
 		tex.drawSubsection(x0, y, drawW, drawH, 0, 0, halfW, texH);
 		tex.drawSubsection(x1, y, drawW, drawH, halfW, 0, halfW, texH);
+		paneRects.emplace_back(x0, y, drawW, drawH); // module 0 (M1)
+		paneRects.emplace_back(x1, y, drawW, drawH); // module 1 (M2)
 		ofSetColor(200);
 		ofDrawBitmapString("M1 (left)", x0 + 6, y + 16);
 		ofDrawBitmapString("M2 (right)", x1 + 6, y + 16);
@@ -209,9 +325,79 @@ void ofApp::drawVideo(){
 		                             viewport.height / tex.getHeight());
 		const float drawW = tex.getWidth() * scale;
 		const float drawH = tex.getHeight() * scale;
-		tex.draw(viewport.x + (viewport.width - drawW) / 2.0f,
-		         viewport.y + (viewport.height - drawH) / 2.0f, drawW, drawH);
+		const float x = viewport.x + (viewport.width - drawW) / 2.0f;
+		const float y = viewport.y + (viewport.height - drawH) / 2.0f;
+		tex.draw(x, y, drawW, drawH);
+		paneRects.emplace_back(x, y, drawW, drawH); // single module
 	}
+
+	drawTrackingOverlay();
+}
+
+//--------------------------------------------------------------
+// Debug overlay: per tracked object — bbox, center point, velocity arrow
+// (1 s lookahead x arrowScale), "#id label" text and a fading trail, all in
+// the object's stable per-id color. Tentative (unconfirmed) tracks are dim.
+// Tracking coordinates are width-normalized per module, so mapping to the
+// screen is just: screen = paneRect.xy + coord * paneRect.width.
+void ofApp::drawTrackingOverlay(){
+	if(!trackingParam || !overlayParam) return;
+	if(trackResults.modules.empty() || paneRects.empty()) return;
+
+	ofPushStyle();
+	for(size_t m = 0; m < paneRects.size() && m < trackResults.modules.size(); m++){
+		const ofRectangle & pane = paneRects[m];
+		const float s = pane.width; // screen px per module-width unit
+
+		for(const auto & obj : trackResults.modules[m].objects){
+			ofColor col(obj.colorR * 255, obj.colorG * 255, obj.colorB * 255,
+			            obj.confirmed ? 255 : 80);
+			const float cx = pane.x + obj.x * s;
+			const float cy = pane.y + obj.y * s;
+
+			// trail (older = more transparent)
+			if(obj.trail.size() > 1){
+				for(size_t i = 1; i < obj.trail.size(); i++){
+					const float a = static_cast<float>(i) / obj.trail.size();
+					ofSetColor(col.r, col.g, col.b, col.a * a * 0.6f);
+					ofDrawLine(pane.x + obj.trail[i - 1].first * s,
+					           pane.y + obj.trail[i - 1].second * s,
+					           pane.x + obj.trail[i].first * s,
+					           pane.y + obj.trail[i].second * s);
+				}
+			}
+
+			ofSetColor(col);
+			// bounding box
+			ofNoFill();
+			ofDrawRectangle(cx - obj.w * s / 2, cy - obj.h * s / 2, obj.w * s, obj.h * s);
+			// position point
+			ofFill();
+			ofDrawCircle(cx, cy, 3);
+			// velocity arrow: where the object will be in 1 s (x arrowScale),
+			// clamped to a quarter module width so fast objects stay readable
+			float dx = obj.vx * overlayArrowScale;
+			float dy = obj.vy * overlayArrowScale;
+			const float len = std::hypot(dx, dy);
+			constexpr float kMaxArrow = 0.25f;
+			if(len > kMaxArrow){
+				dx *= kMaxArrow / len;
+				dy *= kMaxArrow / len;
+			}
+			ofDrawArrow(glm::vec3(cx, cy, 0), glm::vec3(cx + dx * s, cy + dy * s, 0), 5.0f);
+
+			// label
+			const float speed = std::hypot(obj.vx, obj.vy);
+			std::string text = "#" + ofToString(obj.id);
+			if(!obj.label.empty()) text += " " + obj.label;
+			text += "  " + ofToString(speed, 3) + " w/s";
+			if(!obj.confirmed) text += " ?";
+			ofDrawBitmapStringHighlight(text, cx - obj.w * s / 2, cy - obj.h * s / 2 - 6,
+			                            ofColor(0, 160), col);
+		}
+	}
+	ofPopStyle();
+	ofSetColor(255);
 }
 
 //--------------------------------------------------------------
@@ -285,6 +471,18 @@ void ofApp::drawStatsBar(){
 	ofSetColor(0, 200);
 	ofDrawRectangle(0, y, ofGetWidth(), barHeight);
 
+	// tracking summary shared by both modes
+	std::string trackInfo;
+	if(trackingParam){
+		size_t objCount = 0;
+		for(const auto & m : trackResults.modules) objCount += m.objects.size();
+		trackInfo = "   trk[" + (trackResults.detectorName.empty() ? std::string("-") : trackResults.detectorName)
+			+ "] " + ofToString(objCount) + " obj"
+			+ " dec " + ofToString(trackResults.decodeMs, 1)
+			+ " det " + ofToString(trackResults.detectMs, 1)
+			+ " trk " + ofToString(trackResults.trackMs, 1) + " ms";
+	}
+
 	if(mode == AppMode::Playback){
 		const std::string line1 = "[playback] " + player.getCurrentName()
 			+ "   recording " + ofToString(player.getCurrentIndex() + 1)
@@ -292,6 +490,8 @@ void ofApp::drawStatsBar(){
 		const std::string line2 =
 			formatClock(player.getPositionMs()) + " / " + formatClock(player.getDurationMs())
 			+ "   frame " + ofToString(player.getFrameCursor()) + "/" + ofToString(player.getFrameCount())
+			+ "   dec " + ofToString(player.getLastDecodeMs(), 1) + " ms"
+			+ trackInfo
 			+ "   LEFT/RIGHT prev/next   TAB back to live"
 			+ "   app " + ofToString(ofGetFrameRate(), 0) + " fps";
 		ofDrawBitmapStringHighlight(line1, 12, y + 24, ofColor(0, 0, 0, 0), ofColor(120, 180, 255));
@@ -315,9 +515,11 @@ void ofApp::drawStatsBar(){
 		+ "   camera " + (sensors.frj < 0 ? "n/a" : ofToString(sensors.cameraFps(), 1) + " fps")
 		+ "   " + ofToString(stats.bytesPerSecond / (1024.0 * 1024.0), 2) + " MB/s"
 		+ "   frame age " + (frameAgeMs < 0 ? "n/a" : ofToString(frameAgeMs, 0) + " ms")
-		+ "   decode->texture " + ofToString(lastUploadLatencyMs, 1) + " ms"
+		+ "   dec " + ofToString(stats.lastDecodeMs, 1) + " ms"
+		+ "   ->tex " + ofToString(lastUploadLatencyMs, 1) + " ms"
 		+ "   frames " + ofToString(stats.framesDecoded)
 		+ " dropped " + ofToString(stats.framesDropped)
+		+ trackInfo
 		+ "   app " + ofToString(ofGetFrameRate(), 0) + " fps";
 
 	ofDrawBitmapStringHighlight(line1, 12, y + 24, ofColor(0, 0, 0, 0), stateColor);
@@ -341,9 +543,14 @@ void ofApp::exit(){
 	qualityParam.removeListener(this, &ofApp::onQualityChanged);
 	recordParam.removeListener(this, &ofApp::onRecordChanged);
 	playbackParam.removeListener(this, &ofApp::onPlaybackChanged);
+	trackingParam.removeListener(this, &ofApp::onTrackingChanged);
+	yoloParam.removeListener(this, &ofApp::onYoloChanged);
+	halfResParam.removeListener(this, &ofApp::onHalfResChanged);
 	reconnectButton.removeListener(this, &ofApp::onReconnectPressed);
 	stopRecording();
 	client.stop();
+	player.close();
+	trackingManager.stop();
 }
 
 //--------------------------------------------------------------
@@ -358,12 +565,22 @@ void ofApp::keyPressed(int key){
 		saveScreenshot();
 	}else if(key == ' '){
 		recordParam = !recordParam; // rejected in playback mode
+	}else if(key == 't'){
+		trackingParam = !trackingParam;
+	}else if(key == 'o'){
+		overlayParam = !overlayParam;
 	}else if(key == OF_KEY_TAB){
 		playbackParam = !playbackParam;
 	}else if(key == OF_KEY_RIGHT){
-		if(mode == AppMode::Playback) player.next();
+		if(mode == AppMode::Playback){
+			player.next();
+			trackingManager.reset();
+		}
 	}else if(key == OF_KEY_LEFT){
-		if(mode == AppMode::Playback) player.previous();
+		if(mode == AppMode::Playback){
+			player.previous();
+			trackingManager.reset();
+		}
 	}
 }
 
@@ -376,14 +593,11 @@ void ofApp::startRecording(){
 		recordParam = false;
 		return;
 	}
-	client.setRawFrameCallback([this](const uint8_t * data, size_t size, double tsMs){
-		recorder.addFrame(data, size, tsMs);
-	});
+	// frames reach the recorder through the permanent raw-frame tap
 }
 
 void ofApp::stopRecording(){
 	if(!recorder.isRecording()) return;
-	client.setRawFrameCallback(nullptr);
 	recorder.stop();
 }
 
@@ -395,7 +609,9 @@ void ofApp::enterPlayback(){
 		playbackParam = false; // stay live (nested listener call is a no-op)
 		return;
 	}
+	playbackSeenFrameId = 0;
 	mode = AppMode::Playback;
+	trackingManager.reset(); // fresh background model / tracks for the recording
 }
 
 void ofApp::exitPlayback(){
@@ -403,6 +619,7 @@ void ofApp::exitPlayback(){
 	mode = AppMode::Live;
 	player.close();
 	playbackTexture.clear();
+	trackingManager.reset();
 }
 
 //--------------------------------------------------------------
@@ -444,6 +661,21 @@ void ofApp::onPlaybackChanged(bool & value){
 	}else{
 		exitPlayback();
 	}
+}
+
+void ofApp::onTrackingChanged(bool & value){
+	trackingManager.setEnabled(value);
+	if(value) trackingManager.reset(); // fresh background model on re-enable
+}
+
+void ofApp::onYoloChanged(bool & value){
+	trackingManager.setDetectorType(value ? "yolo" : "bgs");
+}
+
+void ofApp::onHalfResChanged(bool & value){
+	// takes effect on the next frame; no stream restart needed
+	client.setDecodeScale(value ? 2 : 1);
+	player.setDecodeScale(value ? 2 : 1);
 }
 
 void ofApp::onReconnectPressed(){
