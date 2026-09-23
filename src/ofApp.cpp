@@ -15,6 +15,21 @@ std::string formatClock(double ms){
 	const int s = totalSec % 60;
 	return ofToString(m, 2, '0') + ":" + ofToString(s, 2, '0');
 }
+
+// ofTexture::loadData only reallocates when the new frame is LARGER than the
+// current allocation; a smaller frame is uploaded into a sub-region and the
+// texture keeps its old size (and stale pixels outside the region). Frame
+// sizes change when playback cycles between dual- and single-camera
+// recordings, when toggling half-res decode, or live when toggling the
+// preview stream — so reallocate whenever the dimensions differ.
+void loadFrameTexture(ofTexture & tex, const ofPixels & pixels){
+	if(tex.isAllocated()
+	   && (static_cast<size_t>(tex.getWidth()) != pixels.getWidth()
+	       || static_cast<size_t>(tex.getHeight()) != pixels.getHeight())){
+		tex.clear();
+	}
+	tex.loadData(pixels);
+}
 } // namespace
 
 //--------------------------------------------------------------
@@ -219,14 +234,14 @@ void ofApp::update(){
 		ofPixels pixels;
 		if(player.getLatestFrame(pixels, sensors, playbackSeenFrameId, playbackFrameTMs,
 		                         showComDumpParam ? &comDump : nullptr)){
-			playbackTexture.loadData(pixels);
+			loadFrameTexture(playbackTexture, pixels);
 		}
 	}else{
 		ofPixels pixels;
 		double receivedAtMs = 0;
 		if(client.getLatestFrame(pixels, sensors, lastSeenFrameId, receivedAtMs,
 		                         showComDumpParam ? &comDump : nullptr)){
-			texture.loadData(pixels);
+			loadFrameTexture(texture, pixels);
 			lastFrameReceivedMs = receivedAtMs;
 			lastUploadLatencyMs = MobotixMjpegClient::nowMs() - receivedAtMs;
 		}
