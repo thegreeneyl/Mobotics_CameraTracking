@@ -27,7 +27,13 @@ public:
 
 	bool isLoaded() const { return loaded; }
 
-	std::vector<Detection> detect(const cv::Mat & pane) override; // BGR pane
+	// Live tuning: thresholds are read on the next detect().
+	void setThresholds(float confThreshold, float nmsThreshold){
+		cfg.confThreshold = confThreshold;
+		cfg.nmsThreshold = nmsThreshold;
+	}
+
+	std::vector<Detection> detect(const cv::Mat & pane, double dtSec) override; // BGR lane image
 	bool wantsColor() const override { return true; }
 	const char * name() const override { return "yolo"; }
 

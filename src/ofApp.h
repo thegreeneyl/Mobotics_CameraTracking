@@ -7,6 +7,7 @@
 
 #include "mobotix/MobotixMjpegClient.h"
 #include "mobotix/MobotixTypes.h"
+#include "output/UdpSender.h"
 #include "recording/MjpegPlayer.h"
 #include "recording/MjpegRecorder.h"
 #include "tracking/TrackingManager.h"
@@ -18,15 +19,20 @@ public:
 	void draw() override;
 	void exit() override;
 	void keyPressed(int key) override;
+	void mousePressed(int x, int y, int button) override;
+	void mouseDragged(int x, int y, int button) override;
+	void mouseReleased(int x, int y, int button) override;
 
 private:
 	enum class AppMode { Live, Playback };
 
 	void loadConfig();
-	void loadTrackingConfig(const ofJson & json);
 	void applyStreamSettings();
 	void drawVideo();
 	void drawTrackingOverlay();
+	void drawLaneEditor();
+	void drawTrackingResults();
+	void drawCanvasView();
 	void drawRecordingIndicator();
 	void drawSensorPanel();
 	void drawStatsBar();
@@ -58,16 +64,56 @@ private:
 	void stopRecording();
 	void enterPlayback();
 	void exitPlayback();
+	std::string currentSourceName() const;
 
 	// tracking (worker thread; fed by the raw-frame taps of client/player)
 	tracking::TrackingManager trackingManager;
-	tracking::TrackingConfig trackingConfig;
+	tracking::TrackingConfig trackingConfig; // loaded config + committed lane edits
 	tracking::TrackingResults trackResults;
 	uint64_t trackResultsRevision = 0;
 	int displayDecodeScale = 2;      // config display.decodeScale
-	float overlayArrowScale = 1.0f;  // config tracking.overlay.arrowScale
+	float overlayArrowScale = 1.0f;  // load buffer for tracking.overlay.arrowScale
+	std::string lastSourceName;
 	// screen rects of the module panes, rebuilt every drawVideo()
 	std::vector<ofRectangle> paneRects;
+	// one result view per lane (index = lane index in the edited layout)
+	std::vector<ofRectangle> laneResultRects;
+	std::vector<ofTexture> laneMaskTex;
+
+	// lane editing. editLayout is what the mouse edits and what is drawn;
+	// committedLayout is the last valid state handed to the worker (updated
+	// on mouse release, only when the quad is convex) and written back into
+	// trackingConfig.layouts.
+	tracking::LayoutConfig editLayout;
+	tracking::LayoutConfig committedLayout;
+	int editPaneCount = 0;
+	int dragLane = -1;
+	int dragCorner = -1;
+	int lastLaneSelect = -1;
+	bool laneSliderSync = false;
+	void syncEditLayout(int paneCount);
+	void commitLayout();
+
+	// corridor placement editing on the output canvas (result view 0).
+	// Placements live directly in trackingConfig.corridors; a corridor the
+	// layout uses without a config entry gets one on first edit.
+	ofRectangle canvasRect;     // screen rect of the canvas itself
+	ofRectangle canvasViewRect; // the surrounding area (off-canvas parts show here)
+	std::vector<std::string> editCorridorIds() const;
+	tracking::CorridorPlacement & placementRef(const std::string & id);
+	int dragCorridor = -1;    // index into editCorridorIds()
+	int dragPlaceHandle = -1; // 0..3 corner (TL,TR,BR,BL), 4 = body
+	float dragGrabX = 0, dragGrabY = 0; // body drag: grab point offset (canvas units)
+	int lastCorridorSelect = -1;
+	bool mousePressCanvas(int x, int y);
+	void mouseDragCanvas(int x, int y);
+
+	// UDP publishing (output.udp in config.json)
+	output::UdpSender udp;
+	bool udpEnabled = false;
+	std::string udpHost = "127.0.0.1";
+	int udpPort = 8765;
+	int udpFrameIndex = 0;
 
 	// gui
 	ofxPanel gui;
@@ -78,9 +124,56 @@ private:
 	ofParameter<bool> playbackParam{"playback mode (TAB)", false};
 	ofParameter<bool> trackingParam{"tracking (t)", true};
 	ofParameter<bool> overlayParam{"overlay (o)", true};
-	ofParameter<bool> yoloParam{"detector: YOLO", false};
+	ofParameter<bool> showMaskParam{"motion mask (m)", true};
+	ofParameter<bool> showDetectionsParam{"raw detections (d)", true};
+	ofParameter<int> resultViewParam{"result 0canvas 1lanes (v)", 0, 0, 1};
+	ofParameter<int> detectorParam{"detector 0flow 1bgs 2yolo", 0, 0, 2};
 	ofParameter<bool> halfResParam{"half-res decode", true};
+	ofParameter<bool> udpParam{"udp publish", false};
 	ofxButton reconnectButton;
+
+	// tracking tuning gui (values loaded from config.json, pushed live to
+	// the worker, written back by the save button — never by gui.xml)
+	ofxPanel trackingGui;
+	ofParameter<int> laneSelectParam{"lane (edit) [ ]", 0, 0, 7};
+	ofParameter<float> laneS0Param{"lane s0", 0, 0, 1};
+	ofParameter<float> laneS1Param{"lane s1", 1, 0, 1};
+	ofParameter<int> corridorSelectParam{"corridor (place) , .", 0, 0, 7};
+	ofParameter<float> placeX0Param{"place x0", 0, -1, 2};
+	ofParameter<float> placeX1Param{"place x1", 1, -1, 2};
+	ofParameter<float> placeY0Param{"place y0", 0, -1, 2};
+	ofParameter<float> placeY1Param{"place y1", 1, -1, 2};
+	ofParameter<float> flowMinFlowParam{"flow minFlowPx", 0.6f, 0.1f, 4};
+	ofParameter<float> flowEmaParam{"flow ema", 0.5f, 0.05f, 1};
+	ofParameter<float> flowBusyThreshParam{"flow busyThresh", 0.35f, 0.05f, 1};
+	ofParameter<bool> flowUseMogParam{"flow useMog2", true};
+	ofParameter<float> flowMogVarParam{"flow mogVarThreshold", 24, 4, 100};
+	ofParameter<float> flowCloseWParam{"flow closeWFrac", 0.04f, 0, 0.3f};
+	ofParameter<float> flowCloseHParam{"flow closeHFrac", 0.3f, 0, 1};
+	ofParameter<float> flowMinAreaParam{"flow minAreaFrac", 0.003f, 0, 0.05f};
+	ofParameter<float> flowMinCoherenceParam{"flow minCoherence", 0.45f, 0, 1};
+	ofParameter<float> flowMinSpeedParam{"flow minSpeed", 0.01f, 0, 0.1f};
+	ofParameter<float> flowMergeGapParam{"flow mergeGapFrac", 0.15f, 0, 0.5f};
+	ofParameter<int> trkConfirmParam{"trk confirmFrames", 4, 1, 30};
+	ofParameter<int> trkMaxMissesParam{"trk maxMisses", 20, 1, 90};
+	ofParameter<float> trkGateGapParam{"trk gateGapFrac", 0.1f, 0.01f, 0.5f};
+	ofParameter<float> trkAbsorbGapParam{"trk absorbGapFrac", 0.15f, 0, 0.5f};
+	ofParameter<int> trkMergeFramesParam{"trk mergeFrames", 6, 1, 30};
+	ofParameter<float> trkReacquireMsParam{"trk reacquireMs", 2000, 0, 20000};
+	ofParameter<float> trkVelMeasNoiseParam{"trk velMeasNoise", 6e-4f, 1e-5f, 1e-2f};
+	ofParameter<int> trkTrailParam{"trk trailFrames", 30, 0, 120};
+	ofParameter<float> yoloConfParam{"yolo confThreshold", 0.35f, 0.05f, 0.95f};
+	ofParameter<float> yoloNmsParam{"yolo nmsThreshold", 0.45f, 0.05f, 0.95f};
+	ofParameter<float> arrowScaleParam{"overlay arrowScale", 1, 0, 5};
+	ofxButton saveTrackingButton;
+	// live push of tuning changes (throttled in update())
+	tracking::TrackingConfig currentTrackingTuning() const;
+	void loadGuiFromConfig();
+	void pushTrackingTuning();
+	void onSaveTrackingPressed();
+	tracking::TrackingConfig pushedTuning;
+	double lastTuningPushMs = 0;
+	std::string configPath; // the config file that was loaded (save target)
 
 	// debounced restart when stream params change
 	bool settingsDirty = false;
@@ -97,7 +190,8 @@ private:
 	void onRecordChanged(bool & value);
 	void onPlaybackChanged(bool & value);
 	void onTrackingChanged(bool & value);
-	void onYoloChanged(bool & value);
+	void onDetectorChanged(int & value);
 	void onHalfResChanged(bool & value);
+	void onUdpChanged(bool & value);
 	void onReconnectPressed();
 };

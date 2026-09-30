@@ -3,10 +3,47 @@
   "display": {
     "decodeScale": 2
   },
+  "output": {
+    "udp": {
+      "enabled": false,
+      "host": "127.0.0.1",
+      "port": 8765
+    }
+  },
   "tracking": {
     "enabled": true,
-    "detector": "bgs",
+    "detector": "flow",
     "analysisReduce": 2,
+    "laneMaxWidth": 800,
+    "laneMinHeight": 64,
+    "flow": {
+      "preset": 1,
+      "flowEma": 0.5,
+      "minFlowPx": 0.6,
+      "sparkleRatio": 0.85,
+      "busyAlpha": 0.04,
+      "busyThresh": 0.35,
+      "useMog2": true,
+      "mogHistory": 300,
+      "mogVarThreshold": 24,
+      "mogDilatePx": 7,
+      "morphOpenPx": 3,
+      "closeWFrac": 0.04,
+      "closeHFrac": 0.3,
+      "minAreaFrac": 0.003,
+      "minWidthFrac": 0.02,
+      "minHeightFrac": 0.1,
+      "minCoherence": 0.45,
+      "minSpeed": 0.01,
+      "maxSpeed": 1.5,
+      "mergeGapFrac": 0.15,
+      "mergeAngleDeg": 40,
+      "mergeSpeedRatio": 3,
+      "mergeLateralOverlap": 0.25,
+      "lockAxis": false,
+      "maxDetections": 8,
+      "edgeMarginPx": 3
+    },
     "bgs": {
       "history": 500,
       "varThreshold": 16,
@@ -17,25 +54,38 @@
       "morphClose": 9
     },
     "tracker": {
-      "confirmFrames": 5,
-      "maxMisses": 12,
-      "minIoU": 0.1,
-      "maxDist": 0.05
-    },
-    "zones": {
-      "M1": [
-        {
-          "label": "train",
-          "y0": 0.55,
-          "y1": 0.75
-        },
-        {
-          "label": "boat",
-          "y0": 0.75,
-          "y1": 1.0
-        }
-      ],
-      "M2": []
+      "confirmFrames": 4,
+      "maxMisses": 20,
+      "tentativeMaxMisses": 3,
+      "minSpeedConfirm": 0.004,
+      "gateGapFrac": 0.1,
+      "gateLateral": 0.2,
+      "velAngleDeg": 80,
+      "velScale": 0.1,
+      "absorbGapFrac": 0.15,
+      "absorbLateral": 0.4,
+      "shadowSuppress": true,
+      "shadowGapFrac": 0.15,
+      "shadowLateral": 0.25,
+      "stopSpeed": 0.04,
+      "stoppedHoldMs": 60000,
+      "stopEdgeFrac": 0.15,
+      "sizeJumpTrust": 0.6,
+      "sizeJumpNoiseGain": 25,
+      "mergeGapFrac": 0.1,
+      "mergeVelTol": 0.03,
+      "mergeFrames": 6,
+      "reacquireMs": 2000,
+      "reacquireGapFrac": 0.15,
+      "lockAxis": false,
+      "posMeasNoise": 0.001,
+      "velMeasNoise": 0.0006,
+      "posProcNoise": 4e-06,
+      "velProcNoise": 0.003,
+      "clippedMeasNoise": 1e-07,
+      "maxDtSec": 5,
+      "stopMinWidthFrac": 0.15,
+      "clipFrames": 3
     },
     "yolo": {
       "model": "models/yolov8n.onnx",
@@ -53,6 +103,291 @@
     "overlay": {
       "arrowScale": 1.0,
       "trailFrames": 30
+    },
+    "corridors": {
+      "train": {
+        "label": "train",
+        "flow": {
+          "lockAxis": true,
+          "mergeGapFrac": 0.25,
+          "mergeAngleDeg": 60,
+          "minHeightFrac": 0.25,
+          "preset": 2,
+          "fillWFrac": 0.02,
+          "fillHFrac": 0.35
+        },
+        "tracker": {
+          "lockAxis": true,
+          "absorbGapFrac": 0.25,
+          "mergeGapFrac": 0.15,
+          "stoppedHoldMs": 120000
+        },
+        "placement": {
+          "x0": 0,
+          "x1": 1,
+          "y0": 0.15,
+          "y1": 0.4
+        }
+      },
+      "boat": {
+        "label": "boat",
+        "flow": {
+          "minSpeed": 0.005,
+          "mogVarThreshold": 30.0,
+          "mogDilatePx": 3,
+          "closeWFrac": 0.03,
+          "closeHFrac": 0.06,
+          "mergeLateralOverlap": 0.4,
+          "minFlowPx": 0.3,
+          "minAreaFrac": 0.01,
+          "minHeightFrac": 0.15,
+          "fillWFrac": 0.02,
+          "fillHFrac": 0.2
+        },
+        "tracker": {
+          "reacquireMs": 15000,
+          "reacquireGapFrac": 0.3,
+          "stoppedHoldMs": 20000,
+          "shadowGapFrac": 0.4,
+          "shadowLateral": 2.0,
+          "confirmFrames": 20
+        },
+        "placement": {
+          "x0": 0,
+          "x1": 1,
+          "y0": 0.55,
+          "y1": 0.95
+        }
+      }
+    },
+    "layouts": [
+      {
+        "name": "single",
+        "panes": 1,
+        "recordings": [],
+        "lanes": [
+          {
+            "id": "train",
+            "pane": 0,
+            "corridor": "train",
+            "quad": [
+              [
+                0.08,
+                0.12
+              ],
+              [
+                0.86,
+                0.125
+              ],
+              [
+                0.86,
+                0.24
+              ],
+              [
+                0.08,
+                0.25
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 1.0
+          },
+          {
+            "id": "boat",
+            "pane": 0,
+            "corridor": "boat",
+            "quad": [
+              [
+                0.33,
+                0.36
+              ],
+              [
+                1.0,
+                0.36
+              ],
+              [
+                1.0,
+                1.0
+              ],
+              [
+                0.52,
+                1.0
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 1.0
+          }
+        ]
+      },
+      {
+        "name": "single_low",
+        "panes": 1,
+        "recordings": [
+          "14-18-08"
+        ],
+        "lanes": [
+          {
+            "id": "train",
+            "pane": 0,
+            "corridor": "train",
+            "quad": [
+              [
+                0.063,
+                0.243
+              ],
+              [
+                0.85,
+                0.241
+              ],
+              [
+                0.84,
+                0.4
+              ],
+              [
+                0.072,
+                0.4
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 1.0
+          },
+          {
+            "id": "boat",
+            "pane": 0,
+            "corridor": "boat",
+            "quad": [
+              [
+                0.35,
+                0.5
+              ],
+              [
+                1.0,
+                0.48
+              ],
+              [
+                1.0,
+                1.0
+              ],
+              [
+                0.55,
+                1.0
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 1.0
+          }
+        ]
+      },
+      {
+        "name": "dual",
+        "panes": 2,
+        "recordings": [],
+        "lanes": [
+          {
+            "id": "train_M1",
+            "pane": 0,
+            "corridor": "train",
+            "quad": [
+              [
+                0.24,
+                0.27
+              ],
+              [
+                1.0,
+                0.13
+              ],
+              [
+                1.0,
+                0.23
+              ],
+              [
+                0.24,
+                0.37
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 0.58
+          },
+          {
+            "id": "train_M2",
+            "pane": 1,
+            "corridor": "train",
+            "quad": [
+              [
+                0.0,
+                0.19
+              ],
+              [
+                0.64,
+                0.085
+              ],
+              [
+                0.64,
+                0.165
+              ],
+              [
+                0.0,
+                0.3
+              ]
+            ],
+            "s0": 0.37,
+            "s1": 1.0
+          },
+          {
+            "id": "boat_M1",
+            "pane": 0,
+            "corridor": "boat",
+            "quad": [
+              [
+                0.0,
+                0.45
+              ],
+              [
+                0.42,
+                0.5
+              ],
+              [
+                0.32,
+                1.0
+              ],
+              [
+                0.0,
+                0.62
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 0.32
+          },
+          {
+            "id": "boat_M2",
+            "pane": 1,
+            "corridor": "boat",
+            "quad": [
+              [
+                0.05,
+                0.33
+              ],
+              [
+                0.85,
+                0.31
+              ],
+              [
+                0.8,
+                0.62
+              ],
+              [
+                0.05,
+                0.9
+              ]
+            ],
+            "s0": 0.4,
+            "s1": 1.0
+          }
+        ]
+      }
+    ],
+    "canvas": {
+      "width": 832,
+      "height": 442
     }
   },
   "cameras": [

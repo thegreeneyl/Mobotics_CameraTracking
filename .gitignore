@@ -9,3 +9,6 @@
 
 # Stream recordings (large .mjpeg dumps + sidecars)
 /bin/data/recordings/
+
+# Batch evaluation output (regenerate with CAMTRACK_BATCH=all)
+/bin/data/eval/

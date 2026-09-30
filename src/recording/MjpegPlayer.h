@@ -43,6 +43,10 @@ public:
 	void next();     // older recording
 	void previous(); // newer recording
 
+	// Seek within the currently playing recording by deltaMs (e.g. +/-1000),
+	// clamped to [0, duration]. Applied on the playback thread.
+	void seekBy(int deltaMs);
+
 	// Copies out the newest decoded frame if newer than lastSeenFrameId.
 	// frameTMs is the frame's recording-relative timestamp in ms.
 	bool getLatestFrame(ofPixels & pixels, SensorSnapshot & sensors,
@@ -87,7 +91,8 @@ private:
 
 	std::thread playThread;
 	std::atomic<bool> running{false};
-	std::atomic<int> pendingJump{0}; // accumulated next(+1)/previous(-1)
+	std::atomic<int> pendingJump{0};   // accumulated next(+1)/previous(-1)
+	std::atomic<int> pendingSeekMs{0}; // accumulated seekBy() deltas
 	std::atomic<int> decodeScale{1};
 
 	// playback-thread state

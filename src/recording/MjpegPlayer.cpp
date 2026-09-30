@@ -65,6 +65,7 @@ bool MjpegPlayer::scan(const std::string & dirAbs){
 	});
 
 	pendingJump = 0;
+	pendingSeekMs = 0;
 	running = true;
 	playThread = std::thread(&MjpegPlayer::threadFn, this);
 	return true;
@@ -161,6 +162,10 @@ void MjpegPlayer::previous(){
 	pendingJump--;
 }
 
+void MjpegPlayer::seekBy(int deltaMs){
+	pendingSeekMs += deltaMs;
+}
+
 void MjpegPlayer::threadFn(){
 	if(!open(0)){
 		running = false;
@@ -178,6 +183,19 @@ void MjpegPlayer::threadFn(){
 		if(frames.empty()){
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			continue;
+		}
+
+		// Apply queued seeks (+/- within the current recording): shift the
+		// playback clock and rewind the cursor to the frame at-or-before the
+		// target so it is (re)shown immediately.
+		const int seekMs = pendingSeekMs.exchange(0);
+		if(seekMs != 0){
+			const double target = std::clamp(nowMs() - clockStartMs + seekMs, 0.0, durationMs);
+			clockStartMs = nowMs() - target;
+			const auto it = std::upper_bound(frames.begin(), frames.end(), target,
+			                                 [](double t, const FrameIndex & f){ return t < f.tMs; });
+			frameCursor = (it == frames.begin()) ? 0 : static_cast<size_t>(it - frames.begin()) - 1;
+			publishInfo();
 		}
 
 		const double elapsed = nowMs() - clockStartMs;

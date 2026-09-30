@@ -1,0 +1,43 @@
+# Full-suite score after the 14-18-08 tuning pass (boat minFlowPx/mog/size limits, train preset 2 + minHeightFrac,
+# flow-seeded fill, posMeasNoise 1e-3, clipFrames 3, stopMinWidthFrac, single_low train lane end 0.85) — config.json as of this commit
+# CAMTRACK_BATCH=all CAMTRACK_OUT=... ; python3 tools/eval/score.py <out> --match class
+# 14-18-08 jitter 11.2e-3 -> 1.2e-3, boat tracked as one id 25.0-56.5 s (visible until ~56 s), train 65.7-84 s.
+
+
+== rec_2026-09-23_14-18-08  frames=3194  tracks=2  false=0  jitter=1.2e-3  vstd=0.02  OK
+  class         window  ids maxsim  cover  sw   dir  ids
+  boat     27.0-  49.0    1      1   1.00   0  1.00  ok  [1] (approx)
+  train    64.5-  83.0    1      1   1.00   0  1.00  ok  [4] (approx)
+
+== rec_2026-09-23_14-29-12  frames=8152  tracks=2  false=0  jitter=0.61e-3  vstd=0.015  OK
+  class         window  ids maxsim  cover  sw   dir  ids
+  train    32.0-  53.0    1      1   1.00   0  1.00  ok  [2] (approx)
+  train   112.0- 131.0    1      1   1.00   0  1.00  ok  [6] (approx)
+
+== rec_2026-09-23_14-34-16  frames=8181  tracks=5  false=0  jitter=0.59e-3  vstd=0.015  OK
+  class         window  ids maxsim  cover  sw   dir  ids
+  train    41.0-  59.0    1      1   1.00   0  1.00  ok  [1]
+  train    60.5-  78.0    1      1   1.00   0  1.00  ok  [2]
+  boat    141.0- 166.0    1      1   1.00   0  1.00  ok  [1]
+  train   188.0- 206.5    1      1   1.00   0  1.00  ok  [4]
+  train   227.0- 246.5    1      1   1.00   0  1.00  ok  [5]
+
+== rec_2026-09-23_14-43-02  frames=9333  tracks=5  false=0  jitter=1.48e-3  vstd=0.03  OK
+  class         window  ids maxsim  cover  sw   dir  ids
+  train     1.0-  20.0    1      1   1.00   0  1.00  ok  [1] (approx)
+  train   107.0- 131.0    1      1   1.00   0  1.00  ok  [5] (approx)
+  train   145.0- 169.0    1      1   1.00   0  1.00  ok  [7] (approx)
+  train   254.0- 277.0    1      1   1.00   0  1.00  ok  [12] (approx)
+  train   299.0- 322.0    1      1   1.00   0  1.00  ok  [15] (approx)
+
+== rec_2026-09-23_14-54-33  frames=2637  tracks=2  false=0  jitter=1.83e-3  vstd=0.032  OK
+  class         window  ids maxsim  cover  sw   dir  ids
+  train     6.0-  28.0    1      1   1.00   0  1.00  ok  [1] (approx)
+  train    55.0-  77.0    1      1   1.00   0  1.00  ok  [4] (approx)
+
+== rec_2026-09-23_15-02-15  frames=2211  tracks=2  false=0  jitter=1.46e-3  vstd=0.025  OK
+  class         window  ids maxsim  cover  sw   dir  ids
+  train    23.0-  45.0    1      1   1.00   0  1.00  ok  [3] (approx)
+  train    46.0-  67.0    1      1   1.00   0  1.00  ok  [5] (approx)
+
+TOTAL: 18 events in 6 recordings -> ALL OK

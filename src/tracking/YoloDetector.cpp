@@ -50,7 +50,7 @@ YoloDetector::YoloDetector(const YoloConfig & config) : cfg(config){
 	}
 }
 
-std::vector<Detection> YoloDetector::detect(const cv::Mat & pane){
+std::vector<Detection> YoloDetector::detect(const cv::Mat & pane, double){
 	std::vector<Detection> detections;
 	if(!loaded || pane.empty()) return detections;
 
@@ -127,10 +127,14 @@ std::vector<Detection> YoloDetector::detect(const cv::Mat & pane){
 	for(const int idx : keep){
 		const cv::Rect & box = boxes[idx];
 		Detection d;
-		d.x = (box.x + box.width * 0.5f) / paneW;
-		d.y = (box.y + box.height * 0.5f) / paneW; // width-normalized
-		d.w = box.width / paneW;
-		d.h = box.height / paneW;
+		d.x0 = box.x / paneW;
+		d.x1 = (box.x + box.width) / paneW;
+		d.y0 = box.y / paneH;
+		d.y1 = (box.y + box.height) / paneH;
+		d.area = d.w() * d.h();
+		d.touchesLeft = box.x <= 2;
+		d.touchesRight = box.x + box.width >= static_cast<int>(paneW) - 2;
+		d.hasVelocity = false;
 		d.confidence = scores[idx];
 		if(classIds[idx] >= 0 && classIds[idx] < static_cast<int>(kCocoNames.size())){
 			d.label = kCocoNames[classIds[idx]];

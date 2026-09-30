@@ -1,0 +1,167 @@
+{
+  "_comment": [
+    "Hand-annotated ground truth for the recordings in bin/data/recordings.",
+    "Times are recording-relative seconds (from the sidecar), read off frame strips at 1-2 s steps.",
+    "direction: 'left' = the object travels toward -x (enters at the right edge), 'right' = toward +x.",
+    "approx: true marks windows read at 3-4 s steps or in the small dual-view thumbnails (tolerance +-4 s);",
+    "coarse: true marks events that were barely legible and are reported but never gate a run.",
+    "Windows cover the time the object is visible INSIDE the configured lane: in the single view the",
+    "viaduct is hidden behind the building left of x=0.08 and behind the trees right of x=0.86 (the",
+    "S-Bahn platform), so trains 'enter'/'exit' there, not at the frame edges."
+  ],
+  "tolerance_s": 2.0,
+  "tolerance_approx_s": 4.0,
+  "recordings": {
+    "rec_2026-09-23_14-34-16": {
+      "layout": "single",
+      "events": [
+        {
+          "class": "train",
+          "t0": 41,
+          "t1": 59,
+          "direction": "left"
+        },
+        {
+          "class": "train",
+          "t0": 60.5,
+          "t1": 78,
+          "direction": "right"
+        },
+        {
+          "class": "boat",
+          "t0": 141,
+          "t1": 166,
+          "direction": "left"
+        },
+        {
+          "class": "train",
+          "t0": 188,
+          "t1": 206.5,
+          "direction": "left"
+        },
+        {
+          "class": "train",
+          "t0": 227,
+          "t1": 246.5,
+          "direction": "right"
+        }
+      ]
+    },
+    "rec_2026-09-23_14-29-12": {
+      "layout": "single",
+      "events": [
+        {
+          "class": "train",
+          "t0": 32,
+          "t1": 53,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 112,
+          "t1": 131,
+          "direction": "right",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-09-23_14-18-08": {
+      "layout": "single_low",
+      "events": [
+        {
+          "class": "boat",
+          "t0": 27,
+          "t1": 49,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 64.5,
+          "t1": 83,
+          "direction": "right",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-09-23_14-54-33": {
+      "layout": "dual",
+      "events": [
+        {
+          "class": "train",
+          "t0": 6,
+          "t1": 28,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 55,
+          "t1": 77,
+          "direction": "right",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-09-23_15-02-15": {
+      "layout": "dual",
+      "events": [
+        {
+          "class": "train",
+          "t0": 23,
+          "t1": 45,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 46,
+          "t1": 67,
+          "direction": "right",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-09-23_14-43-02": {
+      "layout": "dual",
+      "events": [
+        {
+          "class": "train",
+          "t0": 1,
+          "t1": 20,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 107,
+          "t1": 131,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 145,
+          "t1": 169,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 254,
+          "t1": 277,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 299,
+          "t1": 322,
+          "direction": "right",
+          "approx": true
+        }
+      ]
+    }
+  }
+}

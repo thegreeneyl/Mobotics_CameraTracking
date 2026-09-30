@@ -9,41 +9,39 @@
 
 namespace tracking {
 
-// Class-tag zone on a fixed camera: any detection whose centroid falls
-// inside the band gets the zone's label (train corridor -> "train", river
-// band -> "boat", road -> "car"). Coordinates are fractions of the pane:
-// y0/y1 of pane HEIGHT, x0/x1 of pane WIDTH.
-struct Zone {
-	std::string label;
-	float y0 = 0, y1 = 1;
-	float x0 = 0, x1 = 1;
-};
-
 struct BgsConfig {
 	int history = 500;         // MOG2 background model length (frames)
 	double varThreshold = 16;  // MOG2 pixel variance threshold
 	double learningRate = -1;  // -1 = automatic
-	float minAreaNorm = 0.0005f; // min blob area as fraction of pane area
+	float minAreaNorm = 0.0005f; // min blob area as fraction of lane area
 	float maxAreaNorm = 0.5f;    // max blob area (rejects lighting flips)
 	int morphOpenPx = 3;   // opening kernel (kills speckle / water glint)
 	int morphClosePx = 9;  // closing kernel (merges broken object parts)
 };
 
-// Background-subtraction detector: MOG2 -> shadow removal -> morphology ->
-// contours -> area filter -> zone-based labels. Runs on a grayscale
-// analysis pane at full frame rate; no ML model needed.
+// Legacy background-subtraction detector: MOG2 -> shadow removal ->
+// morphology -> contours -> area filter. No velocity measurement (the
+// tracker then derives velocity from box motion only). Kept as a fallback
+// and for A/B comparison against FlowMotionDetector.
 class BgsDetector : public IDetector {
 public:
-	BgsDetector(const BgsConfig & config, std::vector<Zone> zones);
+	explicit BgsDetector(const BgsConfig & config);
 
-	std::vector<Detection> detect(const cv::Mat & pane) override;
+	// Live tuning: area/learning-rate changes apply immediately; the MOG2
+	// model is recreated (background relearns) only when history or
+	// varThreshold change, kernels rebuild only when their sizes change.
+	void setConfig(const BgsConfig & config);
+
+	std::vector<Detection> detect(const cv::Mat & lane, double dtSec) override;
 	void reset() override;
 	bool wantsColor() const override { return false; }
 	const char * name() const override { return "bgs"; }
+	const cv::Mat & debugMask() const override { return fgMask; }
 
 private:
+	void rebuildKernels();
+
 	BgsConfig cfg;
-	std::vector<Zone> zones;
 	cv::Ptr<cv::BackgroundSubtractorMOG2> mog2;
 	cv::Mat fgMask;
 	cv::Mat openKernel, closeKernel;
