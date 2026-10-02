@@ -43,6 +43,10 @@ entry is a stub for later.
 - `o` — toggle the tracking debug overlay
 - `m` — show the detector's motion mask behind the rectified lane views
 - `d` — draw raw (pre-tracker) detections in grey
+- `x` / `n` / `b` — the three result layers of a tracked object: the
+  pixels currently attributed to it (`x`, off by default), its smoothed
+  outline (`n`) and its bounding box (`b`). Each is independent; see
+  *Object outline*
 - `[` / `]` — select the previous / next lane for editing
 - `v` — result view: output canvas (default) / rectified lane strips
 - `,` / `.` — select the previous / next corridor for placing on the canvas
@@ -52,18 +56,22 @@ entry is a stub for later.
 - `UP` / `DOWN` — seek +/-1 s within the current recording (playback mode)
 - GUI: preview toggle, JPEG quality (preview only), COM dump toggle,
   record toggle, playback-mode toggle, tracking/overlay/mask/detections
-  toggles, result view switch (0 canvas / 1 lane strips), detector switch
+  toggles, the three result layers (`shape pixels`, `shape outline`,
+  `bounding box`), result view switch (0 canvas / 1 lane strips), detector switch
   (0 flow / 1 bgs / 2 yolo), half-res display decode toggle, UDP publish
   toggle
-- Tracking panel (below the stream panel): lane selector with the selected
+- Tracking panel (below the stream panel): lens correction at the top
+  (`lens correct`, `fov deg`, `k1`, `k2`, `balance`, optical center — see
+  *Lens correction*), lane selector with the selected
   lane's corridor range `s0`/`s1`, corridor selector with the selected
   corridor's canvas placement `place x0/x1/y0/y1` (see *Canvas placement*
   below), live sliders for the flow detector
   (`minFlowPx`, `ema`, `busyThresh`, MOG2 on/off + `varThreshold`, closing
   kernel, `minAreaFrac`, `minCoherence`, `minSpeed`, `mergeGapFrac`), the
   tracker (`confirmFrames`, `maxMisses`, `gateGapFrac`, `absorbGapFrac`,
-  `mergeFrames`, `reacquireMs`, `velMeasNoise`, trail length), YOLO
-  thresholds and the overlay arrow scale. Changes reach the tracking worker
+  `mergeFrames`, `reacquireMs`, `velMeasNoise`, trail length), the shape
+  estimator (`shape 0mask 1fg 2model`, `ema`, `threshold`, `padX`, `padY`,
+  `simplify`), YOLO thresholds and the overlay arrow scale. Changes reach the tracking worker
   within ~250 ms — tweak while watching the overlay. "save to config.json"
   writes the current values (plus the layouts, canvas and corridor
   placements) back into the `tracking` section of the loaded config file;
@@ -83,7 +91,8 @@ entry is a stub for later.
     placement rectangle (dim where it lies outside the canvas — that part of
     the corridor is cut) and the tracked objects exactly as they are
     published: mapped through the placement and clipped at the canvas edge
-    (the uncut box is drawn dim behind it). The selected corridor has corner
+    (the uncut box and outline are drawn dim behind them). Which layers are
+    shown is up to `x`/`n`/`b`. The selected corridor has corner
     handles; drag a corner to resize, drag the body to move — grabbing
     another corridor selects it. The `place` sliders follow the drag and can
     be used instead of it.
@@ -113,9 +122,12 @@ keeps running in the background but is ignored; `TAB` returns to it
 instantly. Entering playback stops an active recording first.
 
 Headless check: `CAMTRACK_AUTOSHOT=/tmp/shot.png ./YOUniverse_CameraTracking`
-streams for ~8 s, saves a screenshot, and exits. Stats are logged every 5 s.
-Add `CAMTRACK_AUTOPLAYBACK=1` to start in playback mode instead (verifies
-recording playback + tracking without a reachable camera).
+streams for ~8 s (`CAMTRACK_AUTOSHOT_SEC` to change), saves a screenshot,
+and exits. Stats are logged every 5 s. Add `CAMTRACK_AUTOPLAYBACK=1` to
+start in playback mode instead (verifies recording playback + tracking
+without a reachable camera); `CAMTRACK_RECORDINGS=<dir>` then picks the
+recordings folder, so a folder holding one symlinked recording plays
+exactly that one.
 
 ## Stream ingest (what was chosen and why)
 
@@ -160,11 +172,42 @@ no appearance classification: the class of an object is the corridor it
 travels in. Code lives in `src/tracking/` (no UI dependencies, reusable by
 Steuerung); it runs in LIVE and PLAYBACK mode and headless in batch mode.
 
+### Lens correction
+
+The camera lens is wide enough that a straight viaduct bows across the
+frame, so a train's box changes shape as it passes. `tracking.lens`
+undistorts that **before anything else** — before the picture is shown and
+before the lane warp — with OpenCV's equidistant fisheye model. The image
+in the window is the corrected one; lane corners are drawn and stored in
+that same image, not in the raw camera frame.
+
+A side-by-side BOTH frame is two lenses: each half is corrected about its
+own center. One coefficient set is shared (the modules are the same lens).
+
+| Key | Meaning |
+| --- | --- |
+| `enabled` | off copies the camera frame through |
+| `fovDeg` | horizontal field of view of one pane, in degrees. This is the strength: raise it until the viaduct is a straight line. Too high and the line bends the other way and the corners stretch |
+| `k1`..`k4` | how the lens differs from an equidistant fisheye. Leave at 0 until `fovDeg` alone cannot straighten the line |
+| `balance` | 0 fills the frame (the invalid corners are cropped), 1 keeps every source pixel (black corners) |
+| `centerX`, `centerY` | optical center as a fraction of the pane, when the bow is not symmetric |
+
+The sliders are the first rows of the tracking panel and reach both the
+picture and the tracker immediately. "save to config.json" writes them.
+`fovDeg` 170 is the starting point for this lens: on
+`rec_2026-09-23_14-18-08` it takes the viaduct's bow (about 116 px of sag
+on a 1920-wide frame) down to a few pixels. What is left of the slope is
+perspective — the track is not square to the camera — and no lens model
+removes that. Drag `fov deg` while a train is in frame until the deck is a
+straight line. Lane corners placed before the correction was
+turned on sat on the distorted image and will miss the viaduct until you
+drag them back onto it.
+
 ### Lanes and corridors
 
 The geometry is configured, not detected. A **lane** is a four-corner quad
-on one camera pane (`tracking.layouts[].lanes[]`, corners TL,TR,BR,BL in
-pane UV) that is perspective-warped to an upright strip (at most
+on one lens-corrected camera pane (`tracking.layouts[].lanes[]`, corners
+TL,TR,BR,BL in pane UV) that is perspective-warped to an upright strip (at most
 `laneMaxWidth` px wide, at least `laneMinHeight` px high) before analysis.
 A **corridor** is the physical path an object follows (`train`, `boat`,
 …); one or more lanes feed it, each covering the corridor range `s0..s1`
@@ -339,6 +382,86 @@ edges) and `velMeasNoise` (flow velocity). Raising `posMeasNoise` from
 lag; the along-axis position is dominated by the pinned edges and the
 velocity anyway.
 
+### Object outline
+
+Besides the box, every confirmed object carries a silhouette: `ShapeEstimator`
+(`tracking.shape`) keeps per object a `gridW × gridH` (96×32) occupancy
+grid pinned to the tracked box (plus `padX`/`padY` margin), so the shape
+rides along with the Kalman box and stays put when the object does. Each
+frame the grid is refreshed from a *shape source* and blended with an EMA
+(`ema` 0.25, the first observation seeds it); the outline is the largest
+contour of the thresholded (`threshold`), 4× upsampled, morphologically
+closed (`closeCells`) grid, simplified with `approxPolyDP` (`simplify`, in
+cells). Pixels, outline and box are independent display layers (`x`/`n`/`b`)
+and the outline is published (see *Output*). A `stopped` object keeps its
+last shape. The tracker never reads the shape — enabling or disabling it
+leaves the tracks identical.
+
+The three sources (`source`):
+
+| `source` | what fills the grid | character |
+| --- | --- | --- |
+| 0 `mask` | the detector's final motion mask (closed, dilated) | blobby, follows the box |
+| 1 `foreground` | the raw MOG2 foreground, before closing | finer, but gaps where the object is untextured (roof, deck) |
+| 2 `model` (default) | an instance segmentation model run on the colour crop of the tracked box | the actual silhouette — the stern cabin of a boat, the gap between two coupled cars |
+
+The model is YOLOv8n-seg, run through the bundled OpenCV `dnn`
+(`models/yolov8n-seg-192x640.onnx`, 13.7 MB). It is exported with a fixed
+**rectangular** input (`modelInputW × modelInputH`, 640×192) because a
+train in the lane is ~6:1 — letterboxed into a square it would be a 70 px
+strip and the model finds nothing. The crop is the tracked box plus
+`modelPad` (25 %) of margin, in the lane's own pane; all instances that
+overlap the box (IoU ≥ `modelMinIou`, or mostly inside it and at least 3 %
+of its area) are unioned, so a train split into two instances still yields
+one shape, and the mask is warped back through the lane homography. Class
+labels are deliberately ignored (the model calls the boat a "keyboard" at
+times, but segments it right). The forward pass costs ~25–30 ms on an M2
+Max, so it runs every `modelEveryN` (2) frames, staggered by object id, at
+most `modelMaxPerFrame` (2) objects per frame; the EMA bridges the frames
+in between.
+
+A crop wider than `modelMaxAspect` (6.5 — about twice the input's 3.3) is
+cut into tiles with `modelTileOverlap` (15 %) overlap, and **one tile per
+model call**, round-robin per object. Without this a full-length train
+(crop ~1800×160) letterboxed into 640×192 is a 57 px ribbon and the model
+returns nothing at all — the outline tracked fine while the train was
+short and collapsed the moment it spanned the viaduct (`14-29-12` at
+t ≈ 40 s). Two tiles make it ~110 px tall and the model finds it on both
+(2/2 hits, 85 % of the length covered, versus 0/1); more tiles cost more
+and lose the end cars at the seams. Cells outside the current tile are
+*unobserved*, not empty, so the other half of the train keeps its last
+state; the whole object is refreshed every `modelEveryN × tiles` frames.
+
+If the model finds nothing for `modelHoldFrames` (45) frames the grid
+falls back to the closed detector mask (the solid bar in the lane strip)
+until the model returns. A grid that holds a model silhouette is blended
+toward that bar at `fallbackEma` (0.06) rather than `ema`: at 0.25 the raw
+MOG2 fallback used to erase a train in three frames and leave one blob
+(the overlay label then reads `shape:model+mask`). If the model file is
+missing or fails to load, the estimator logs once and uses the mask
+throughout. Batch average with two objects at most: ~6 ms/frame
+(`avg_shape_ms` in the summary, `shp` in the stats bar); tiling does not
+change it — a call is still one forward pass.
+
+Re-export the model (needs Python + `ultralytics`; the bundled `cv2` is not
+required):
+
+```bash
+python3 -m venv /tmp/yoloseg && . /tmp/yoloseg/bin/activate && pip install ultralytics
+yolo export model=yolov8n-seg.pt format=onnx imgsz=192,640 opset=12 simplify=True
+# -> yolov8n-seg.onnx, copy to bin/data/models/ and set tracking.shape.model
+```
+
+`model`, `modelInputW/H` are read at startup; everything else in
+`tracking.shape` is live (GUI sliders for `source`, `ema`, `threshold`,
+`padX`, `padY`, `simplify`) and can be overridden per corridor
+(`tracking.corridors.<id>.shape`). Limits: at night (IR, the train is a row
+of lit windows) the model mostly fails and the mask fallback gives the
+detector's bar rather than a silhouette — the boat still segments well; the model sees
+only what the tracked box covers, so when the motion detector lags behind
+an untextured stern the outline can extend beyond the detections but not
+beyond the box plus `padX`.
+
 ### Evaluation harness
 
 Headless batch mode processes recordings unpaced (~80 fps single, ~40 fps
@@ -376,17 +499,22 @@ and all object coordinates are canvas-normalized (0..1, see *Canvas
 placement*): per object `id`, `class`, `bbox` `[x, y, w, h]`, `x`/`y`
 (center), `vx`/`vy`/`speed`, `heading`/`heading_deg`, `phase`
 (`entering|crossing|exiting|moving|stopped`), `clipped`, `region`, `fill`, a
-short `path`, and — extra — the uncut corridor-normalized `corridor {x, y,
-w, h, vx, vy}` and, for overlays, the back-projected `panes[]` boxes.
+short `path`, and — extra — `outline` (the object's silhouette as a closed
+polygon `[[x, y], …]` in canvas coordinates, clipped to the canvas like the
+box; empty until the shape has its first observation or when
+`tracking.shape.enabled` is false), the uncut corridor-normalized `corridor
+{x, y, w, h, vx, vy}` and, for overlays, the back-projected `panes[]` boxes.
 `view` is the corridor id. With
 `output.udp.enabled` the app sends one datagram per analysed frame to
 `output.udp.host:port` (toggle in the GUI); the batch runner writes the
 same frames under `{"kind": "recording"}`.
 
-The debug overlay (`o`) draws per object, in a stable per-id color: bounding
-box (per lane it is visible in), center point, velocity arrow (1 s
+The debug overlay (`o`) draws per object, in a stable per-id color: the
+shape pixels (`x`), the outline (`n`) and the bounding box (`b`) — each per
+lane it is visible in — plus center point, velocity arrow (1 s
 lookahead × `overlay.arrowScale`), fading trail, and `#id label phase
-speed`. Tentative tracks are dimmed with a `?`.
+speed shape:<source>`. Tentative tracks are dimmed with a `?`. The batch
+contact sheets and lane strips draw the outline together with the box.
 
 ### Threading & decode
 

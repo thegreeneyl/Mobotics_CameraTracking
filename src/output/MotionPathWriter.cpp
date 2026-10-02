@@ -27,6 +27,38 @@ std::string regionLabel(float x, float y){
 }
 } // namespace
 
+std::vector<std::pair<float, float>> clipPolygonToCanvas(const std::vector<std::pair<float, float>> & poly){
+	using P = std::pair<float, float>;
+	std::vector<P> cur = poly;
+	// edges: axis (0 = x, 1 = y), bound, keep side (+1 keep >= bound, -1 keep <= bound)
+	const struct { int axis; float bound; int side; } edges[4] = {
+		{0, 0.0f, +1}, {0, 1.0f, -1}, {1, 0.0f, +1}, {1, 1.0f, -1}};
+	for(const auto & e : edges){
+		if(cur.size() < 3) return {};
+		std::vector<P> next;
+		next.reserve(cur.size() + 4);
+		const auto coord = [&](const P & p){ return e.axis == 0 ? p.first : p.second; };
+		const auto inside = [&](const P & p){
+			return e.side > 0 ? coord(p) >= e.bound : coord(p) <= e.bound;
+		};
+		const auto intersect = [&](const P & a, const P & b){
+			const float da = coord(a), db = coord(b);
+			const float t = std::fabs(db - da) < 1e-9f ? 0.0f : (e.bound - da) / (db - da);
+			return P{a.first + (b.first - a.first) * t, a.second + (b.second - a.second) * t};
+		};
+		for(size_t i = 0; i < cur.size(); i++){
+			const P & a = cur[i];
+			const P & b = cur[(i + 1) % cur.size()];
+			const bool ia = inside(a), ib = inside(b);
+			if(ia && ib) next.push_back(b);
+			else if(ia && !ib) next.push_back(intersect(a, b));
+			else if(!ia && ib){ next.push_back(intersect(a, b)); next.push_back(b); }
+		}
+		cur.swap(next);
+	}
+	return cur.size() < 3 ? std::vector<P>{} : cur;
+}
+
 std::vector<MotionObject> fromTrackingResults(const tracking::TrackingResults & res){
 	std::vector<MotionObject> out;
 	for(const auto & cr : res.corridors){
@@ -66,6 +98,14 @@ std::vector<MotionObject> fromTrackingResults(const tracking::TrackingResults & 
 			mo.corridor.h = o.h;
 			mo.corridor.vx = o.vx;
 			mo.corridor.vy = o.vy;
+			if(o.shape.valid && !o.shape.outline.empty()){
+				std::vector<std::pair<float, float>> poly;
+				poly.reserve(o.shape.outline.size());
+				for(const auto & p : o.shape.outline){
+					poly.emplace_back(pl.toCanvasX(p.first), pl.toCanvasY(p.second));
+				}
+				mo.outline = clipPolygonToCanvas(poly);
+			}
 			// Back-project onto each lane of the corridor. The lane quad is
 			// a perspective map; we approximate the box by the bilinear
 			// image of its lane-space corners' bounding box (exact for
@@ -130,6 +170,8 @@ ofJson buildFrame(const std::vector<MotionObject> & objects, double tSec, int fr
 			panes.push_back({{"pane", p.pane},
 			                 {"bbox", {round4(p.x), round4(p.y), round4(p.w), round4(p.h)}}});
 		}
+		ofJson outline = ofJson::array();
+		for(const auto & p : o.outline) outline.push_back({round4(p.first), round4(p.second)});
 		ofJson j = {
 			{"id", o.id},
 			{"view", o.view},
@@ -150,6 +192,7 @@ ofJson buildFrame(const std::vector<MotionObject> & objects, double tSec, int fr
 			              {"w", round4(o.corridor.w)}, {"h", round4(o.corridor.h)},
 			              {"vx", round4(o.corridor.vx)}, {"vy", round4(o.corridor.vy)}}},
 			{"panes", panes},
+			{"outline", outline},
 			{"path", path},
 		};
 		objs.push_back(std::move(j));

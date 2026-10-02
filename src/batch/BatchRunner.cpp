@@ -20,6 +20,7 @@
 #include "../tracking/TrackingConfigJson.h"
 #include "../tracking/TrackingManager.h"
 #include "../util/JpegDecode.h"
+#include "../util/LensCorrector.h"
 
 namespace batch {
 
@@ -112,6 +113,22 @@ void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tS
 				float lx0, lx1;
 				if(!lane.corridorRangeToLane(o.x0, o.x1, lx0, lx1)) continue;
 				const cv::Mat & h = laneH[li];
+				// silhouette outline (corridor coords -> this lane -> photo)
+				if(o.shape.valid && o.shape.outline.size() >= 3){
+					std::vector<cv::Point> poly;
+					for(const auto & q : o.shape.outline){
+						const float lx = lane.toLane(q.first);
+						if(lx < -0.001f || lx > 1.001f) continue;
+						const cv::Point2f pp = project(h, lx, q.second);
+						poly.emplace_back(static_cast<int>(std::lround(pp.x)), static_cast<int>(std::lround(pp.y)));
+					}
+					if(poly.size() >= 3){
+						cv::Mat fill = img.clone();
+						cv::fillPoly(fill, std::vector<std::vector<cv::Point>>{poly}, col);
+						cv::addWeighted(img, 0.75, fill, 0.25, 0, img);
+						cv::polylines(img, poly, true, col, thick, cv::LINE_AA);
+					}
+				}
 				const cv::Point2f p[4] = {project(h, lx0, o.y0), project(h, lx1, o.y0),
 				                          project(h, lx1, o.y1), project(h, lx0, o.y1)};
 				for(int c = 0; c < 4; c++) cv::line(img, p[c], p[(c + 1) % 4], col, thick, cv::LINE_AA);
@@ -185,6 +202,22 @@ cv::Mat stripSheet(const cv::Mat & frame, const tracking::TrackingResults & res)
 			cv::putText(strip, "v" + ofToString(d.vx, 3) + " coh" + ofToString(d.coherence, 2),
 			            r.tl() + cv::Point(2, -3), cv::FONT_HERSHEY_SIMPLEX, 0.35, cv::Scalar(0, 255, 255), 1);
 		}
+		// tracked objects' outlines in lane space (on the strip)
+		for(const auto & cr : res.corridors){
+			const int laneIdx = static_cast<int>(&ld - res.lanes.data());
+			if(std::find(cr.lanes.begin(), cr.lanes.end(), laneIdx) == cr.lanes.end()) continue;
+			for(const auto & o : cr.objects){
+				if(!o.shape.valid || o.shape.outline.size() < 3) continue;
+				std::vector<cv::Point> poly;
+				for(const auto & q : o.shape.outline){
+					const float lx = ld.lane.toLane(q.first);
+					if(lx < -0.001f || lx > 1.001f) continue;
+					poly.emplace_back(static_cast<int>(std::lround(lx * ld.maskW)),
+					                  static_cast<int>(std::lround(q.second * ld.maskH)));
+				}
+				if(poly.size() >= 3) cv::polylines(strip, poly, true, colorForId(o.id), o.confirmed ? 2 : 1, cv::LINE_AA);
+			}
+		}
 		cv::putText(strip, ld.lane.id, cv::Point(3, 12), cv::FONT_HERSHEY_SIMPLEX, 0.4, cv::Scalar(60, 210, 255), 1);
 		rows.push_back(strip);
 		rows.push_back(maskBgr);
@@ -242,6 +275,8 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 	cfg.enabled = true;
 	cfg.sourceName = reader.name();
 	manager.setupSync(cfg);
+	LensCorrector sheetLens;
+	sheetLens.set(cfg.lens);
 
 	std::unique_ptr<output::MotionPathRecording> recording; // created on the first frame (size)
 	std::vector<cv::Mat> thumbs;
@@ -259,7 +294,7 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 
 	std::vector<uint8_t> jpeg;
 	tracking::TrackingResults res;
-	double sumDecode = 0, sumDetect = 0, sumTrack = 0;
+	double sumDecode = 0, sumDetect = 0, sumTrack = 0, sumShape = 0;
 	size_t processed = 0, failed = 0;
 	const double t0 = nowMs();
 	size_t nextProgress = n / 10;
@@ -274,6 +309,7 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 		sumDecode += res.decodeMs;
 		sumDetect += res.detectMs;
 		sumTrack += res.trackMs;
+		sumShape += res.shapeMs;
 
 		if(!recording){
 			thumbCols = res.paneCount >= 2 ? 2 : 4;
@@ -312,7 +348,10 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 			nextThumbSec += opts.sheetIntervalSec;
 			cv::Mat bgr;
 			if(jpegdecode::decodeToBgrMat(jpeg.data(), jpeg.size(), bgr, 4)){
-				drawOverlay(bgr, res, tSec);
+				cv::Mat corrected;
+				sheetLens.apply(bgr, corrected);
+				drawOverlay(corrected, res, tSec);
+				bgr = corrected;
 				thumbs.push_back(bgr);
 			}
 		}
@@ -320,8 +359,10 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 			nextStripSec += opts.stripIntervalSec;
 			cv::Mat bgr;
 			if(jpegdecode::decodeToBgrMat(jpeg.data(), jpeg.size(), bgr, 2)){
+				cv::Mat corrected;
+				sheetLens.apply(bgr, corrected);
 				ofDirectory::createDirectory(stripDir, false, true);
-				saveBgr(stripSheet(bgr, res), ofFilePath::join(stripDir,
+				saveBgr(stripSheet(corrected, res), ofFilePath::join(stripDir,
 					reader.name() + "_" + ofToString(tSec, 1, 6, '0') + ".jpg"));
 			}
 		}
@@ -358,6 +399,7 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 		{"avg_decode_ms", processed ? sumDecode / processed : 0.0},
 		{"avg_detect_ms", processed ? sumDetect / processed : 0.0},
 		{"avg_track_ms", processed ? sumTrack / processed : 0.0},
+		{"avg_shape_ms", processed ? sumShape / processed : 0.0},
 		{"detector", res.detectorName},
 		{"layout", res.layoutName},
 		{"analysis_size", {res.analysisW, res.analysisH}},

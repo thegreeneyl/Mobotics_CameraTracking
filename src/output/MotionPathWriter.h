@@ -43,7 +43,15 @@ struct MotionObject {
 	// overlay/debug — extra field, ignored by the motion-path.v1 parser.
 	struct PaneBox { int pane = 0; float x = 0, y = 0, w = 0, h = 0; };
 	std::vector<PaneBox> panes;
+	// Silhouette as a closed polygon on the canvas (same space as bbox,
+	// cut at the canvas edge like the box). Empty while the shape
+	// estimator has nothing yet. Extra field, ignored by older parsers.
+	std::vector<std::pair<float, float>> outline;
 };
+
+// Sutherland-Hodgman clip of a closed polygon to the unit canvas. Returns
+// an empty polygon when nothing remains.
+std::vector<std::pair<float, float>> clipPolygonToCanvas(const std::vector<std::pair<float, float>> & poly);
 
 // Flattens a tracking snapshot: one MotionObject per tracked object of every
 // corridor that still shows on the canvas after the corridor's placement,

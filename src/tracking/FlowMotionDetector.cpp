@@ -58,6 +58,7 @@ std::vector<Detection> FlowMotionDetector::detect(const cv::Mat & lane, double d
 		flowEma = cv::Mat::zeros(H, W, CV_32FC2);
 		busy = cv::Mat::zeros(H, W, CV_32F);
 		mask = cv::Mat::zeros(H, W, CV_8U);
+		fgRaw = cv::Mat::zeros(H, W, CV_8U);
 		if(cfg.useMog2) mog2->apply(lane, fg);
 		return out;
 	}
@@ -98,6 +99,7 @@ std::vector<Detection> FlowMotionDetector::detect(const cv::Mat & lane, double d
 	if(cfg.useMog2){
 		mog2->apply(lane, fg);
 		cv::threshold(fg, fg, 200, 255, cv::THRESH_BINARY);
+		fg.copyTo(fgRaw); // silhouette source, before the dilation
 		if(cfg.mogDilatePx > 1){
 			cv::dilate(fg, fg, cv::getStructuringElement(cv::MORPH_ELLIPSE,
 				cv::Size(cfg.mogDilatePx, cfg.mogDilatePx)));

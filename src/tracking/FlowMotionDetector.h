@@ -73,6 +73,9 @@ public:
 	bool wantsColor() const override { return false; }
 	const char * name() const override { return "flow"; }
 	const cv::Mat & debugMask() const override { return mask; }
+	// The undilated MOG2 foreground: inside a tracked box it is the better
+	// silhouette (a flat roof is foreground even where it has no flow).
+	const cv::Mat & shapeMask() const override { return cfg.useMog2 && !fgRaw.empty() ? fgRaw : mask; }
 
 private:
 	void rebuild();
@@ -86,7 +89,8 @@ private:
 	cv::Mat busy;      // persistent-sparkle accumulator (32F)
 	cv::Mat mask;      // final motion mask (8U)
 	cv::Mat seedMask;  // flow-only mask when the fill is on (velocity source), else empty
-	cv::Mat fg;        // MOG2 foreground
+	cv::Mat fg;        // MOG2 foreground (thresholded + dilated, ANDed with the flow)
+	cv::Mat fgRaw;     // MOG2 foreground, thresholded only (shape source)
 	cv::Mat openKernel;
 };
 

@@ -13,8 +13,10 @@
 #include "BgsDetector.h"
 #include "FlowMotionDetector.h"
 #include "MultiObjectTracker.h"
+#include "ShapeEstimator.h"
 #include "TrackingTypes.h"
 #include "YoloDetector.h"
+#include "../util/LensCorrector.h"
 
 namespace tracking {
 
@@ -27,6 +29,7 @@ struct CorridorConfig {
 	CorridorPlacement placement; // where the corridor sits on the output canvas
 	std::map<std::string, double> flow;
 	std::map<std::string, double> tracker;
+	std::map<std::string, double> shape;
 };
 
 struct TrackingConfig {
@@ -35,6 +38,10 @@ struct TrackingConfig {
 	// DCT-domain reduction of the source JPEG for analysis (1|2|4|8).
 	// 2 => a 3840x1080 frame is analysed at 1920x540 (960x540 per module).
 	int analysisReduce = 2;
+	// Undistortion applied to every frame before the lane warp. The same
+	// coefficients are what the GUI shows, so lane quads live in the
+	// corrected image.
+	LensCorrection lens;
 	// Rectified lane images are at most this wide (px) and at least this
 	// tall; the lane keeps its aspect unless the height floor kicks in.
 	int laneMaxWidth = 800;
@@ -42,6 +49,7 @@ struct TrackingConfig {
 	FlowDetectorConfig flow;
 	BgsConfig bgs;
 	TrackerConfig tracker;
+	ShapeConfig shape; // per-object silhouette (see ShapeEstimator)
 	YoloConfig yolo;
 	std::vector<LayoutConfig> layouts;
 	std::vector<CorridorConfig> corridors;
@@ -62,6 +70,7 @@ struct TrackingConfig {
 	// Effective per-corridor parameters (global + overrides).
 	FlowDetectorConfig flowFor(const std::string & corridorId) const;
 	TrackerConfig trackerFor(const std::string & corridorId) const;
+	ShapeConfig shapeFor(const std::string & corridorId) const;
 };
 
 // Owns the tracking worker thread. Input: raw JPEG bytes tapped from the
@@ -69,10 +78,12 @@ struct TrackingConfig {
 // dropped, never queued, so a slow detector can never stall the sources or
 // the UI). The worker does its OWN reduced decode, picks the layout for the
 // frame (pane count from the aspect ratio: width >= 2*height means the
-// side-by-side "BOTH" view; source name for layout filters), warps every
-// lane quad to an upright rectangle, runs one detector per lane, maps the
+// side-by-side "BOTH" view; source name for layout filters), undistorts
+// each pane, warps every lane quad to an upright rectangle, runs one
+// detector per lane, maps the
 // detections to corridor coordinates, groups blobs of one object across
-// lanes and runs one tracker per corridor. Publishes a TrackingResults
+// lanes, runs one tracker per corridor and finally estimates each tracked
+// object's silhouette (ShapeEstimator). Publishes a TrackingResults
 // snapshot per analysed frame.
 //
 // No UI dependencies (same rule as src/mobotix/).
@@ -177,6 +188,9 @@ private:
 	int builtKind = -1;
 	bool yoloUnavailable = false;
 	double lastTMs = -1;
+	LensCorrector lensCorrector;
+	ShapeEstimator shapes;
+	uint64_t frameCounter = 0;
 
 	// published results
 	mutable std::mutex resultsMutex;

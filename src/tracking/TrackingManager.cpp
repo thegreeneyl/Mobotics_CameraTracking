@@ -54,6 +54,12 @@ TrackerConfig TrackingConfig::trackerFor(const std::string & corridorId) const {
 	return t;
 }
 
+ShapeConfig TrackingConfig::shapeFor(const std::string & corridorId) const {
+	ShapeConfig s = shape;
+	if(const CorridorConfig * c = corridor(corridorId)) applyShapeOverrides(s, c->shape);
+	return s;
+}
+
 // ----------------------------------------------------------- TrackingManager
 
 TrackingManager::~TrackingManager(){
@@ -68,6 +74,8 @@ double TrackingManager::nowMs(){
 void TrackingManager::setup(const TrackingConfig & config){
 	stop();
 	cfg = config;
+	lensCorrector.set(cfg.lens);
+	shapes.setConfig(cfg.shape);
 	enabled = cfg.enabled;
 	detectorKind = kindFromName(cfg.detector);
 	running = true;
@@ -77,6 +85,8 @@ void TrackingManager::setup(const TrackingConfig & config){
 void TrackingManager::setupSync(const TrackingConfig & config){
 	stop();
 	cfg = config;
+	lensCorrector.set(cfg.lens);
+	shapes.setConfig(cfg.shape);
 	enabled = cfg.enabled;
 	detectorKind = kindFromName(cfg.detector);
 }
@@ -87,6 +97,7 @@ void TrackingManager::stop(){
 	if(worker.joinable()) worker.join();
 	lanes.clear();
 	corridors.clear();
+	shapes.reset();
 	builtPanes = 0;
 	builtKind = -1;
 	lastTMs = -1;
@@ -141,6 +152,9 @@ void TrackingManager::applyPendingConfig(){
 	}
 	if(haveCfg){
 		if(!sameLayouts(cfg.layouts, next.layouts)) rebuild = true;
+		const bool lensChanged = cfg.lens != next.lens;
+		const bool shapeSourceChanged = cfg.shape.source != next.shape.source
+			|| cfg.shape.gridW != next.shape.gridW || cfg.shape.gridH != next.shape.gridH;
 		cfg.layouts = next.layouts;
 		cfg.corridors = next.corridors;
 		cfg.canvas = next.canvas;
@@ -151,6 +165,26 @@ void TrackingManager::applyPendingConfig(){
 		cfg.laneMinHeight = next.laneMinHeight;
 		cfg.yolo.confThreshold = next.yolo.confThreshold;
 		cfg.yolo.nmsThreshold = next.yolo.nmsThreshold;
+		cfg.lens = next.lens;
+		// model path / input stay as loaded (startup-only); everything else
+		// in `shape` is live
+		const std::string modelPath = cfg.shape.modelPath, modelFile = cfg.shape.modelFile;
+		const int modelInputW = cfg.shape.modelInputW, modelInputH = cfg.shape.modelInputH;
+		cfg.shape = next.shape;
+		cfg.shape.modelPath = modelPath;
+		cfg.shape.modelFile = modelFile;
+		cfg.shape.modelInputW = modelInputW;
+		cfg.shape.modelInputH = modelInputH;
+		shapes.setConfig(cfg.shape);
+		if(shapeSourceChanged) shapes.reset(); // a different source draws a different silhouette
+		if(lensChanged){
+			// The whole image moved. Background models and tracks were
+			// learned on the previous warp and must start over.
+			lensCorrector.set(cfg.lens);
+			for(auto & lp : lanes) if(lp.detector) lp.detector->reset();
+			for(auto & cp : corridors) if(cp.tracker) cp.tracker->reset();
+			shapes.reset();
+		}
 		if(!rebuild) applyParams();
 	}
 	if(rebuild){
@@ -354,16 +388,29 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	int wantKind = detectorKind;
 	if(wantKind == kYolo && yoloUnavailable) wantKind = kFlow;
 
-	// Analysis decode: reduced scaled decode of only what the detector
-	// needs (grayscale for flow/bgs, BGR for YOLO).
+	// Analysis decode: reduced scaled decode of only what is needed —
+	// grayscale for flow/bgs, BGR for YOLO or when the shape estimator's
+	// segmentation model is on (the detector then gets a gray copy).
 	const double t0 = nowMs();
-	cv::Mat full;
-	const bool decoded = wantKind == kYolo
+	bool shapeColor = shapes.wantsColor(cfg.shape);
+	for(const auto & cc : cfg.corridors) shapeColor = shapeColor || shapes.wantsColor(cfg.shapeFor(cc.id));
+	const bool wantColor = wantKind == kYolo || shapeColor;
+	cv::Mat full, fullBgr;
+	const bool decoded = wantColor
 		? jpegdecode::decodeToBgrMat(data, size, full, cfg.analysisReduce)
 		: jpegdecode::decodeToGrayMat(data, size, full, cfg.analysisReduce);
 	if(!decoded || full.empty()){
 		ofLogWarning("TrackingManager") << "analysis decode failed (" << size << " bytes)";
 		return false;
+	}
+	{
+		cv::Mat corrected;
+		lensCorrector.apply(full, corrected);
+		full = corrected;
+	}
+	if(wantColor){
+		fullBgr = full;
+		if(wantKind != kYolo) cv::cvtColor(fullBgr, full, cv::COLOR_BGR2GRAY);
 	}
 	const double decodeMs = nowMs() - t0;
 
@@ -380,6 +427,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	if(lastTMs >= 0 && (tMs < lastTMs || tMs - lastTMs > kMaxGapMs)){
 		for(auto & lp : lanes) lp.detector->reset();
 		for(auto & cp : corridors) cp.tracker->reset();
+		shapes.reset();
 	}
 	lastTMs = tMs;
 
@@ -464,11 +512,30 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 		trackMs += nowMs() - k0;
 	}
 
+	// 3. per tracked object: silhouette from the lane masks / the model
+	const double s0 = nowMs();
+	{
+		std::vector<ShapeEstimator::LaneInput> inputs(lanes.size());
+		for(size_t i = 0; i < lanes.size(); i++){
+			inputs[i].lane = &lanes[i].lane;
+			inputs[i].mask = &lanes[i].detector->debugMask();
+			inputs[i].foreground = &lanes[i].detector->shapeMask();
+			inputs[i].homography = &lanes[i].homography;
+			inputs[i].laneW = lanes[i].laneW;
+			inputs[i].laneH = lanes[i].laneH;
+		}
+		shapes.beginFrame(fullBgr, paneW, paneH, ++frameCounter);
+		for(auto & cr : res.corridors) shapes.updateCorridor(cr, cfg.shapeFor(cr.id), inputs);
+		shapes.endFrame();
+	}
+	const double shapeMs = nowMs() - s0;
+
 	res.canvas = cfg.canvas;
 	res.frameTMs = tMs;
 	res.decodeMs = decodeMs;
 	res.detectMs = detectMs;
 	res.trackMs = trackMs;
+	res.shapeMs = shapeMs;
 	res.analysisW = paneW;
 	res.analysisH = paneH;
 	res.detectorName = kindName(builtKind);

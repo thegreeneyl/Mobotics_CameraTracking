@@ -29,6 +29,12 @@ public:
 	// detect() call at lane resolution (empty if the detector has none).
 	virtual const cv::Mat & debugMask() const { return emptyMask; }
 
+	// Silhouette source for the ShapeEstimator: a per-pixel "is object"
+	// mask at lane resolution that is allowed to be more generous than the
+	// detection mask (it is only ever read inside a tracked box). Default:
+	// the debug mask.
+	virtual const cv::Mat & shapeMask() const { return debugMask(); }
+
 private:
 	cv::Mat emptyMask;
 };

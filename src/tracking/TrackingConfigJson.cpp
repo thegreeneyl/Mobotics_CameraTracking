@@ -83,6 +83,18 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 	c.analysisReduce = t.value("analysisReduce", 2);
 	c.laneMaxWidth = t.value("laneMaxWidth", 800);
 	c.laneMinHeight = t.value("laneMinHeight", 64);
+	if(t.contains("lens") && t["lens"].is_object()){
+		const auto & l = t["lens"];
+		c.lens.enabled = l.value("enabled", c.lens.enabled);
+		c.lens.fovDeg = l.value("fovDeg", c.lens.fovDeg);
+		c.lens.k1 = l.value("k1", c.lens.k1);
+		c.lens.k2 = l.value("k2", c.lens.k2);
+		c.lens.k3 = l.value("k3", c.lens.k3);
+		c.lens.k4 = l.value("k4", c.lens.k4);
+		c.lens.balance = l.value("balance", c.lens.balance);
+		c.lens.centerX = l.value("centerX", c.lens.centerX);
+		c.lens.centerY = l.value("centerY", c.lens.centerY);
+	}
 
 	if(t.contains("flow") && t["flow"].is_object()){
 		for(auto it = t["flow"].begin(); it != t["flow"].end(); ++it){
@@ -116,6 +128,24 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 			}
 		}
 	}
+	// shape: flat ShapeEstimator parameters plus "model" (ONNX path)
+	c.shape.modelFile = "models/yolov8n-seg.onnx";
+	if(t.contains("shape") && t["shape"].is_object()){
+		for(auto it = t["shape"].begin(); it != t["shape"].end(); ++it){
+			if(it.key() == "model"){
+				if(it->is_string()) c.shape.modelFile = it->get<std::string>();
+				continue;
+			}
+			double v = 0;
+			if(it->is_boolean()) v = it->get<bool>() ? 1 : 0;
+			else if(it->is_number()) v = it->get<double>();
+			else continue;
+			if(!setShapeParam(c.shape, it.key(), v)){
+				ofLogWarning("TrackingConfig") << "unknown shape parameter '" << it.key() << "'";
+			}
+		}
+	}
+	c.shape.modelPath = c.shape.modelFile.empty() ? std::string() : resolvePath(c.shape.modelFile);
 	if(t.contains("yolo")){
 		const auto & y = t["yolo"];
 		c.yolo.modelPath = resolvePath(y.value("model", std::string("models/yolov8n.onnx")));
@@ -156,6 +186,7 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 			}
 			if(it->contains("flow")) cc.flow = parseOverrides((*it)["flow"]);
 			if(it->contains("tracker")) cc.tracker = parseOverrides((*it)["tracker"]);
+			if(it->contains("shape")) cc.shape = parseOverrides((*it)["shape"]);
 			c.corridors.push_back(cc);
 		}
 	}
@@ -193,6 +224,17 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 	t["detector"] = cfg.detector;
 	t["laneMaxWidth"] = cfg.laneMaxWidth;
 	t["laneMinHeight"] = cfg.laneMinHeight;
+	t["lens"] = {
+		{"enabled", cfg.lens.enabled},
+		{"fovDeg", cfg.lens.fovDeg},
+		{"k1", cfg.lens.k1},
+		{"k2", cfg.lens.k2},
+		{"k3", cfg.lens.k3},
+		{"k4", cfg.lens.k4},
+		{"balance", cfg.lens.balance},
+		{"centerX", cfg.lens.centerX},
+		{"centerY", cfg.lens.centerY},
+	};
 	t["flow"] = paramsJson(flowParams(cfg.flow));
 	t["bgs"]["history"] = cfg.bgs.history;
 	t["bgs"]["varThreshold"] = cfg.bgs.varThreshold;
@@ -204,6 +246,9 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 	ofJson tracker = paramsJson(trackerParams(cfg.tracker));
 	tracker.erase("trailLen"); // lives under overlay.trailFrames
 	t["tracker"] = tracker;
+	ofJson shape = paramsJson(shapeParams(cfg.shape));
+	shape["model"] = cfg.shape.modelFile;
+	t["shape"] = shape;
 	t["yolo"]["confThreshold"] = cfg.yolo.confThreshold;
 	t["yolo"]["nmsThreshold"] = cfg.yolo.nmsThreshold;
 	t["overlay"]["arrowScale"] = overlayArrowScale;
@@ -215,6 +260,7 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 	ofJson corridors = ofJson::object();
 	const auto flowSchema = flowParams(cfg.flow);
 	const auto trackerSchema = trackerParams(cfg.tracker);
+	const auto shapeSchema = shapeParams(cfg.shape);
 	for(const auto & cc : cfg.corridors){
 		ofJson cj = ofJson::object();
 		cj["label"] = cc.label;
@@ -222,6 +268,7 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 		                   {"y0", cc.placement.y0}, {"y1", cc.placement.y1}};
 		if(!cc.flow.empty()) cj["flow"] = overridesJson(cc.flow, flowSchema);
 		if(!cc.tracker.empty()) cj["tracker"] = overridesJson(cc.tracker, trackerSchema);
+		if(!cc.shape.empty()) cj["shape"] = overridesJson(cc.shape, shapeSchema);
 		corridors[cc.id] = cj;
 	}
 	t["corridors"] = corridors;

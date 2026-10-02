@@ -101,6 +101,35 @@ const std::vector<Field<TrackerConfig>> & trackerFields(){
 	return f;
 }
 
+const std::vector<Field<ShapeConfig>> & shapeFields(){
+	static const std::vector<Field<ShapeConfig>> f = {
+		F_BOOL(ShapeConfig, enabled),
+		F_INT(ShapeConfig, source),
+		F_INT(ShapeConfig, gridW),
+		F_INT(ShapeConfig, gridH),
+		F_FLOAT(ShapeConfig, ema),
+		F_FLOAT(ShapeConfig, threshold),
+		F_FLOAT(ShapeConfig, padX),
+		F_FLOAT(ShapeConfig, padY),
+		F_FLOAT(ShapeConfig, simplify),
+		F_INT(ShapeConfig, closeCells),
+		F_BOOL(ShapeConfig, confirmedOnly),
+		F_INT(ShapeConfig, modelInputW),
+		F_INT(ShapeConfig, modelInputH),
+		F_FLOAT(ShapeConfig, modelConf),
+		F_FLOAT(ShapeConfig, modelMinIou),
+		F_FLOAT(ShapeConfig, modelMaskThresh),
+		F_FLOAT(ShapeConfig, modelPad),
+		F_FLOAT(ShapeConfig, modelMaxAspect),
+		F_FLOAT(ShapeConfig, modelTileOverlap),
+		F_INT(ShapeConfig, modelEveryN),
+		F_INT(ShapeConfig, modelHoldFrames),
+		F_INT(ShapeConfig, modelMaxPerFrame),
+		F_FLOAT(ShapeConfig, fallbackEma),
+	};
+	return f;
+}
+
 template <typename Cfg>
 bool setByKey(const std::vector<Field<Cfg>> & fields, Cfg & c, const std::string & key, double v){
 	for(const auto & f : fields){
@@ -128,14 +157,21 @@ bool setFlowParam(FlowDetectorConfig & c, const std::string & key, double v){
 bool setTrackerParam(TrackerConfig & c, const std::string & key, double v){
 	return setByKey(trackerFields(), c, key, v);
 }
+bool setShapeParam(ShapeConfig & c, const std::string & key, double v){
+	return setByKey(shapeFields(), c, key, v);
+}
 std::vector<ParamInfo> flowParams(const FlowDetectorConfig & c){ return listAll(flowFields(), c); }
 std::vector<ParamInfo> trackerParams(const TrackerConfig & c){ return listAll(trackerFields(), c); }
+std::vector<ParamInfo> shapeParams(const ShapeConfig & c){ return listAll(shapeFields(), c); }
 
 void applyFlowOverrides(FlowDetectorConfig & c, const std::map<std::string, double> & o){
 	for(const auto & kv : o) setFlowParam(c, kv.first, kv.second);
 }
 void applyTrackerOverrides(TrackerConfig & c, const std::map<std::string, double> & o){
 	for(const auto & kv : o) setTrackerParam(c, kv.first, kv.second);
+}
+void applyShapeOverrides(ShapeConfig & c, const std::map<std::string, double> & o){
+	for(const auto & kv : o) setShapeParam(c, kv.first, kv.second);
 }
 
 } // namespace tracking

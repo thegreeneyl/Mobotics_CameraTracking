@@ -188,6 +188,33 @@ struct Detection {
 	float speed() const { return std::hypot(vx, vy); }
 };
 
+// The silhouette of a tracked object. Accumulated per track in a small
+// occupancy grid pinned to the tracked box (plus a padding margin): grid
+// u 0..1 runs along the box from x0 to x1, v 0..1 from y0 to y1, so the
+// shape of a rigid object stays put in grid coordinates while the box
+// travels — a temporal EMA of the grid then averages out the per-frame
+// mask flicker without smearing the shape. See ShapeEstimator.
+struct ObjectShape {
+	bool valid = false;
+	int gridW = 0, gridH = 0;
+	// grid frame in corridor coordinates (the tracked box plus padding)
+	float fx0 = 0, fx1 = 0, fy0 = 0, fy1 = 0;
+	std::vector<uint8_t> ema; // accumulated occupancy 0..255, row-major
+	// the newest observation that fed the grid: 0 background, 255 object,
+	// 128 = not observed (outside every lane / no source this frame)
+	std::vector<uint8_t> obs;
+	// closed polygon in corridor coordinates, derived from the thresholded
+	// grid; empty when the grid holds nothing yet
+	std::vector<std::pair<float, float>> outline;
+	std::string source; // "mask" | "foreground" | "model" — what fed obs
+
+	float frameW() const { return fx1 - fx0; }
+	float frameH() const { return fy1 - fy0; }
+	// grid cell (gu, gv in cell units, may be fractional) -> corridor coords
+	float toS(float gu) const { return fx0 + gu / std::max(1, gridW) * frameW(); }
+	float toY(float gv) const { return fy0 + gv / std::max(1, gridH) * frameH(); }
+};
+
 // One tracked object with a stable unique id (corridor coordinates).
 struct TrackedObject {
 	int id = 0;
@@ -205,6 +232,7 @@ struct TrackedObject {
 	bool confirmed = false;
 	float colorR = 1, colorG = 1, colorB = 1; // stable per-id debug color
 	std::vector<std::pair<float, float>> trail; // recent centers, newest last
+	ObjectShape shape; // silhouette (filled by the ShapeEstimator, not the tracker)
 };
 
 struct CorridorResult {
@@ -236,6 +264,7 @@ struct TrackingResults {
 	double decodeMs = 0;  // analysis decode cost
 	double detectMs = 0;  // detector cost (all lanes)
 	double trackMs = 0;   // tracker cost (all corridors)
+	double shapeMs = 0;   // shape estimator cost (incl. segmentation model)
 	int analysisW = 0;    // per-pane analysis resolution (px)
 	int analysisH = 0;
 	std::string detectorName; // "flow" | "bgs" | "yolo"

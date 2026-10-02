@@ -57,7 +57,7 @@ bool sameCorridors(const std::vector<tracking::CorridorConfig> & a, const std::v
 	if(a.size() != b.size()) return false;
 	for(size_t i = 0; i < a.size(); i++){
 		if(a[i].id != b[i].id || a[i].label != b[i].label || a[i].placement != b[i].placement
-		   || a[i].flow != b[i].flow || a[i].tracker != b[i].tracker) return false;
+		   || a[i].flow != b[i].flow || a[i].tracker != b[i].tracker || a[i].shape != b[i].shape) return false;
 	}
 	return true;
 }
@@ -66,11 +66,13 @@ bool sameCorridors(const std::vector<tracking::CorridorConfig> & a, const std::v
 bool tuningEquals(const tracking::TrackingConfig & a, const tracking::TrackingConfig & b){
 	return sameParams(tracking::flowParams(a.flow), tracking::flowParams(b.flow))
 		&& sameParams(tracking::trackerParams(a.tracker), tracking::trackerParams(b.tracker))
+		&& sameParams(tracking::shapeParams(a.shape), tracking::shapeParams(b.shape))
 		&& a.bgs.history == b.bgs.history
 		&& a.bgs.varThreshold == b.bgs.varThreshold
 		&& a.yolo.confThreshold == b.yolo.confThreshold
 		&& a.yolo.nmsThreshold == b.yolo.nmsThreshold
 		&& a.canvas == b.canvas
+		&& a.lens == b.lens
 		&& sameCorridors(a.corridors, b.corridors)
 		&& sameLayouts(a.layouts, b.layouts);
 }
@@ -128,8 +130,91 @@ void loadFrameTexture(ofTexture & tex, const ofPixels & pixels){
 	tex.loadData(pixels);
 }
 
+// The picture on screen is the lens-corrected frame. src stays untouched
+// so the same pixels can be rewarped when the sliders move.
+void uploadCorrected(ofTexture & tex, const ofPixels & src, LensCorrector & corr){
+	if(!src.isAllocated()) return;
+	const int w = static_cast<int>(src.getWidth());
+	const int h = static_cast<int>(src.getHeight());
+	const int ch = static_cast<int>(src.getNumChannels());
+	const int type = ch == 4 ? CV_8UC4 : ch == 3 ? CV_8UC3 : CV_8UC1;
+	const cv::Mat in(h, w, type, const_cast<unsigned char *>(src.getData()), src.getBytesStride());
+	cv::Mat out;
+	corr.apply(in, out);
+	if(out.empty()) return;
+	ofPixels pix;
+	const ofPixelFormat fmt = ch == 4 ? OF_PIXELS_RGBA : ch == 3 ? OF_PIXELS_RGB : OF_PIXELS_GRAY;
+	pix.setFromPixels(out.data, static_cast<size_t>(out.cols), static_cast<size_t>(out.rows), fmt);
+	loadFrameTexture(tex, pix);
+}
+
 ofColor objectColor(const tracking::TrackedObject & obj){
 	return ofColor(obj.colorR * 255, obj.colorG * 255, obj.colorB * 255, obj.confirmed ? 255 : 90);
+}
+
+// Maps a corridor-space point (s along the corridor, y lateral) to the
+// screen; returns false where the view does not show that point.
+using CorridorToScreen = std::function<bool(float s, float y, glm::vec2 & out)>;
+
+// The object's current shape pixels (the newest observation that fed its
+// grid) as filled cells, drawn through an arbitrary corridor->screen map so
+// the same code serves the canvas, the lane strips and the photo overlay.
+void drawShapeCells(const tracking::ObjectShape & sh, const CorridorToScreen & map, const ofColor & col){
+	if(!sh.valid || sh.gridW <= 0 || sh.obs.size() != static_cast<size_t>(sh.gridW) * sh.gridH) return;
+	ofMesh mesh;
+	mesh.setMode(OF_PRIMITIVE_TRIANGLES);
+	for(int gv = 0; gv < sh.gridH; gv++){
+		for(int gu = 0; gu < sh.gridW; gu++){
+			if(sh.obs[static_cast<size_t>(gv) * sh.gridW + gu] != 255) continue;
+			glm::vec2 p[4];
+			if(!map(sh.toS(gu), sh.toY(gv), p[0]) || !map(sh.toS(gu + 1), sh.toY(gv), p[1])
+			   || !map(sh.toS(gu + 1), sh.toY(gv + 1), p[2]) || !map(sh.toS(gu), sh.toY(gv + 1), p[3])) continue;
+			const ofIndexType base = mesh.getNumVertices();
+			for(int c = 0; c < 4; c++){
+				mesh.addVertex(glm::vec3(p[c], 0));
+				mesh.addColor(col);
+			}
+			mesh.addIndex(base); mesh.addIndex(base + 1); mesh.addIndex(base + 2);
+			mesh.addIndex(base); mesh.addIndex(base + 2); mesh.addIndex(base + 3);
+		}
+	}
+	if(mesh.getNumVertices() == 0) return;
+	ofPushStyle();
+	ofFill();
+	ofEnableAlphaBlending();
+	mesh.draw();
+	ofPopStyle();
+}
+
+// Outline polygon (corridor coordinates) through the same kind of map:
+// faint fill plus a stroke. Vertices the view does not show are dropped.
+void drawShapeOutline(const std::vector<std::pair<float, float>> & outline, const CorridorToScreen & map,
+                      const ofColor & col, float lineWidth, int fillAlpha){
+	if(outline.size() < 3) return;
+	std::vector<glm::vec2> pts;
+	pts.reserve(outline.size());
+	for(const auto & o : outline){
+		glm::vec2 p;
+		if(map(o.first, o.second, p)) pts.push_back(p);
+	}
+	if(pts.size() < 3) return;
+	ofPushStyle();
+	if(fillAlpha > 0){
+		ofFill();
+		ofSetColor(col, fillAlpha);
+		ofBeginShape();
+		for(const auto & p : pts) ofVertex(p.x, p.y);
+		ofEndShape(true);
+	}
+	ofNoFill();
+	ofSetColor(col);
+	ofSetLineWidth(lineWidth);
+	ofPolyline line;
+	for(const auto & p : pts) line.addVertex(glm::vec3(p, 0));
+	line.close();
+	line.draw();
+	ofSetLineWidth(1);
+	ofPopStyle();
 }
 } // namespace
 
@@ -151,6 +236,9 @@ void ofApp::setup(){
 	gui.add(overlayParam);
 	gui.add(showMaskParam);
 	gui.add(showDetectionsParam);
+	gui.add(showPixelsParam);
+	gui.add(showOutlineParam);
+	gui.add(showBoxParam);
 	gui.add(resultViewParam);
 	gui.add(detectorParam);
 	gui.add(halfResParam);
@@ -163,6 +251,13 @@ void ofApp::setup(){
 	// below, after setup — so a stale tracking_gui.xml can never shadow the
 	// config) and go back to config.json via the save button.
 	trackingGui.setup("tracking", "tracking_gui.xml");
+	trackingGui.add(lensEnabledParam);
+	trackingGui.add(lensFovParam);
+	trackingGui.add(lensK1Param);
+	trackingGui.add(lensK2Param);
+	trackingGui.add(lensBalanceParam);
+	trackingGui.add(lensCenterXParam);
+	trackingGui.add(lensCenterYParam);
 	trackingGui.add(laneSelectParam);
 	trackingGui.add(laneS0Param);
 	trackingGui.add(laneS1Param);
@@ -190,6 +285,12 @@ void ofApp::setup(){
 	trackingGui.add(trkReacquireMsParam);
 	trackingGui.add(trkVelMeasNoiseParam);
 	trackingGui.add(trkTrailParam);
+	trackingGui.add(shapeSourceParam);
+	trackingGui.add(shapeEmaParam);
+	trackingGui.add(shapeThreshParam);
+	trackingGui.add(shapePadXParam);
+	trackingGui.add(shapePadYParam);
+	trackingGui.add(shapeSimplifyParam);
 	trackingGui.add(yoloConfParam);
 	trackingGui.add(yoloNmsParam);
 	trackingGui.add(arrowScaleParam);
@@ -248,14 +349,19 @@ void ofApp::setup(){
 	}
 
 	// Headless verification: CAMTRACK_AUTOSHOT=<path> saves a screenshot
-	// after ~8 s of streaming and quits. CAMTRACK_AUTOPLAYBACK=1 additionally
-	// starts in playback mode (tracking against a recording, no camera).
+	// after CAMTRACK_AUTOSHOT_SEC (default 8) seconds and quits.
+	// CAMTRACK_AUTOPLAYBACK=1 additionally starts in playback mode (tracking
+	// against a recording, no camera); CAMTRACK_RECORDINGS overrides the
+	// recordings folder, so a single recording can be played by pointing it at
+	// a folder holding just that one.
 	if(const char * autoshot = std::getenv("CAMTRACK_AUTOSHOT")){
 		autoshotPath = autoshot;
-		ofLogNotice("ofApp") << "autoshot enabled -> " << autoshotPath;
+		if(const char * sec = std::getenv("CAMTRACK_AUTOSHOT_SEC")) autoshotSec = std::max(1.0f, static_cast<float>(std::atof(sec)));
+		ofLogNotice("ofApp") << "autoshot enabled -> " << autoshotPath << " after " << autoshotSec << " s";
 	}
 	if(std::getenv("CAMTRACK_AUTOPLAYBACK")){
 		ofLogNotice("ofApp") << "autoplayback enabled";
+		if(const char * dir = std::getenv("CAMTRACK_RECORDINGS")) recordingsDir = ofToDataPath(dir, true);
 		playbackParam = true;
 	}
 }
@@ -311,6 +417,14 @@ void ofApp::loadConfig(){
 }
 
 void ofApp::loadGuiFromConfig(){
+	const auto & lens = trackingConfig.lens;
+	lensEnabledParam = lens.enabled;
+	lensFovParam = lens.fovDeg;
+	lensK1Param = lens.k1;
+	lensK2Param = lens.k2;
+	lensBalanceParam = lens.balance;
+	lensCenterXParam = lens.centerX;
+	lensCenterYParam = lens.centerY;
 	const auto & f = trackingConfig.flow;
 	flowMinFlowParam = f.minFlowPx;
 	flowEmaParam = f.flowEma;
@@ -332,6 +446,13 @@ void ofApp::loadGuiFromConfig(){
 	trkReacquireMsParam = static_cast<float>(k.reacquireMs);
 	trkVelMeasNoiseParam = k.velMeasNoise;
 	trkTrailParam = k.trailLen;
+	const auto & s = trackingConfig.shape;
+	shapeSourceParam = s.source;
+	shapeEmaParam = s.ema;
+	shapeThreshParam = s.threshold;
+	shapePadXParam = s.padX;
+	shapePadYParam = s.padY;
+	shapeSimplifyParam = s.simplify;
 	yoloConfParam = trackingConfig.yolo.confThreshold;
 	yoloNmsParam = trackingConfig.yolo.nmsThreshold;
 	arrowScaleParam = overlayArrowScale;
@@ -347,6 +468,13 @@ std::string ofApp::currentSourceName() const {
 // exact state the worker should run with, and what the save button writes.
 tracking::TrackingConfig ofApp::currentTrackingTuning() const {
 	tracking::TrackingConfig c = trackingConfig;
+	c.lens.enabled = lensEnabledParam;
+	c.lens.fovDeg = lensFovParam;
+	c.lens.k1 = lensK1Param;
+	c.lens.k2 = lensK2Param;
+	c.lens.balance = lensBalanceParam;
+	c.lens.centerX = lensCenterXParam;
+	c.lens.centerY = lensCenterYParam;
 	c.flow.minFlowPx = flowMinFlowParam;
 	c.flow.flowEma = flowEmaParam;
 	c.flow.busyThresh = flowBusyThreshParam;
@@ -366,6 +494,12 @@ tracking::TrackingConfig ofApp::currentTrackingTuning() const {
 	c.tracker.reacquireMs = trkReacquireMsParam;
 	c.tracker.velMeasNoise = trkVelMeasNoiseParam;
 	c.tracker.trailLen = trkTrailParam;
+	c.shape.source = shapeSourceParam;
+	c.shape.ema = shapeEmaParam;
+	c.shape.threshold = shapeThreshParam;
+	c.shape.padX = shapePadXParam;
+	c.shape.padY = shapePadYParam;
+	c.shape.simplify = shapeSimplifyParam;
 	c.yolo.confThreshold = yoloConfParam;
 	c.yolo.nmsThreshold = yoloNmsParam;
 	return c;
@@ -472,22 +606,37 @@ void ofApp::applyStreamSettings(){
 
 //--------------------------------------------------------------
 void ofApp::update(){
+	bool gotFrame = false;
 	if(mode == AppMode::Playback){
 		// live stream keeps running in the background but is ignored;
 		// the player paces/reads/decodes on its own thread.
 		ofPixels pixels;
 		if(player.getLatestFrame(pixels, sensors, playbackSeenFrameId, playbackFrameTMs,
 		                         showComDumpParam ? &comDump : nullptr)){
-			loadFrameTexture(playbackTexture, pixels);
+			rawFrame = pixels;
+			rawFrameMode = AppMode::Playback;
+			gotFrame = true;
 		}
 	}else{
 		ofPixels pixels;
 		double receivedAtMs = 0;
 		if(client.getLatestFrame(pixels, sensors, lastSeenFrameId, receivedAtMs,
 		                         showComDumpParam ? &comDump : nullptr)){
-			loadFrameTexture(texture, pixels);
+			rawFrame = pixels;
+			rawFrameMode = AppMode::Live;
+			gotFrame = true;
 			lastFrameReceivedMs = receivedAtMs;
 			lastUploadLatencyMs = MobotixMjpegClient::nowMs() - receivedAtMs;
+		}
+	}
+	// Show the corrected frame, and rewarp the last one as soon as a lens
+	// slider moves (playback may be sitting on one frame).
+	if(rawFrame.isAllocated() && rawFrameMode == mode){
+		const LensCorrection lens = currentTrackingTuning().lens;
+		if(gotFrame || lens != shownLens){
+			shownLens = lens;
+			displayLens.set(lens);
+			uploadCorrected(mode == AppMode::Playback ? playbackTexture : texture, rawFrame, displayLens);
 		}
 	}
 
@@ -583,7 +732,7 @@ void ofApp::update(){
 			<< (stats.lastError.empty() ? "" : ", error: " + stats.lastError);
 	}
 
-	if(!autoshotPath.empty() && !autoshotDone && ofGetElapsedTimef() > 8.0f){
+	if(!autoshotPath.empty() && !autoshotDone && ofGetElapsedTimef() > autoshotSec){
 		autoshotDone = true;
 	}
 }
@@ -614,7 +763,7 @@ void ofApp::drawVideo(){
 	// keep the image clear of the GUI panels on the left
 	const float guiWidth = std::max(gui.getShape().getRight(), trackingGui.getShape().getRight()) + splitGap;
 	const ofRectangle full(guiWidth, 0, ofGetWidth() - panelWidth - guiWidth, ofGetHeight() - barHeight);
-	// top: the original image(s) with lane editor + overlay; bottom: the
+	// top: the lens-corrected image(s) with lane editor + overlay; bottom: the
 	// rectified lane views (motion mask + tracking, no camera pixels)
 	const ofRectangle viewport(full.x, full.y, full.width, full.height * 0.6f);
 	const ofRectangle resultView(full.x, viewport.getBottom() + splitGap,
@@ -788,19 +937,36 @@ void ofApp::drawCanvasView(){
 		}
 	}
 
-	// objects, mapped and cut exactly like the published data
+	// objects, mapped and cut exactly like the published data. Three
+	// layers per object, each switchable: shape pixels, outline, box.
 	if(trackingParam){
 		for(const auto & cr : trackResults.corridors){
 			const tracking::CorridorPlacement p = trackingConfig.placementFor(cr.id);
+			const CorridorToScreen mapCanvas = [&](float s, float y, glm::vec2 & out){
+				out = toScreen(p.toCanvasX(s), p.toCanvasY(y));
+				return true;
+			};
 			for(const auto & obj : cr.objects){
 				float x0, x1, y0, y1;
 				p.mapBox(obj.x0, obj.x1, obj.y0, obj.y1, x0, x1, y0, y1);
 				const ofColor col = objectColor(obj);
+				if(showPixelsParam) drawShapeCells(obj.shape, mapCanvas, ofColor(col, 110));
+				if(showOutlineParam && obj.shape.valid && !obj.shape.outline.empty()){
+					// uncut outline dim, the published (canvas-clipped) one bright
+					drawShapeOutline(obj.shape.outline, mapCanvas, ofColor(col, 60), 1, 0);
+					std::vector<std::pair<float, float>> onCanvas;
+					for(const auto & q : obj.shape.outline) onCanvas.emplace_back(p.toCanvasX(q.first), p.toCanvasY(q.second));
+					const auto clipped = output::clipPolygonToCanvas(onCanvas);
+					drawShapeOutline(clipped, [&](float cx, float cy, glm::vec2 & out){ out = toScreen(cx, cy); return true; },
+					                 col, obj.confirmed ? 2 : 1, 40);
+				}
 				// uncut box (dim) — shows what the placement cuts away
 				const glm::vec2 fa = toScreen(x0, y0), fb = toScreen(x1, y1);
-				ofNoFill();
-				ofSetColor(col, 70);
-				ofDrawRectangle(fa.x, fa.y, fb.x - fa.x, fb.y - fa.y);
+				if(showBoxParam){
+					ofNoFill();
+					ofSetColor(col, 70);
+					ofDrawRectangle(fa.x, fa.y, fb.x - fa.x, fb.y - fa.y);
+				}
 				const bool offL = x0 < 0, offR = x1 > 1;
 				if(!tracking::CorridorPlacement::clipToCanvas(x0, x1, y0, y1)) continue;
 				const glm::vec2 a = toScreen(x0, y0), b = toScreen(x1, y1);
@@ -815,17 +981,20 @@ void ofApp::drawCanvasView(){
 						ofDrawLine(t0, t1);
 					}
 				}
-				ofSetColor(col);
-				ofSetLineWidth(obj.confirmed ? 2 : 1);
-				ofDrawRectangle(a.x, a.y, b.x - a.x, b.y - a.y);
-				ofSetLineWidth(1);
-				const bool cutL = offL || (p.mirrored() ? obj.clippedRight : obj.clippedLeft);
-				const bool cutR = offR || (p.mirrored() ? obj.clippedLeft : obj.clippedRight);
-				ofSetColor(255, 60, 60);
-				ofSetLineWidth(3);
-				if(cutL) ofDrawLine(a.x, a.y, a.x, b.y);
-				if(cutR) ofDrawLine(b.x, a.y, b.x, b.y);
-				ofSetLineWidth(1);
+				if(showBoxParam){
+					ofNoFill();
+					ofSetColor(col);
+					ofSetLineWidth(obj.confirmed ? 2 : 1);
+					ofDrawRectangle(a.x, a.y, b.x - a.x, b.y - a.y);
+					ofSetLineWidth(1);
+					const bool cutL = offL || (p.mirrored() ? obj.clippedRight : obj.clippedLeft);
+					const bool cutR = offR || (p.mirrored() ? obj.clippedLeft : obj.clippedRight);
+					ofSetColor(255, 60, 60);
+					ofSetLineWidth(3);
+					if(cutL) ofDrawLine(a.x, a.y, a.x, b.y);
+					if(cutR) ofDrawLine(b.x, a.y, b.x, b.y);
+					ofSetLineWidth(1);
+				}
 
 				ofSetColor(col);
 				const glm::vec2 ctr((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
@@ -837,6 +1006,7 @@ void ofApp::drawCanvasView(){
 				ofDrawArrow(glm::vec3(ctr, 0), glm::vec3(ctr.x + dx * c.width, ctr.y + dy * c.height, 0), 5.0f);
 				std::string text = "#" + ofToString(obj.id) + " " + obj.label + " " + obj.phase
 					+ "  x=" + ofToString((x0 + x1) * 0.5f, 2) + " vx=" + ofToString(obj.vx * p.spanX(), 3);
+				if(obj.shape.valid && !obj.shape.source.empty()) text += "  shape:" + obj.shape.source;
 				if(!obj.confirmed) text += " ?";
 				ofDrawBitmapStringHighlight(text, a.x, a.y - 6, ofColor(0, 160), col);
 			}
@@ -901,29 +1071,43 @@ void ofApp::drawTrackingOverlay(){
 					}
 				}
 
+				// shape layers, projected through this lane's quad
+				const CorridorToScreen mapLane = [&](float s, float y, glm::vec2 & out){
+					const float lx = lane.toLane(s);
+					if(lx < -0.001f || lx > 1.001f) return false;
+					out = proj(lx, y);
+					return true;
+				};
+				if(showPixelsParam) drawShapeCells(obj.shape, mapLane, ofColor(col, 110));
+				if(showOutlineParam && obj.shape.valid){
+					drawShapeOutline(obj.shape.outline, mapLane, col, obj.confirmed ? 2 : 1, 40);
+				}
+
 				ofSetColor(col);
 				const glm::vec2 bTl = proj(lx0, obj.y0), bTr = proj(lx1, obj.y0);
 				const glm::vec2 bBr = proj(lx1, obj.y1), bBl = proj(lx0, obj.y1);
-				ofNoFill();
-				ofSetLineWidth(obj.confirmed ? 2 : 1);
-				ofDrawLine(bTl, bTr);
-				ofDrawLine(bTr, bBr);
-				ofDrawLine(bBr, bBl);
-				ofDrawLine(bBl, bTl);
-				ofSetLineWidth(1);
-				// clipped edge markers (red) where the corridor end is in this lane
-				float e0, e1;
-				if(obj.clippedLeft && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
-					ofSetColor(255, 60, 60);
-					ofSetLineWidth(3);
-					ofDrawLine(bTl, bBl);
-					ofSetLineWidth(1);
-				}
-				if(obj.clippedRight && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
-					ofSetColor(255, 60, 60);
-					ofSetLineWidth(3);
+				if(showBoxParam){
+					ofNoFill();
+					ofSetLineWidth(obj.confirmed ? 2 : 1);
+					ofDrawLine(bTl, bTr);
 					ofDrawLine(bTr, bBr);
+					ofDrawLine(bBr, bBl);
+					ofDrawLine(bBl, bTl);
 					ofSetLineWidth(1);
+					// clipped edge markers (red) where the corridor end is in this lane
+					float e0, e1;
+					if(obj.clippedLeft && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
+						ofSetColor(255, 60, 60);
+						ofSetLineWidth(3);
+						ofDrawLine(bTl, bBl);
+						ofSetLineWidth(1);
+					}
+					if(obj.clippedRight && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
+						ofSetColor(255, 60, 60);
+						ofSetLineWidth(3);
+						ofDrawLine(bTr, bBr);
+						ofSetLineWidth(1);
+					}
 				}
 				ofSetColor(col);
 
@@ -1071,23 +1255,36 @@ void ofApp::drawTrackingResults(){
 					}
 				}
 
-				ofSetColor(col);
-				ofNoFill();
-				ofSetLineWidth(obj.confirmed ? 2 : 1);
-				ofDrawRectangle(bx, by, bw, bh);
-				ofSetLineWidth(1);
-				float e0, e1;
-				if(obj.clippedLeft && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
-					ofSetColor(255, 60, 60);
-					ofSetLineWidth(3);
-					ofDrawLine(bx, by, bx, by + bh);
-					ofSetLineWidth(1);
+				const CorridorToScreen mapStrip = [&](float s, float y, glm::vec2 & out){
+					const float lx = lane.toLane(s);
+					if(lx < -0.001f || lx > 1.001f) return false;
+					out = glm::vec2(r.x + lx * r.width, r.y + y * r.height);
+					return true;
+				};
+				if(showPixelsParam) drawShapeCells(obj.shape, mapStrip, ofColor(col, 110));
+				if(showOutlineParam && obj.shape.valid){
+					drawShapeOutline(obj.shape.outline, mapStrip, col, obj.confirmed ? 2 : 1, 40);
 				}
-				if(obj.clippedRight && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
-					ofSetColor(255, 60, 60);
-					ofSetLineWidth(3);
-					ofDrawLine(bx + bw, by, bx + bw, by + bh);
+
+				if(showBoxParam){
+					ofSetColor(col);
+					ofNoFill();
+					ofSetLineWidth(obj.confirmed ? 2 : 1);
+					ofDrawRectangle(bx, by, bw, bh);
 					ofSetLineWidth(1);
+					float e0, e1;
+					if(obj.clippedLeft && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
+						ofSetColor(255, 60, 60);
+						ofSetLineWidth(3);
+						ofDrawLine(bx, by, bx, by + bh);
+						ofSetLineWidth(1);
+					}
+					if(obj.clippedRight && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
+						ofSetColor(255, 60, 60);
+						ofSetLineWidth(3);
+						ofDrawLine(bx + bw, by, bx + bw, by + bh);
+						ofSetLineWidth(1);
+					}
 				}
 				ofSetColor(col);
 				const float lcx = lane.toLane(obj.x);
@@ -1216,7 +1413,8 @@ void ofApp::drawStatsBar(){
 			+ "] " + ofToString(objCount) + " obj"
 			+ " dec " + ofToString(trackResults.decodeMs, 1)
 			+ " det " + ofToString(trackResults.detectMs, 1)
-			+ " trk " + ofToString(trackResults.trackMs, 1) + " ms";
+			+ " trk " + ofToString(trackResults.trackMs, 1)
+			+ " shp " + ofToString(trackResults.shapeMs, 1) + " ms";
 	}
 
 	if(mode == AppMode::Playback){
@@ -1314,6 +1512,12 @@ void ofApp::keyPressed(int key){
 		showMaskParam = !showMaskParam;
 	}else if(key == 'd'){
 		showDetectionsParam = !showDetectionsParam;
+	}else if(key == 'x'){
+		showPixelsParam = !showPixelsParam;
+	}else if(key == 'n'){
+		showOutlineParam = !showOutlineParam;
+	}else if(key == 'b'){
+		showBoxParam = !showBoxParam;
 	}else if(key == '['){
 		if(laneSelectParam > laneSelectParam.getMin()) laneSelectParam = laneSelectParam - 1;
 	}else if(key == ']'){
