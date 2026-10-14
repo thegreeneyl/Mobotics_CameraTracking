@@ -13,6 +13,7 @@
 #include "BgsDetector.h"
 #include "FlowMotionDetector.h"
 #include "MultiObjectTracker.h"
+#include "OutputSmoother.h"
 #include "ShapeEstimator.h"
 #include "TrackingTypes.h"
 #include "YoloDetector.h"
@@ -50,6 +51,7 @@ struct TrackingConfig {
 	BgsConfig bgs;
 	TrackerConfig tracker;
 	ShapeConfig shape; // per-object silhouette (see ShapeEstimator)
+	SmoothConfig smoothing; // publisher-side smoothing (see OutputSmoother)
 	YoloConfig yolo;
 	std::vector<LayoutConfig> layouts;
 	std::vector<CorridorConfig> corridors;
@@ -149,6 +151,8 @@ private:
 		std::vector<int> lanes; // indices into lanes
 		std::unique_ptr<MultiObjectTracker> tracker;
 		GroupingParams grouping;
+		std::map<int, ShapeFeedback> feedback; // shape estimator -> tracker, one frame late
+		OutputSmoother smoother;
 	};
 
 	void threadFn();

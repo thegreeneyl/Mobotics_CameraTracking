@@ -50,16 +50,24 @@ entry is a stub for later.
 - `[` / `]` — select the previous / next lane for editing
 - `v` — result view: output canvas (default) / rectified lane strips
 - `,` / `.` — select the previous / next corridor for placing on the canvas
-- `SPACE` — start/stop recording the incoming stream (live mode only)
+- `SPACE` — live: start/stop recording the incoming stream; playback:
+  play/pause
+- `e` — start/stop a motion-path export for the facade editor (both modes,
+  see *Output*)
 - `TAB` — toggle LIVE / PLAYBACK mode
 - `LEFT` / `RIGHT` — previous / next recording (playback mode, wraps)
 - `UP` / `DOWN` — seek +/-1 s within the current recording (playback mode)
 - GUI: preview toggle, JPEG quality (preview only), COM dump toggle,
-  record toggle, playback-mode toggle, tracking/overlay/mask/detections
+  record toggle, export toggle, playback-mode toggle, tracking/overlay/mask/detections
   toggles, the three result layers (`shape pixels`, `shape outline`,
   `bounding box`), result view switch (0 canvas / 1 lane strips), detector switch
   (0 flow / 1 bgs / 2 yolo), half-res display decode toggle, UDP publish
   toggle
+- Playback panel (playback mode only, between the stream and tracking
+  panels): `play` toggle, `playhead` slider to scrub, `prev frame` /
+  `next frame` to step one frame (also while paused — the stepped frame
+  goes through tracking and the export like any other), `prev recording` /
+  `next recording`
 - Tracking panel (below the stream panel): lens correction at the top
   (`lens correct`, `fov deg`, `k1`, `k2`, `balance`, optical center — see
   *Lens correction*), lane selector with the selected
@@ -117,7 +125,8 @@ playback.
 
 Playback (`TAB`) starts with the most recent recording, plays it to the end,
 then cycles onward through all recordings newest to oldest (wrapping).
-Arrow keys jump within that cycle. While in playback mode the live stream
+Arrow keys jump within that cycle; the playback panel pauses, scrubs and
+steps single frames (a paused recording does not cycle on). While in playback mode the live stream
 keeps running in the background but is ignored; `TAB` returns to it
 instantly. Entering playback stops an active recording first.
 
@@ -347,7 +356,17 @@ corridor to bridge wagon gaps) → connected components with **median flow
 velocity and coherence** → directional union-find grouping
 (`mergeGapFrac`, `mergeLateralOverlap`, `mergeAngleDeg`): blobs moving the
 same way, close together, become one detection. Components touching a lane
-end that is a corridor end are flagged clipped. `bgs` (plain MOG2) and
+end that is a corridor end are flagged clipped. **Direction split**
+(`dirSplit`, default on): the components are labelled on an undirected
+mask, so two trains passing each other are one component with one
+(meaningless) median velocity. A component whose flow-seed pixels move
+both ways along the lane — the minority sign a blob in its own right
+(≥ `minAreaFrac`) and above the noise floor (≥ `dirSplitMinFrac`, 5 %, of
+the signed pixels; a train entering behind a corridor-long one is only a
+few percent) — is cut into a +x and a −x part — each sign's seed
+pixels grown by the closing kernel inside the component and off the other
+sign's pixels — and each part is measured on its own. Single-direction
+components are untouched. `bgs` (plain MOG2) and
 `yolo` (ONNX via OpenCV DNN, model in `bin/data/models/`, falls back to
 flow when missing) are still selectable for comparison.
 
@@ -366,7 +385,9 @@ gap, IoU, velocity difference) with a direction veto; leftover fragments
 within `absorbGapFrac` are absorbed into the matched track (1:N); two
 confirmed tracks travelling together for `mergeFrames` merge; a track that
 dies and reappears where it was heading within `reacquireMs` inherits its
-id (boats passing under the bridge). Size constancy: a detection much
+id (boats passing under the bridge) — except one that coasted out past
+the far end: it has left the corridor, and nothing at that lane end can
+be it again. Size constancy: a detection much
 shorter/longer than the predicted box (`sizeJumpTrust`) is treated as a
 fragment — it cannot collapse the box or release a pinned edge in one step.
 A confirmed, unclipped object that loses its detections at low speed far
@@ -382,6 +403,114 @@ edges) and `velMeasNoise` (flow velocity). Raising `posMeasNoise` from
 lag; the along-axis position is dominated by the pinned edges and the
 velocity anyway.
 
+**Lifecycle.** A track is *tentative* until it passes every confirmation
+gate, *confirmed* while it is seen, *occluded* while it coasts unseen,
+*stopped* while it is parked, and (from the output smoother only) *gone*
+while it fades out. Only confirmed objects are published. The gates, all
+in `tracking.tracker` and overridable per corridor:
+
+- **Edge rule** (`edgeRule`, `edgeBirthFrac`, `edgeGraceMs`). Trains and
+  boats come in through a corridor end. A track confirms only if it was
+  born clipped at an end or with its box within `edgeBirthFrac` of one;
+  a track that inherits an id, or is born within `edgeGraceMs` of a reset
+  (the object was already there), is exempt. Water glitter, a moored boat
+  rocking, a wake fragment, a car glimpsed behind the viaduct — all of
+  them appear in mid corridor and stay tentative forever. In the dual
+  layout a train from the right is first detected at corridor x ≈ 0.85
+  (the far lane end lies in foliage), hence the train override
+  `edgeBirthFrac` 0.2; boats use the default 0.08.
+- **Length gate** (`minConfirmLen`, train override 0.12). A track must be
+  at least this long (corridor fraction) to confirm: a car on the road
+  behind the viaduct is 0.03–0.05 of the corridor and never grows, a
+  train has passed 0.12 after two or three seconds of entering — still
+  off-canvas with the current train placement. (A permanent "let go of
+  the end while short" flag was tried and dropped: a train whose nose
+  flickers off the lane end for three frames must not be banned for its
+  whole pass.)
+- **Model gate** (`modelGate`, `modelGateOtherHits`; needs the
+  segmentation model, see *Object outline*). The shape estimator runs the
+  model on edge-born tentative tracks too (`shape.modelTentative`) and
+  hands the tracker, one frame late, how often it found an instance of
+  the corridor's class on the track and how often it saw only another
+  class there. A track the model has never found does not confirm, nor
+  one it has labelled another class at least `modelGateOtherHits` times
+  and more than twice as often as its own class. The verdict is
+  re-evaluated every frame — the nose of a train at the lane end reads
+  "truck" for the first few calls, so an early verdict must not be final.
+  The gate also works at the far end (`modelLostMs`): a confirmed object
+  that is leaving (front at the end it heads for) on which the model has
+  seen nothing at all — neither its own class nor another one — for that
+  long is no longer fed by the motion blobs at that lane end; it ages out
+  and coasts away as `occluded`. Sun glitter and wake at the lane edge
+  kept a departed boat "exiting" for 45 s before this; a boat the model
+  reads as "surfboard" is still something and keeps being tracked.
+  Nothing changes when the model is off.
+- A per-lane `yBand: [y0, y1]` (lane fractions, in the layout) drops
+  detections whose vertical centre lies outside the band before tracking
+  — for a quad that has to stay generous because of the lane height
+  floor while the road band behind the viaduct should be ignored.
+
+**Occlusion coasting** (`coastOccluded`, `occludedMaxMs`,
+`occludedGateGrow`). A confirmed object that loses its detections while
+moving is hidden, not gone: another train in front of it, a mast, the
+sun on the water. After `maxMisses` it switches to `occluded` and coasts
+at the velocity it was last seen with, size frozen (its rear pin is
+released so the box does not grow without end), until a detection moving
+*its* way overlaps the prediction — then it continues under the same id,
+corrected to the new box — or its trailing edge has passed the far
+corridor end. The direction veto is unconditional while hidden: the
+visible opposite-direction train passing in front can never drag the
+hidden one along. The association gate widens by `occludedGateGrow` per
+hidden second; a fresh tentative track that emerges where the hidden
+object should be (same direction, lateral overlap, within
+`reacquireGapFrac` plus the growth) is adopted by it. A hidden object
+that is *leaving* (front pinned at the end it heads for, or within
+`stopEdgeFrac` of it) only coasts out: it is neither adopted into nor
+merged with a tentative track at that end, so water glitter at the lane
+edge cannot keep a departed boat alive. An object that vanished *slowly*
+is still parked as `stopped` as before; `occludedMaxMs` is the safety
+cap. The stop rule is unchanged otherwise.
+
+**Shape-driven box** (`shapeBox`, `shapeBoxMaxAge`, `shapeBoxTrim`). While
+a model silhouette no older than `shapeBoxMaxAge` frames exists for a
+confirmed object, its bounding box *trims* the motion blob before the
+blob becomes the Kalman position measurement: the published box follows
+the hull, not the wake the closing glued to it (a boat box with wake was
+~3× the hull), the roof, not the dilated foreground. The blob stays the
+outer bound and the anchor — the silhouette lives in the box's own
+(padded) frame, so taken as the measurement itself it could only ever
+reproduce the box it was measured in and crept inward wherever the mask
+fell short of the crop border; a corridor-long train lost two thirds of
+its box that way. A silhouette edge therefore counts only inside the
+blob and may take at most `shapeBoxTrim` of the blob's length / height
+off each end; an edge the blob has at a corridor end stays pinned there.
+Merge priority uses the same feedback: a track with a model outline is
+never folded into one without — the survivor is the one the model found.
+These are the only three couplings from the shape estimator back into the
+tracker (`ShapeFeedback` in `TrackingTypes.h`); with the model off the
+tracks are identical to before.
+
+**Hidden rear / front** (`hiddenRear`). Two trains meeting on the
+viaduct: the far one is partly or entirely behind the near one. A train
+that is first detected in mid corridor with only its nose showing did
+not appear out of nowhere — if the spot behind its rear edge is covered
+by an oncoming visible confirmed object, it came in behind that one, so
+its rear is pinned at the entry end it must have come through (and it is
+edge-born). A pinned rear also stays pinned while the oncoming object
+still covers the spot where the blob's rear edge is: the blob ends where
+the occluder begins, not where the object does. The mirror case is the
+nose disappearing behind the oncoming train: a blob front edge that lies
+inside the oncoming object's box is ignored and the nose coasts at the
+object's velocity (clamped to the corridor) instead of being pushed back
+by the other train's tail. Once the occluder has moved on, the edge is
+measured again and the output smoother glides the box to its real
+extent. A detection right next to a confirmed same-direction object is a
+fragment of it and never gets a hidden rear; a sliver sitting entirely
+inside the oncoming box (or shorter than `minConfirmLen`) is the same.
+The decision is taken only once the tentative track's direction has
+settled (three agreeing frames), not at birth — a wake fragment's first
+velocity sample can point the wrong way.
+
 ### Object outline
 
 Besides the box, every confirmed object carries a silhouette: `ShapeEstimator`
@@ -393,9 +522,11 @@ frame the grid is refreshed from a *shape source* and blended with an EMA
 contour of the thresholded (`threshold`), 4× upsampled, morphologically
 closed (`closeCells`) grid, simplified with `approxPolyDP` (`simplify`, in
 cells). Pixels, outline and box are independent display layers (`x`/`n`/`b`)
-and the outline is published (see *Output*). A `stopped` object keeps its
-last shape. The tracker never reads the shape — enabling or disabling it
-leaves the tracks identical.
+and the outline is published (see *Output*). A `stopped` or `occluded`
+object keeps its last shape. The tracker never reads the shape itself; it
+only gets the narrow `ShapeFeedback` described under *Tracker* (model
+gate, shape-driven box, merge priority) — with the model off, enabling or
+disabling the estimator leaves the tracks identical.
 
 The three sources (`source`):
 
@@ -413,9 +544,15 @@ strip and the model finds nothing. The crop is the tracked box plus
 `modelPad` (25 %) of margin, in the lane's own pane; all instances that
 overlap the box (IoU ≥ `modelMinIou`, or mostly inside it and at least 3 %
 of its area) are unioned, so a train split into two instances still yields
-one shape, and the mask is warped back through the lane homography. Class
-labels are deliberately ignored (the model calls the boat a "keyboard" at
-times, but segments it right). The forward pass costs ~25–30 ms on an M2
+one shape, and the mask is warped back through the lane homography. With
+`modelClassGate` (default on) only instances of the corridor's class count
+— COCO `train` for the train corridor (every train in the evaluation
+recordings is labelled `train` from its first partial sighting on; the one
+`bus` hit was a vehicle on the road), `boat` for the boat corridor
+(`ShapeEstimator::allowedClasses`); the strongest instance of any other
+class on the box is reported to the tracker as an *other-class hit*
+(the model gate rejects a track that is only ever "car"). With the gate
+off, class labels are ignored as before. The forward pass costs ~25–30 ms on an M2
 Max, so it runs every `modelEveryN` (2) frames, staggered by object id, at
 most `modelMaxPerFrame` (2) objects per frame; the EMA bridges the frames
 in between.
@@ -462,6 +599,32 @@ only what the tracked box covers, so when the motion detector lags behind
 an untextured stern the outline can extend beyond the detections but not
 beyond the box plus `padX`.
 
+### Output smoothing
+
+`OutputSmoother` (`tracking.smoothing`) sits between the tracker and the
+publisher, per corridor. The tracker's job is to be right; this stage's
+job is that whatever is published never jumps — nothing feeds back.
+
+- **Box edges** slide toward the tracker's edges at most `boxRate` (0.25
+  corridor fractions/s) on top of the object's own travel, so a merge, a
+  pin/release re-seed or a silhouette trim is a slide, not a jump. An
+  edge the tracker pins at a corridor end does not travel with the
+  object (it sits at the end), but it glides there at the same rate when
+  it is pinned — a nose reaching the lane end widens the box over a few
+  frames, not in one.
+- **Outline**: the tracker outline is resampled to `outlineVertices` (32)
+  points by arc length — walked clockwise from the point where the
+  boundary crosses the horizontal centre line on the right, so vertex k
+  lies on the same part of the object frame after frame — and each
+  vertex is low-passed in box-normalized coordinates (`outlineAlpha`,
+  0.3). The outline is never empty: until the first silhouette arrives it
+  is the box rectangle, while the model is silent it is the last
+  silhouette, riding along on the smoothed box.
+- **Presence**: a new object fades in over `fadeInMs` (300), an object the
+  tracker dropped keeps travelling at its last velocity and fades out over
+  `fadeOutMs` (400) with phase `gone`; `presence` (0..1) is published per
+  object. An id that comes back while fading (reacquire) ramps up again.
+
 ### Evaluation harness
 
 Headless batch mode processes recordings unpaced (~80 fps single, ~40 fps
@@ -498,7 +661,8 @@ sample-motion-path.json`): frame `size` is the canvas (832×442 by default)
 and all object coordinates are canvas-normalized (0..1, see *Canvas
 placement*): per object `id`, `class`, `bbox` `[x, y, w, h]`, `x`/`y`
 (center), `vx`/`vy`/`speed`, `heading`/`heading_deg`, `phase`
-(`entering|crossing|exiting|moving|stopped`), `clipped`, `region`, `fill`, a
+(`entering|crossing|exiting|moving|stopped|occluded|gone`), `presence`
+(0..1 fade ramp, see *Output smoothing*), `clipped`, `region`, `fill`, a
 short `path`, and — extra — `outline` (the object's silhouette as a closed
 polygon `[[x, y], …]` in canvas coordinates, clipped to the canvas like the
 box; empty until the shape has its first observation or when
@@ -507,7 +671,22 @@ box; empty until the shape has its first observation or when
 `view` is the corridor id. With
 `output.udp.enabled` the app sends one datagram per analysed frame to
 `output.udp.host:port` (toggle in the GUI); the batch runner writes the
-same frames under `{"kind": "recording"}`.
+same frames under `{"kind": "recording"}` (`tools/eval/score.py` reads
+`view`, `class` and `clipped` from them).
+
+**Export motion (`e`)** writes a file for the facade editor instead: the
+same canvas-space objects cut down to what its parser reads — root
+`schema`, `source`, `fps`, `duration_s`, `size`, `frames`; per frame `t`
+(seconds from the first exported frame) and `scene {vx, vy, speed}`; per
+object `id`, `x`, `y`, `vx`, `vy`, `speed`, `phase`, `presence`, `fill`,
+`bbox` and the `outline` polygon (`path` and the debug extras are left
+out). Every start
+opens a new `recordings/motion_<source>_<stamp>.json`, written on stop or
+quit; it works in live and playback mode alike and is independent of the
+MJPEG recording. A source change under an open export (live ↔ playback,
+the player advancing to the next recording) closes the file and starts the
+next one, so each file is one continuous take with stable ids.
+`CAMTRACK_AUTOEXPORT=1` starts an export at launch (headless runs).
 
 The debug overlay (`o`) draws per object, in a stable per-id color: the
 shape pixels (`x`), the outline (`n`) and the bounding box (`b`) — each per

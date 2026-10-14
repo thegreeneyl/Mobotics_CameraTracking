@@ -25,23 +25,29 @@ class SegModel {
 public:
 	struct Result {
 		cv::Mat mask;     // 8U, crop size, 0/255
-		cv::Rect2f box;   // instance box in crop px
+		cv::Rect2f box;   // instance box in crop px (union of the used instances)
 		float score = 0;  // class score
 		int classId = -1; // COCO id
 		float iou = 0;    // overlap with the requested target box
+		// best instance on the target that is NOT of an allowed class (a car
+		// where a train was expected); -1 when none. Set even when the call
+		// returns false, so the caller can tell "nothing there" from
+		// "something else there".
+		int otherClass = -1;
+		float otherScore = 0;
 	};
 
 	bool load(const std::string & path, int inputW, int inputH);
 	bool isLoaded() const { return loaded; }
 	const std::string & path() const { return modelPath; }
 
-	// Segments the instance that best covers `target` (crop px). Any class
-	// is accepted (the target box already says what we are looking at);
-	// candidates with class score < conf or IoU(target) < minIou are
-	// dropped. Mask pixels >= maskThresh (0..1) are set. Returns false when
-	// nothing qualifies.
+	// Segments the instance(s) that cover `target` (crop px). `allow` lists
+	// the acceptable COCO class ids (empty = any class); candidates of other
+	// classes are only reported via Result::otherClass. Candidates with
+	// class score < conf or IoU(target) < minIou are dropped. Mask pixels
+	// >= maskThresh (0..1) are set. Returns false when nothing qualifies.
 	bool segment(const cv::Mat & bgrCrop, const cv::Rect2f & target, float conf, float minIou,
-	             float maskThresh, Result & out);
+	             float maskThresh, const std::vector<int> & allow, Result & out);
 
 	double lastForwardMs() const { return forwardMs; }
 

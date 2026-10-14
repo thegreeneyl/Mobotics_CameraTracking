@@ -31,8 +31,9 @@ struct MotionObject {
 	float x = 0, y = 0;    // center
 	float w = 0, h = 0;    // bbox size
 	float vx = 0, vy = 0;  // fractions per second
-	std::string phase = "moving"; // entering | crossing | exiting | moving
+	std::string phase = "moving"; // entering | crossing | exiting | moving | stopped | occluded | gone
 	bool confirmed = true;
+	float presence = 1.0f; // 0..1 visibility ramp (fade in / fade out), see OutputSmoother
 	bool clippedLeft = false, clippedRight = false; // cut at a corridor end or the canvas edge
 	std::vector<std::pair<float, float>> path; // recent centers, oldest first
 	// The object in corridor space (x along the corridor, y lateral in the
@@ -66,20 +67,40 @@ ofJson buildFrame(const std::vector<MotionObject> & objects, double tSec, int fr
                   double fps, const std::string & camera, int sizeW, int sizeH,
                   double wallClockSec);
 
-// Accumulates frames and writes the {"kind":"recording", ...} wrapper.
+// The same frame cut down to what the facade editor's parser reads
+// (`t`, `scene.vx/vy/speed`, per object `id`, `x`, `y`, `vx`, `vy`,
+// `speed`, `phase`, `fill`, `bbox`) plus the canvas `outline`. Everything
+// is in output-canvas space; the corridor box, lane panes, trail and
+// labels stay in buildFrame.
+ofJson buildEditorFrame(const std::vector<MotionObject> & objects, double tSec);
+
+// Accumulates frames and writes the recording wrapper.
+//
+// Style::Full keeps every datagram field and the {"kind":"recording"}
+// envelope the batch runner and tools/eval/score.py read. Style::Editor
+// writes buildEditorFrame frames with `t` counted from the first added
+// frame, and derives `fps` from their spacing on save — the shape the
+// facade editor loads from its camera-tracking panel.
 class MotionPathRecording {
 public:
-	MotionPathRecording(std::string source, double fps, int sizeW, int sizeH);
+	enum class Style { Full, Editor };
+
+	MotionPathRecording(std::string source, double fps, int sizeW, int sizeH,
+	                    Style style = Style::Full);
 
 	void addFrame(const std::vector<MotionObject> & objects, double tSec, double wallClockSec);
 	size_t frameCount() const { return frames.size(); }
 	bool save(const std::string & path, const std::string & note = "") const;
 
 private:
+	double effectiveFps() const;
+
 	std::string source;
-	double fps;
+	double fps; // nominal; Style::Editor measures it from the frames when it can
 	int sizeW, sizeH;
+	Style style;
 	std::vector<ofJson> frames;
+	double firstTSec = 0;
 	double lastTSec = 0;
 };
 

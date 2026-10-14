@@ -231,6 +231,7 @@ void ofApp::setup(){
 	gui.add(qualityParam);
 	gui.add(showComDumpParam);
 	gui.add(recordParam);
+	gui.add(exportParam);
 	gui.add(playbackParam);
 	gui.add(trackingParam);
 	gui.add(overlayParam);
@@ -246,6 +247,28 @@ void ofApp::setup(){
 	reconnectButton.setup("reconnect (r)");
 	gui.add(&reconnectButton);
 	gui.setPosition(10, 10);
+
+	// playback transport. Listeners are attached right away: the panel is
+	// only drawn (and hit) in playback mode, and the keys route through the
+	// same parameters.
+	playbackGui.setup("playback", "playback_gui.xml");
+	playbackGui.add(playParam);
+	playbackGui.add(playheadParam);
+	prevFrameButton.setup("prev frame");
+	nextFrameButton.setup("next frame");
+	prevRecordingButton.setup("prev recording (LEFT)");
+	nextRecordingButton.setup("next recording (RIGHT)");
+	playbackGui.add(&prevFrameButton);
+	playbackGui.add(&nextFrameButton);
+	playbackGui.add(&prevRecordingButton);
+	playbackGui.add(&nextRecordingButton);
+	playbackGui.unregisterMouseEvents(); // hidden in live mode; layoutGuiPanels() wires it up
+	playParam.addListener(this, &ofApp::onPlayChanged);
+	playheadParam.addListener(this, &ofApp::onPlayheadChanged);
+	prevFrameButton.addListener(this, &ofApp::onPrevFramePressed);
+	nextFrameButton.addListener(this, &ofApp::onNextFramePressed);
+	prevRecordingButton.addListener(this, &ofApp::onPrevRecordingPressed);
+	nextRecordingButton.addListener(this, &ofApp::onNextRecordingPressed);
 
 	// tracking tuning panel. Values always come from config.json (assigned
 	// below, after setup — so a stale tracking_gui.xml can never shadow the
@@ -296,7 +319,7 @@ void ofApp::setup(){
 	trackingGui.add(arrowScaleParam);
 	saveTrackingButton.setup("save to config.json");
 	trackingGui.add(&saveTrackingButton);
-	trackingGui.setPosition(10, gui.getShape().getBottom() + 8);
+	layoutGuiPanels();
 	saveTrackingButton.addListener(this, &ofApp::onSaveTrackingPressed);
 
 	loadGuiFromConfig();
@@ -304,6 +327,7 @@ void ofApp::setup(){
 	previewParam = camConfig.preview;
 	qualityParam = camConfig.quality;
 	recordParam = false;   // never restore a stale "recording" state from gui.xml
+	exportParam = false;   // same for an open export
 	playbackParam = false; // always start live
 	trackingParam = trackingConfig.enabled;
 	detectorParam = trackingConfig.detector == "yolo" ? 2 : trackingConfig.detector == "bgs" ? 1 : 0;
@@ -312,6 +336,7 @@ void ofApp::setup(){
 	previewParam.addListener(this, &ofApp::onPreviewChanged);
 	qualityParam.addListener(this, &ofApp::onQualityChanged);
 	recordParam.addListener(this, &ofApp::onRecordChanged);
+	exportParam.addListener(this, &ofApp::onExportChanged);
 	playbackParam.addListener(this, &ofApp::onPlaybackChanged);
 	trackingParam.addListener(this, &ofApp::onTrackingChanged);
 	detectorParam.addListener(this, &ofApp::onDetectorChanged);
@@ -353,7 +378,8 @@ void ofApp::setup(){
 	// CAMTRACK_AUTOPLAYBACK=1 additionally starts in playback mode (tracking
 	// against a recording, no camera); CAMTRACK_RECORDINGS overrides the
 	// recordings folder, so a single recording can be played by pointing it at
-	// a folder holding just that one.
+	// a folder holding just that one. CAMTRACK_AUTOEXPORT=1 starts a motion
+	// export right away (written when the autoshot quits).
 	if(const char * autoshot = std::getenv("CAMTRACK_AUTOSHOT")){
 		autoshotPath = autoshot;
 		if(const char * sec = std::getenv("CAMTRACK_AUTOSHOT_SEC")) autoshotSec = std::max(1.0f, static_cast<float>(std::atof(sec)));
@@ -363,6 +389,10 @@ void ofApp::setup(){
 		ofLogNotice("ofApp") << "autoplayback enabled";
 		if(const char * dir = std::getenv("CAMTRACK_RECORDINGS")) recordingsDir = ofToDataPath(dir, true);
 		playbackParam = true;
+	}
+	if(std::getenv("CAMTRACK_AUTOEXPORT")){
+		ofLogNotice("ofApp") << "autoexport enabled";
+		exportParam = true;
 	}
 }
 
@@ -617,6 +647,17 @@ void ofApp::update(){
 			rawFrameMode = AppMode::Playback;
 			gotFrame = true;
 		}
+		// playhead slider mirrors the player, except while the mouse is
+		// dragging it — then the slider drives the player (onPlayheadChanged)
+		const bool scrubbing = ofGetMousePressed()
+			&& playbackGui.getShape().inside(ofGetMouseX(), ofGetMouseY());
+		if(!scrubbing){
+			const float durationSec = static_cast<float>(player.getDurationMs() / 1000.0);
+			if(durationSec > 0 && playheadParam.getMax() != durationSec) playheadParam.setMax(durationSec);
+			playheadSync = true;
+			playheadParam = static_cast<float>(player.getPositionMs() / 1000.0);
+			playheadSync = false;
+		}
 	}else{
 		ofPixels pixels;
 		double receivedAtMs = 0;
@@ -642,13 +683,22 @@ void ofApp::update(){
 
 	// newest tracking results (published by the tracking thread)
 	if(trackingManager.getLatestResults(trackResults, trackResultsRevision)){
-		if(udp.isOpen()){
+		if(udp.isOpen() || motionExport){
+			// canvas-space objects: the one mapping both outputs publish
+			const std::vector<output::MotionObject> objects = output::fromTrackingResults(trackResults);
 			const double tSec = trackResults.frameTMs / 1000.0;
-			const ofJson frame = output::buildFrame(output::fromTrackingResults(trackResults), tSec,
-			                                        ++udpFrameIndex, 30.0, currentSourceName(),
-			                                        trackResults.canvas.width, trackResults.canvas.height,
-			                                        wallClockSec());
-			udp.send(frame.dump());
+			if(udp.isOpen()){
+				const ofJson frame = output::buildFrame(objects, tSec, ++udpFrameIndex, 30.0,
+				                                        currentSourceName(), trackResults.canvas.width,
+				                                        trackResults.canvas.height, wallClockSec());
+				udp.send(frame.dump());
+			}
+			if(motionExport){
+				// a new source means new track ids and a new time base:
+				// finish this file and start the next one
+				if(currentSourceName() != motionExportSource) startMotionExport();
+				motionExport->addFrame(objects, tSec, wallClockSec());
+			}
 		}
 		// lane masks -> textures (only when shown)
 		if(showMaskParam){
@@ -745,6 +795,7 @@ void ofApp::draw(){
 	drawStatsBar();
 	if(showComDumpParam) drawComDump();
 	gui.draw();
+	if(mode == AppMode::Playback) playbackGui.draw();
 	trackingGui.draw();
 
 	if(autoshotDone && !autoshotPath.empty()){
@@ -1313,18 +1364,25 @@ void ofApp::drawTrackingResults(){
 
 //--------------------------------------------------------------
 void ofApp::drawRecordingIndicator(){
-	if(!recorder.isRecording()) return;
 	const float x = 250; // right of the gui panel
-	const float y = 26;
-	const bool blinkOn = (static_cast<int>(ofGetElapsedTimef() * 2) % 2) == 0;
-	if(blinkOn){
-		ofSetColor(230, 40, 40);
-		ofDrawCircle(x, y - 4, 7);
+	float y = 26;
+	if(recorder.isRecording()){
+		const bool blinkOn = (static_cast<int>(ofGetElapsedTimef() * 2) % 2) == 0;
+		if(blinkOn){
+			ofSetColor(230, 40, 40);
+			ofDrawCircle(x, y - 4, 7);
+		}
+		const std::string label = "REC " + formatClock(recorder.getDurationMs())
+			+ "  " + ofToString(recorder.getFramesWritten()) + " frames  "
+			+ ofToString(recorder.getBytesWritten() / (1024.0 * 1024.0), 1) + " MB";
+		ofDrawBitmapStringHighlight(label, x + 14, y, ofColor(0, 180), ofColor(255, 90, 90));
+		y += 22;
 	}
-	const std::string label = "REC " + formatClock(recorder.getDurationMs())
-		+ "  " + ofToString(recorder.getFramesWritten()) + " frames  "
-		+ ofToString(recorder.getBytesWritten() / (1024.0 * 1024.0), 1) + " MB";
-	ofDrawBitmapStringHighlight(label, x + 14, y, ofColor(0, 180), ofColor(255, 90, 90));
+	if(motionExport){
+		const std::string label = "EXPORT " + ofFilePath::getFileName(motionExportPath)
+			+ "  " + ofToString(motionExport->frameCount()) + " frames";
+		ofDrawBitmapStringHighlight(label, x + 14, y, ofColor(0, 180), ofColor(120, 220, 160));
+	}
 	ofSetColor(255);
 }
 
@@ -1426,7 +1484,8 @@ void ofApp::drawStatsBar(){
 			+ "   frame " + ofToString(player.getFrameCursor()) + "/" + ofToString(player.getFrameCount())
 			+ "   dec " + ofToString(player.getLastDecodeMs(), 1) + " ms"
 			+ trackInfo
-			+ "   LEFT/RIGHT prev/next   UP/DOWN +/-1s   TAB back to live"
+			+ (player.isPaused() ? "   PAUSED" : "")
+			+ "   SPACE play/pause   LEFT/RIGHT prev/next   UP/DOWN +/-1s   TAB back to live"
 			+ "   app " + ofToString(ofGetFrameRate(), 0) + " fps";
 		ofDrawBitmapStringHighlight(line1, 12, y + 24, ofColor(0, 0, 0, 0), ofColor(120, 180, 255));
 		ofDrawBitmapStringHighlight(line2, 12, y + 46, ofColor(0, 0, 0, 0), ofColor(220));
@@ -1478,6 +1537,7 @@ void ofApp::exit(){
 	previewParam.removeListener(this, &ofApp::onPreviewChanged);
 	qualityParam.removeListener(this, &ofApp::onQualityChanged);
 	recordParam.removeListener(this, &ofApp::onRecordChanged);
+	exportParam.removeListener(this, &ofApp::onExportChanged);
 	playbackParam.removeListener(this, &ofApp::onPlaybackChanged);
 	trackingParam.removeListener(this, &ofApp::onTrackingChanged);
 	detectorParam.removeListener(this, &ofApp::onDetectorChanged);
@@ -1485,7 +1545,14 @@ void ofApp::exit(){
 	udpParam.removeListener(this, &ofApp::onUdpChanged);
 	reconnectButton.removeListener(this, &ofApp::onReconnectPressed);
 	saveTrackingButton.removeListener(this, &ofApp::onSaveTrackingPressed);
+	playParam.removeListener(this, &ofApp::onPlayChanged);
+	playheadParam.removeListener(this, &ofApp::onPlayheadChanged);
+	prevFrameButton.removeListener(this, &ofApp::onPrevFramePressed);
+	nextFrameButton.removeListener(this, &ofApp::onNextFramePressed);
+	prevRecordingButton.removeListener(this, &ofApp::onPrevRecordingPressed);
+	nextRecordingButton.removeListener(this, &ofApp::onNextRecordingPressed);
 	stopRecording();
+	stopMotionExport();
 	client.stop();
 	player.close();
 	trackingManager.stop();
@@ -1503,7 +1570,10 @@ void ofApp::keyPressed(int key){
 	}else if(key == 's'){
 		saveScreenshot();
 	}else if(key == ' '){
-		recordParam = !recordParam; // rejected in playback mode
+		if(mode == AppMode::Playback) playParam = !playParam;
+		else recordParam = !recordParam;
+	}else if(key == 'e'){
+		exportParam = !exportParam;
 	}else if(key == 't'){
 		trackingParam = !trackingParam;
 	}else if(key == 'o'){
@@ -1531,15 +1601,9 @@ void ofApp::keyPressed(int key){
 	}else if(key == OF_KEY_TAB){
 		playbackParam = !playbackParam;
 	}else if(key == OF_KEY_RIGHT){
-		if(mode == AppMode::Playback){
-			player.next();
-			trackingManager.reset();
-		}
+		onNextRecordingPressed();
 	}else if(key == OF_KEY_LEFT){
-		if(mode == AppMode::Playback){
-			player.previous();
-			trackingManager.reset();
-		}
+		onPrevRecordingPressed();
 	}else if(key == OF_KEY_UP){
 		if(mode == AppMode::Playback) player.seekBy(1000);
 	}else if(key == OF_KEY_DOWN){
@@ -1556,6 +1620,7 @@ void ofApp::keyPressed(int key){
 void ofApp::mousePressed(int x, int y, int){
 	if(!overlayParam) return; // handles are hidden -> nothing to grab
 	if(gui.getShape().inside(x, y) || trackingGui.getShape().inside(x, y)) return;
+	if(mode == AppMode::Playback && playbackGui.getShape().inside(x, y)) return;
 
 	float bestD2 = kFrameHandleHitRadius * kFrameHandleHitRadius;
 	dragLane = -1;
@@ -1715,6 +1780,34 @@ void ofApp::stopRecording(){
 	recorder.stop();
 }
 
+void ofApp::startMotionExport(){
+	stopMotionExport(); // a start always opens a fresh file
+	motionExportSource = currentSourceName();
+	ofDirectory::createDirectory(recordingsDir, false, true);
+	motionExportPath = ofFilePath::join(recordingsDir,
+		"motion_" + motionExportSource + "_" + ofGetTimestampString("%Y-%m-%d_%H-%M-%S") + ".json");
+	// 30 fps is only the fallback for a file too short to measure its own rate
+	motionExport = std::make_unique<output::MotionPathRecording>(
+		motionExportSource, 30.0, trackingConfig.canvas.width, trackingConfig.canvas.height,
+		output::MotionPathRecording::Style::Editor);
+	ofLogNotice("ofApp") << "motion export started -> " << motionExportPath;
+}
+
+void ofApp::stopMotionExport(){
+	if(!motionExport) return;
+	const std::unique_ptr<output::MotionPathRecording> rec = std::move(motionExport);
+	if(rec->frameCount() == 0){
+		ofLogNotice("ofApp") << "motion export discarded (no frames): " << motionExportPath;
+		return;
+	}
+	if(rec->save(motionExportPath)){
+		ofLogNotice("ofApp") << "motion export written: " << motionExportPath
+		                     << " (" << rec->frameCount() << " frames)";
+	}else{
+		ofLogError("ofApp") << "failed to write motion export " << motionExportPath;
+	}
+}
+
 void ofApp::enterPlayback(){
 	if(mode == AppMode::Playback) return;
 	if(recordParam) recordParam = false; // stops an active recording
@@ -1725,6 +1818,8 @@ void ofApp::enterPlayback(){
 	}
 	playbackSeenFrameId = 0;
 	mode = AppMode::Playback;
+	playParam = true; // scan() starts playing; keep the toggle in step
+	layoutGuiPanels();
 	trackingManager.reset(); // fresh background model / tracks for the recording
 }
 
@@ -1733,6 +1828,55 @@ void ofApp::exitPlayback(){
 	mode = AppMode::Live;
 	player.close();
 	playbackTexture.clear();
+	layoutGuiPanels();
+	trackingManager.reset();
+}
+
+// Stream panel on top; in playback mode the transport panel sits under
+// it and the tracking panel moves down below that. The transport panel
+// only listens to the mouse while it is shown — ofxGui would otherwise
+// keep hit-testing the hidden widgets.
+void ofApp::layoutGuiPanels(){
+	const bool playback = (mode == AppMode::Playback);
+	if(playback != playbackGuiActive){
+		if(playback) playbackGui.registerMouseEvents();
+		else playbackGui.unregisterMouseEvents();
+		playbackGuiActive = playback;
+	}
+	float y = gui.getShape().getBottom() + 8;
+	if(playback){
+		playbackGui.setPosition(10, y);
+		y = playbackGui.getShape().getBottom() + 8;
+	}
+	trackingGui.setPosition(10, y);
+}
+
+void ofApp::onPlayChanged(bool & value){
+	player.setPaused(!value);
+}
+
+void ofApp::onPlayheadChanged(float & value){
+	if(playheadSync) return; // mirrored from the player, not a scrub
+	if(mode == AppMode::Playback) player.seekTo(value * 1000.0);
+}
+
+void ofApp::onPrevFramePressed(){
+	if(mode == AppMode::Playback) player.stepFrame(-1);
+}
+
+void ofApp::onNextFramePressed(){
+	if(mode == AppMode::Playback) player.stepFrame(1);
+}
+
+void ofApp::onPrevRecordingPressed(){
+	if(mode != AppMode::Playback) return;
+	player.previous();
+	trackingManager.reset();
+}
+
+void ofApp::onNextRecordingPressed(){
+	if(mode != AppMode::Playback) return;
+	player.next();
 	trackingManager.reset();
 }
 
@@ -1767,6 +1911,11 @@ void ofApp::onRecordChanged(bool & value){
 	}else{
 		stopRecording();
 	}
+}
+
+void ofApp::onExportChanged(bool & value){
+	if(value) startMotionExport();
+	else stopMotionExport();
 }
 
 void ofApp::onPlaybackChanged(bool & value){

@@ -66,6 +66,11 @@ bool MjpegPlayer::scan(const std::string & dirAbs){
 
 	pendingJump = 0;
 	pendingSeekMs = 0;
+	pendingSeekToMs = -1;
+	pendingStep = 0;
+	paused = false; // a fresh scan always starts playing
+	wasPaused = false;
+	pausedPositionMs = 0;
 	running = true;
 	playThread = std::thread(&MjpegPlayer::threadFn, this);
 	return true;
@@ -166,6 +171,30 @@ void MjpegPlayer::seekBy(int deltaMs){
 	pendingSeekMs += deltaMs;
 }
 
+void MjpegPlayer::seekTo(double positionMs){
+	pendingSeekToMs = static_cast<int>(std::max(0.0, positionMs));
+}
+
+void MjpegPlayer::stepFrame(int delta){
+	pendingStep += delta;
+}
+
+void MjpegPlayer::setPaused(bool p){
+	paused = p;
+}
+
+size_t MjpegPlayer::frameAt(double positionMs) const {
+	const auto it = std::upper_bound(frames.begin(), frames.end(), positionMs,
+	                                 [](double t, const FrameIndex & f){ return t < f.tMs; });
+	return (it == frames.begin()) ? 0 : static_cast<size_t>(it - frames.begin()) - 1;
+}
+
+void MjpegPlayer::showFrame(size_t idx){
+	decodeAndPublish(idx); // corrupt frame -> just skip it
+	frameCursor = idx + 1;
+	publishInfo();
+}
+
 void MjpegPlayer::threadFn(){
 	if(!open(0)){
 		running = false;
@@ -179,23 +208,54 @@ void MjpegPlayer::threadFn(){
 			const int n = static_cast<int>(playlist.size());
 			const int target = ((static_cast<int>(currentIndex) + jump) % n + n) % n;
 			open(static_cast<size_t>(target));
+			// paused: the clock would never reach frame 0 — show it now
+			if(wasPaused) pendingSeekToMs = 0;
 		}
 		if(frames.empty()){
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			continue;
 		}
 
-		// Apply queued seeks (+/- within the current recording): shift the
-		// playback clock and rewind the cursor to the frame at-or-before the
-		// target so it is (re)shown immediately.
-		const int seekMs = pendingSeekMs.exchange(0);
-		if(seekMs != 0){
-			const double target = std::clamp(nowMs() - clockStartMs + seekMs, 0.0, durationMs);
-			clockStartMs = nowMs() - target;
-			const auto it = std::upper_bound(frames.begin(), frames.end(), target,
-			                                 [](double t, const FrameIndex & f){ return t < f.tMs; });
-			frameCursor = (it == frames.begin()) ? 0 : static_cast<size_t>(it - frames.begin()) - 1;
+		// Pause transitions: freeze the clock at the current position, or
+		// restart it from where it was frozen.
+		const bool pauseNow = paused.load();
+		if(pauseNow != wasPaused){
+			if(pauseNow) pausedPositionMs = std::clamp(nowMs() - clockStartMs, 0.0, durationMs);
+			else clockStartMs = nowMs() - pausedPositionMs;
+			wasPaused = pauseNow;
 			publishInfo();
+		}
+		const auto positionNow = [&]{ return wasPaused ? pausedPositionMs : nowMs() - clockStartMs; };
+		const auto setPosition = [&](double ms){
+			if(wasPaused) pausedPositionMs = ms;
+			else clockStartMs = nowMs() - ms;
+		};
+
+		// Seeks: an absolute target (slider) replaces the position, relative
+		// deltas (keys) add to it; the frame at-or-before is shown at once.
+		const int seekToMs = pendingSeekToMs.exchange(-1);
+		const int seekByMs = pendingSeekMs.exchange(0);
+		if(seekToMs >= 0 || seekByMs != 0){
+			const double base = seekToMs >= 0 ? static_cast<double>(seekToMs) : positionNow();
+			const double target = std::clamp(base + seekByMs, 0.0, durationMs);
+			setPosition(target);
+			showFrame(frameAt(target));
+		}
+
+		// Frame steps from the frame on screen; the clock parks on the
+		// stepped frame so playback (or a resume) continues from it.
+		const int step = pendingStep.exchange(0);
+		if(step != 0){
+			const long shown = static_cast<long>(frameCursor) - 1;
+			const long last = static_cast<long>(frames.size()) - 1;
+			const size_t idx = static_cast<size_t>(std::clamp(shown + step, 0L, last));
+			setPosition(frames[idx].tMs);
+			showFrame(idx);
+		}
+
+		if(wasPaused){
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+			continue;
 		}
 
 		const double elapsed = nowMs() - clockStartMs;
@@ -314,6 +374,8 @@ void MjpegPlayer::publishInfo(){
 	info.frameCursor = frameCursor;
 	info.frameCount = frames.size();
 	info.clockStartMs = clockStartMs;
+	info.paused = wasPaused;
+	info.pausedPositionMs = pausedPositionMs;
 	info.lastDecodeMs = lastDecodeMs;
 }
 
@@ -335,6 +397,7 @@ size_t MjpegPlayer::getCount() const {
 double MjpegPlayer::getPositionMs() const {
 	std::lock_guard<std::mutex> lock(infoMutex);
 	if(!running || info.clockStartMs <= 0) return 0;
+	if(info.paused) return std::min(info.pausedPositionMs, info.durationMs);
 	return std::min(nowMs() - info.clockStartMs, info.durationMs);
 }
 

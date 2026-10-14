@@ -146,6 +146,18 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 		}
 	}
 	c.shape.modelPath = c.shape.modelFile.empty() ? std::string() : resolvePath(c.shape.modelFile);
+	// smoothing: flat OutputSmoother parameters
+	if(t.contains("smoothing") && t["smoothing"].is_object()){
+		for(auto it = t["smoothing"].begin(); it != t["smoothing"].end(); ++it){
+			double v = 0;
+			if(it->is_boolean()) v = it->get<bool>() ? 1 : 0;
+			else if(it->is_number()) v = it->get<double>();
+			else continue;
+			if(!setSmoothParam(c.smoothing, it.key(), v)){
+				ofLogWarning("TrackingConfig") << "unknown smoothing parameter '" << it.key() << "'";
+			}
+		}
+	}
 	if(t.contains("yolo")){
 		const auto & y = t["yolo"];
 		c.yolo.modelPath = resolvePath(y.value("model", std::string("models/yolov8n.onnx")));
@@ -210,6 +222,12 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 					if(lanej.contains("quad")) parseQuad(lanej["quad"], lane.quad);
 					lane.s0 = lanej.value("s0", 0.0f);
 					lane.s1 = lanej.value("s1", 1.0f);
+					// optional "yBand": [y0, y1] (lane fractions)
+					if(lanej.contains("yBand") && lanej["yBand"].is_array() && lanej["yBand"].size() >= 2){
+						lane.yBand0 = clamp01(lanej["yBand"][0].get<float>());
+						lane.yBand1 = clamp01(lanej["yBand"][1].get<float>());
+						if(lane.yBand1 < lane.yBand0) std::swap(lane.yBand0, lane.yBand1);
+					}
 					l.lanes.push_back(lane);
 				}
 			}
@@ -249,6 +267,7 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 	ofJson shape = paramsJson(shapeParams(cfg.shape));
 	shape["model"] = cfg.shape.modelFile;
 	t["shape"] = shape;
+	t["smoothing"] = paramsJson(smoothParams(cfg.smoothing));
 	t["yolo"]["confThreshold"] = cfg.yolo.confThreshold;
 	t["yolo"]["nmsThreshold"] = cfg.yolo.nmsThreshold;
 	t["overlay"]["arrowScale"] = overlayArrowScale;
@@ -281,14 +300,16 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 		lj["recordings"] = l.recordings;
 		ofJson lanes = ofJson::array();
 		for(const auto & lane : l.lanes){
-			lanes.push_back({
+			ofJson lanej = {
 				{"id", lane.id},
 				{"pane", lane.pane},
 				{"corridor", lane.corridor},
 				{"quad", quadJson(lane.quad)},
 				{"s0", lane.s0},
 				{"s1", lane.s1},
-			});
+			};
+			if(lane.hasYBand()) lanej["yBand"] = {lane.yBand0, lane.yBand1};
+			lanes.push_back(lanej);
 		}
 		lj["lanes"] = lanes;
 		layouts.push_back(lj);

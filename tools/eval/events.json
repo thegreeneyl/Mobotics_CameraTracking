@@ -7,7 +7,10 @@
     "coarse: true marks events that were barely legible and are reported but never gate a run.",
     "Windows cover the time the object is visible INSIDE the configured lane: in the single view the",
     "viaduct is hidden behind the building left of x=0.08 and behind the trees right of x=0.86 (the",
-    "S-Bahn platform), so trains 'enter'/'exit' there, not at the frame edges."
+    "S-Bahn platform), so trains 'enter'/'exit' there, not at the frame edges.",
+    "The 2026-10-12 recordings (1920x1080, deck-tight 'single' train lane saved 2026-10-13) contain",
+    "two trains at once in three of them; events of one class may overlap in time and the scorer",
+    "allows as many simultaneous tracks as there are concurrent events (matched by direction)."
   ],
   "tolerance_s": 2.0,
   "tolerance_approx_s": 4.0,
@@ -160,6 +163,123 @@
           "t1": 322,
           "direction": "right",
           "approx": true
+        }
+      ]
+    },
+    "rec_2026-10-12_15-48-29": {
+      "layout": "single",
+      "events": [
+        {
+          "class": "boat",
+          "t0": 11,
+          "t1": 44,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 29,
+          "t1": 44,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 70,
+          "t1": 86,
+          "direction": "left",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-10-12_16-04-00": {
+      "layout": "single",
+      "events": [
+        {
+          "class": "train",
+          "t0": 12,
+          "t1": 28,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 47,
+          "t1": 62,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "boat",
+          "t0": 58,
+          "t1": 88,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 125,
+          "t1": 149,
+          "direction": "right",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-10-12_16-24-35": {
+      "layout": "single",
+      "events": [
+        {
+          "class": "train",
+          "t0": 21,
+          "t1": 38,
+          "direction": "left",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 23,
+          "t1": 54,
+          "direction": "right",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-10-12_16-27-03": {
+      "layout": "single",
+      "events": [
+        {
+          "class": "train",
+          "t0": 12,
+          "t1": 39,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 23,
+          "t1": 41,
+          "direction": "left",
+          "approx": true
+        }
+      ]
+    },
+    "rec_2026-10-12_16-29-11": {
+      "layout": "single",
+      "events": [
+        {
+          "class": "train",
+          "t0": 14,
+          "t1": 49,
+          "direction": "right",
+          "approx": true
+        },
+        {
+          "class": "train",
+          "t0": 42,
+          "t1": 56,
+          "direction": "left",
+          "approx": true,
+          "note": "enters behind the right-going train at ~35 s and is completely hidden by it inside the lane until ~42 s (checked on the 40 s lane strip: one train); its nose first shows at x~0.48"
         }
       ]
     }

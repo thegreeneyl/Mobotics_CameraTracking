@@ -338,7 +338,10 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 					tracks.push_back({{"id", o.id}, {"c", cr.id}, {"x0", r4(o.x0)}, {"x1", r4(o.x1)},
 					                  {"y0", r4(o.y0)}, {"y1", r4(o.y1)}, {"vx", r4(o.vx)}, {"vy", r4(o.vy)},
 					                  {"conf", o.confirmed}, {"ph", o.phase}, {"hits", o.hits}, {"miss", o.misses},
-					                  {"cl", o.clippedLeft}, {"cr", o.clippedRight}});
+					                  {"cl", o.clippedLeft}, {"cr", o.clippedRight}, {"eb", o.edgeBorn},
+					                  {"pr", r4(o.presence)}, {"mc", o.shape.modelCalls}, {"mh", o.shape.modelHits},
+					                  {"mo", o.shape.otherClassHits}, {"mcls", o.shape.modelClass},
+					                  {"src", o.shape.source}});
 				}
 			}
 			debug << ofJson{{"t", r4(tSec)}, {"lanes", lanes}, {"tracks", tracks}}.dump() << "\n";

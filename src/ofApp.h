@@ -1,12 +1,14 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 
 #include "ofMain.h"
 #include "ofxGui.h"
 
 #include "mobotix/MobotixMjpegClient.h"
 #include "mobotix/MobotixTypes.h"
+#include "output/MotionPathWriter.h"
 #include "output/UdpSender.h"
 #include "recording/MjpegPlayer.h"
 #include "recording/MjpegRecorder.h"
@@ -72,6 +74,16 @@ private:
 	void exitPlayback();
 	std::string currentSourceName() const;
 
+	// motion-path export: one editor-shaped JSON file per start, fed by the
+	// tracking results in both modes — independent of the MJPEG recorder,
+	// which taps raw JPEG bytes. A source change (live <-> playback, next
+	// recording) closes the file and opens a new one.
+	std::unique_ptr<output::MotionPathRecording> motionExport;
+	std::string motionExportPath;   // absolute, written on stop
+	std::string motionExportSource; // currentSourceName() when it was opened
+	void startMotionExport();
+	void stopMotionExport();
+
 	// tracking (worker thread; fed by the raw-frame taps of client/player)
 	tracking::TrackingManager trackingManager;
 	tracking::TrackingConfig trackingConfig; // loaded config + committed lane edits
@@ -127,6 +139,7 @@ private:
 	ofParameter<int> qualityParam{"jpeg quality (preview)", 60, 10, 90};
 	ofParameter<bool> showComDumpParam{"show COM dump", false};
 	ofParameter<bool> recordParam{"record (SPACE)", false};
+	ofParameter<bool> exportParam{"export motion (e)", false};
 	ofParameter<bool> playbackParam{"playback mode (TAB)", false};
 	ofParameter<bool> trackingParam{"tracking (t)", true};
 	ofParameter<bool> overlayParam{"overlay (o)", true};
@@ -141,6 +154,25 @@ private:
 	ofParameter<bool> halfResParam{"half-res decode", true};
 	ofParameter<bool> udpParam{"udp publish", false};
 	ofxButton reconnectButton;
+
+	// playback transport (shown in playback mode only, under the stream
+	// panel; the tracking panel moves down to make room)
+	ofxPanel playbackGui;
+	ofParameter<bool> playParam{"play (SPACE)", true};
+	ofParameter<float> playheadParam{"playhead s", 0, 0, 1};
+	ofxButton prevFrameButton;
+	ofxButton nextFrameButton;
+	ofxButton prevRecordingButton;
+	ofxButton nextRecordingButton;
+	bool playheadSync = false;      // true while update() mirrors the player into the slider
+	bool playbackGuiActive = false; // panel shown and receiving mouse events
+	void layoutGuiPanels();
+	void onPlayChanged(bool & value);
+	void onPlayheadChanged(float & value);
+	void onPrevFramePressed();
+	void onNextFramePressed();
+	void onPrevRecordingPressed();
+	void onNextRecordingPressed();
 
 	// tracking tuning gui (values loaded from config.json, pushed live to
 	// the worker, written back by the save button — never by gui.xml)
@@ -212,6 +244,7 @@ private:
 	void onPreviewChanged(bool & value);
 	void onQualityChanged(int & value);
 	void onRecordChanged(bool & value);
+	void onExportChanged(bool & value);
 	void onPlaybackChanged(bool & value);
 	void onTrackingChanged(bool & value);
 	void onDetectorChanged(int & value);

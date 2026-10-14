@@ -45,7 +45,9 @@ bool SegModel::load(const std::string & path, int inputW, int inputH){
 }
 
 bool SegModel::segment(const cv::Mat & crop, const cv::Rect2f & target, float conf, float minIou,
-                       float maskThresh, Result & out){
+                       float maskThresh, const std::vector<int> & allow, Result & out){
+	out.otherClass = -1;
+	out.otherScore = 0;
 	if(!loaded || crop.empty() || crop.type() != CV_8UC3) return false;
 
 	// letterbox (Ultralytics preprocessing: pad 114, RGB, 0..1)
@@ -112,6 +114,12 @@ bool SegModel::segment(const cv::Mat & crop, const cv::Rect2f & target, float co
 		// speck (a person on deck, a reflection) — at least 3 % of the box
 		const bool part = inside >= 0.6f && box.area() >= 0.03f * target.area();
 		if(iou < minIou && !part) continue;
+		// a class the caller is not looking for: remember the strongest one
+		// (the model gate rejects a track that is only ever "car") and move on
+		if(!allow.empty() && std::find(allow.begin(), allow.end(), cls) == allow.end()){
+			if(score > out.otherScore){ out.otherScore = score; out.otherClass = cls; }
+			continue;
+		}
 		cands.push_back({i, box, score, cls, iou, std::max(iou, inside * 0.5f) * (0.5f + 0.5f * score)});
 	}
 	if(cands.empty()) return false;

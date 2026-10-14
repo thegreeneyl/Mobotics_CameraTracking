@@ -46,6 +46,15 @@ struct FlowDetectorConfig {
 	float mergeAngleDeg = 40.0f;
 	float mergeSpeedRatio = 3.0f;
 	float mergeLateralOverlap = 0.25f;
+	// --- direction split: a component whose flow-seed pixels move both
+	// ways along the lane (two trains passing) is one undirected blob but
+	// two objects. When the minority sign is a blob in its own right
+	// (>= minAreaFrac) and above the noise floor (>= dirSplitMinFrac of the
+	// signed pixels) the component is cut into a +x and a -x part — each
+	// sign's seed pixels grown by the closing kernel inside the component
+	// — before the blobs are measured.
+	bool dirSplit = true;
+	float dirSplitMinFrac = 0.05f;
 	// --- axis lock (trains): velocity is along the lane, vy is noise
 	bool lockAxis = false;
 	int maxDetections = 8;

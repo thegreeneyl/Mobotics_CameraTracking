@@ -79,6 +79,36 @@ bool ShapeEstimator::wantsColor(const ShapeConfig & c) const {
 	return c.enabled && c.source == 2 && !modelFailed;
 }
 
+bool ShapeEstimator::modelActive(const ShapeConfig & c) const {
+	return c.enabled && c.source == 2 && model && model->isLoaded();
+}
+
+// COCO: car 2, bus 5, train 6, truck 7, boat 8. Every train in the
+// evaluation recordings is labelled "train" (class 6) by the model, from
+// the first partial sighting on; bus / truck / car are what the road behind
+// the viaduct produces and are deliberately NOT accepted — they are what
+// the gate is for.
+std::vector<int> ShapeEstimator::allowedClasses(const std::string & label){
+	if(label == "train") return {6};
+	if(label == "boat") return {8};
+	return {};
+}
+
+ShapeFeedback ShapeEstimator::feedbackFor(const TrackedObject & o, bool modelAvailable){
+	ShapeFeedback fb;
+	const ObjectShape & s = o.shape;
+	fb.modelAvailable = modelAvailable;
+	fb.modelCalls = s.modelCalls;
+	fb.modelHits = s.modelHits;
+	fb.otherClassHits = s.otherClassHits;
+	fb.modelAge = s.modelAge;
+	const bool modelShape = s.valid && (s.source == "model" || s.source == "model+mask");
+	fb.outlineValid = modelShape && !s.outline.empty();
+	fb.boxValid = fb.outlineValid && s.boxValid;
+	fb.bx0 = s.bx0; fb.bx1 = s.bx1; fb.by0 = s.by0; fb.by1 = s.by1;
+	return fb;
+}
+
 void ShapeEstimator::beginFrame(const cv::Mat & bgr, int pw, int ph, uint64_t index){
 	frameBgr = bgr;
 	paneW = pw;
@@ -152,7 +182,10 @@ void ShapeEstimator::sampleLane(const cv::Mat & laneMask, const LaneInput & li, 
 // Segments the object in this lane's pane and returns the instance mask
 // warped into lane space (8U laneH x laneW).
 bool ShapeEstimator::runModel(const TrackedObject & o, const ShapeConfig & cfg, const LaneInput & li,
-                              const ObjectShape & f, State & st, cv::Mat & laneMask, cv::Mat & laneSeen){
+                              const ObjectShape & f, State & st, const std::vector<int> & allow,
+                              cv::Mat & laneMask, cv::Mat & laneSeen, int & classId, int & otherClass){
+	classId = -1;
+	otherClass = -1;
 	if(!model || frameBgr.empty() || !li.homography || li.homography->empty()) return false;
 	const LaneConfig & lane = *li.lane;
 	if(lane.pane < 0 || (lane.pane + 1) * paneW > frameBgr.cols) return false;
@@ -201,8 +234,10 @@ bool ShapeEstimator::runModel(const TrackedObject & o, const ShapeConfig & cfg, 
 
 	SegModel::Result r;
 	modelRunsThisFrame++;
-	const bool ok = model->segment(cropImg, target, cfg.modelConf, cfg.modelMinIou, cfg.modelMaskThresh, r);
+	const bool ok = model->segment(cropImg, target, cfg.modelConf, cfg.modelMinIou, cfg.modelMaskThresh, allow, r);
 	modelMsThisFrame += model->lastForwardMs();
+	otherClass = r.otherClass;
+	if(ok) classId = r.classId;
 
 	// tile px -> pane px -> lane px; the seen area is the tile itself
 	cv::Mat T = cv::Mat::eye(3, 3, CV_64F);
@@ -242,6 +277,16 @@ void ShapeEstimator::extractOutline(const cv::Mat & ema, const ShapeConfig & cfg
 	for(const auto & p : poly){
 		shape.outline.emplace_back(shape.toS((p.x + 0.5f) / kUp), shape.toY((p.y + 0.5f) / kUp));
 	}
+	// bounding box of the silhouette (corridor coordinates)
+	shape.bx0 = shape.by0 = 1e9f;
+	shape.bx1 = shape.by1 = -1e9f;
+	for(const auto & p : shape.outline){
+		shape.bx0 = std::min(shape.bx0, p.first);
+		shape.bx1 = std::max(shape.bx1, p.first);
+		shape.by0 = std::min(shape.by0, p.second);
+		shape.by1 = std::max(shape.by1, p.second);
+	}
+	shape.boxValid = shape.bx1 > shape.bx0 && shape.by1 > shape.by0;
 }
 
 void ShapeEstimator::updateCorridor(CorridorResult & cr, const ShapeConfig & cfg, const std::vector<LaneInput> & lanes){
@@ -249,18 +294,28 @@ void ShapeEstimator::updateCorridor(CorridorResult & cr, const ShapeConfig & cfg
 	const bool useModel = cfg.source == 2;
 	if(useModel) ensureModel();
 	const bool modelOk = useModel && model && !frameBgr.empty();
+	const std::vector<int> allow = cfg.modelClassGate ? allowedClasses(cr.label) : std::vector<int>{};
 
-	// largest objects first: they get the model budget
+	// Confirmed objects first, largest first: they get the model budget.
+	// Edge-born tentative tracks follow (model verdict for the gate) when
+	// the model runs; other tentative tracks get nothing.
 	std::vector<TrackedObject *> order;
-	for(auto & o : cr.objects) order.push_back(&o);
+	for(auto & o : cr.objects){
+		if(o.confirmed) order.push_back(&o);
+		else if(modelOk && cfg.modelTentative && o.edgeBorn) order.push_back(&o);
+		else if(!cfg.confirmedOnly) order.push_back(&o);
+	}
 	std::sort(order.begin(), order.end(), [](const TrackedObject * a, const TrackedObject * b){
+		if(a->confirmed != b->confirmed) return a->confirmed;
 		return a->w * a->h > b->w * b->h;
 	});
 
 	for(TrackedObject * op : order){
 		TrackedObject & o = *op;
-		if(cfg.confirmedOnly && !o.confirmed) continue;
 		if(o.w <= 0 || o.h <= 0) continue;
+		// a tentative track in a confirmedOnly corridor is here for the
+		// model verdict only: no mask fallback feeds its grid
+		const bool gateOnly = !o.confirmed && cfg.confirmedOnly;
 
 		State & st = states[o.id];
 		st.lastSeen = frameIndex;
@@ -270,30 +325,45 @@ void ShapeEstimator::updateCorridor(CorridorResult & cr, const ShapeConfig & cfg
 			st.obs.clear();
 			st.fresh = true;
 		}
+		if(st.modelAge < (1 << 20)) st.modelAge++;
 
 		cv::Mat obs(f.gridH, f.gridW, CV_32F, cv::Scalar(kUnobserved));
 		std::string src;
 		float alpha = std::clamp(cfg.ema, 0.01f, 1.0f);
-		const bool stopped = o.phase == "stopped";
-		if(!stopped){
+		// a halted or hidden object keeps its shape: a motion mask would
+		// fade on the one, the other is not visible at all
+		const bool frozen = o.phase == "stopped" || o.phase == "occluded";
+		if(!frozen){
 			if(modelOk){
 				const bool due = ((frameIndex + static_cast<uint64_t>(o.id)) % std::max(1, cfg.modelEveryN)) == 0
 				                 && modelRunsThisFrame < cfg.modelMaxPerFrame;
 				if(due){
 					bool any = false;
+					int otherSeen = -1;
 					for(int li : cr.lanes){
 						if(li < 0 || li >= static_cast<int>(lanes.size()) || !lanes[li].lane) continue;
 						cv::Mat laneMask, laneSeen;
-						if(runModel(o, cfg, lanes[li], f, st, laneMask, laneSeen)){
+						int cls = -1, other = -1;
+						if(runModel(o, cfg, lanes[li], f, st, allow, laneMask, laneSeen, cls, other)){
 							sampleLane(laneMask, lanes[li], f, obs, &laneSeen);
 							any = true;
+							st.modelClass = cls;
 						}
+						if(other >= 0) otherSeen = other;
 					}
 					st.tileCursor++;
-					if(any){ st.modelMiss = 0; src = "model"; }
-					else st.modelMiss++;
+					st.modelCalls++;
+					if(any){
+						st.modelMiss = 0;
+						st.modelHits++;
+						st.modelAge = 0;
+						src = "model";
+					}else{
+						st.modelMiss++;
+						if(otherSeen >= 0) st.otherClassHits++;
+					}
 				}
-				if(src.empty() && st.modelMiss > cfg.modelHoldFrames){
+				if(src.empty() && !gateOnly && st.modelMiss > cfg.modelHoldFrames){
 					// the model has gone silent: lean on the closed detector
 					// mask, gently if the grid still holds a model silhouette
 					for(int li : cr.lanes){
@@ -306,7 +376,7 @@ void ShapeEstimator::updateCorridor(CorridorResult & cr, const ShapeConfig & cfg
 						src = "model+mask";
 					}
 				}
-			}else{
+			}else if(!gateOnly){
 				for(int li : cr.lanes){
 					if(li < 0 || li >= static_cast<int>(lanes.size()) || !lanes[li].lane) continue;
 					const cv::Mat * m = cfg.source == 0 ? lanes[li].mask : lanes[li].foreground;
@@ -353,7 +423,23 @@ void ShapeEstimator::updateCorridor(CorridorResult & cr, const ShapeConfig & cfg
 			}
 		}
 		shape.obs = st.obs.empty() ? std::vector<uint8_t>(shape.ema.size(), 128) : st.obs;
+		shape.modelCalls = st.modelCalls;
+		shape.modelHits = st.modelHits;
+		shape.otherClassHits = st.otherClassHits;
+		shape.modelAge = st.modelAge;
+		shape.modelClass = st.modelClass;
 		if(shape.valid) extractOutline(st.ema, cfg, shape);
+		// The silhouette box only stands for the whole object once (nearly)
+		// every cell has been looked at: with a long train cut into tiles
+		// the first observation covers one tile, and a box from that would
+		// shrink the tracked box to a third of the train. (Cells of the
+		// padding that lie outside every lane are never observed, hence
+		// the generous quarter.)
+		if(shape.boxValid){
+			size_t unseen = 0;
+			for(uint8_t v : shape.obs) unseen += v == 128;
+			if(unseen * 4 > shape.obs.size()) shape.boxValid = false;
+		}
 	}
 }
 

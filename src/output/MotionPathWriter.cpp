@@ -11,7 +11,8 @@ constexpr const char * kSchema = "motion-path.v1";
 constexpr int kMaxPathPoints = 80;
 
 double round4(double v){
-	return std::round(v * 10000.0) / 10000.0;
+	const double r = std::round(v * 10000.0) / 10000.0;
+	return r == 0.0 ? 0.0 : r; // no "-0.0" in the output
 }
 
 double headingDeg(double vx, double vy){
@@ -82,6 +83,7 @@ std::vector<MotionObject> fromTrackingResults(const tracking::TrackingResults & 
 			mo.vy = o.vy * pl.spanY();
 			mo.phase = o.phase;
 			mo.confirmed = o.confirmed;
+			mo.presence = o.presence;
 			// cut on the canvas side, either by a corridor end (mapped
 			// through the mirror) or by the canvas edge
 			const bool corrLeft = pl.mirrored() ? o.clippedRight : o.clippedLeft;
@@ -183,6 +185,7 @@ ofJson buildFrame(const std::vector<MotionObject> & objects, double tSec, int fr
 			{"heading_deg", std::round(heading * 10.0) / 10.0},
 			{"heading", speed > 0.003 ? headingLabel(heading) : "still"},
 			{"phase", o.phase},
+			{"presence", std::round(o.presence * 1000.0) / 1000.0},
 			{"fill", std::round(o.w * o.h * 1000.0) / 1000.0},
 			{"class", o.label.empty() ? ofJson(nullptr) : ofJson(o.label)},
 			{"region", regionLabel(o.x, o.y)},
@@ -224,29 +227,96 @@ ofJson buildFrame(const std::vector<MotionObject> & objects, double tSec, int fr
 	};
 }
 
-MotionPathRecording::MotionPathRecording(std::string src, double f, int w, int h)
-	: source(std::move(src)), fps(f), sizeW(w), sizeH(h){}
+ofJson buildEditorFrame(const std::vector<MotionObject> & objects, double tSec){
+	ofJson objs = ofJson::array();
+	double sumVx = 0, sumVy = 0;
+	int count = 0;
+	for(const auto & o : objects){
+		if(!o.confirmed) continue;
+		ofJson outline = ofJson::array();
+		for(const auto & p : o.outline) outline.push_back({round4(p.first), round4(p.second)});
+		objs.push_back({
+			{"id", o.id},
+			{"x", round4(o.x)},
+			{"y", round4(o.y)},
+			{"vx", round4(o.vx)},
+			{"vy", round4(o.vy)},
+			{"speed", round4(std::hypot(o.vx, o.vy))},
+			{"phase", o.phase},
+			{"presence", std::round(o.presence * 1000.0) / 1000.0},
+			{"fill", std::round(o.w * o.h * 1000.0) / 1000.0},
+			{"bbox", {round4(o.x - o.w / 2), round4(o.y - o.h / 2), round4(o.w), round4(o.h)}},
+			{"outline", outline},
+		});
+		sumVx += o.vx;
+		sumVy += o.vy;
+		count++;
+	}
+	const double sceneVx = count ? sumVx / count : 0.0;
+	const double sceneVy = count ? sumVy / count : 0.0;
+	return ofJson{
+		{"t", round4(tSec)},
+		{"scene", {
+			{"vx", round4(sceneVx)},
+			{"vy", round4(sceneVy)},
+			{"speed", round4(std::hypot(sceneVx, sceneVy))}}},
+		{"objects", objs},
+	};
+}
+
+MotionPathRecording::MotionPathRecording(std::string src, double f, int w, int h, Style s)
+	: source(std::move(src)), fps(f), sizeW(w), sizeH(h), style(s){}
 
 void MotionPathRecording::addFrame(const std::vector<MotionObject> & objects, double tSec,
                                    double wallClockSec){
-	frames.push_back(buildFrame(objects, tSec, static_cast<int>(frames.size()) + 1, fps, source,
-	                            sizeW, sizeH, wallClockSec));
+	if(frames.empty()) firstTSec = tSec;
+	if(style == Style::Editor){
+		// The editor seeks by binary search on `t`, so the file must stay
+		// sorted: a frame from a playhead scrubbed backwards is dropped.
+		if(!frames.empty() && tSec < lastTSec) return;
+		frames.push_back(buildEditorFrame(objects, tSec - firstTSec));
+	}else{
+		frames.push_back(buildFrame(objects, tSec, static_cast<int>(frames.size()) + 1, fps, source,
+		                            sizeW, sizeH, wallClockSec));
+	}
 	lastTSec = tSec;
 }
 
+double MotionPathRecording::effectiveFps() const {
+	if(style == Style::Editor && frames.size() >= 2){
+		const double span = lastTSec - firstTSec;
+		if(span > 1e-6) return (frames.size() - 1) / span;
+	}
+	return std::max(fps, 1.0);
+}
+
 bool MotionPathRecording::save(const std::string & path, const std::string & note) const {
-	ofJson doc = {
-		{"schema", kSchema},
-		{"kind", "recording"},
-		{"source", source},
-		{"fps", std::round(fps * 100.0) / 100.0},
-		{"frame_count", frames.size()},
-		{"duration_s", frames.empty() ? 0.0 : round4(lastTSec + 1.0 / std::max(fps, 1.0))},
-		{"size", {sizeW, sizeH}},
-		{"live", {{"transport", "udp"}, {"host", "127.0.0.1"}, {"port", 8765},
-		          {"note", "In production each frames[] item is one UDP datagram."}}},
-		{"frames", frames},
-	};
+	const double f = effectiveFps();
+	ofJson doc;
+	if(style == Style::Editor){
+		const double lastT = frames.empty() ? 0.0 : lastTSec - firstTSec;
+		doc = {
+			{"schema", kSchema},
+			{"source", source},
+			{"fps", std::round(f * 100.0) / 100.0},
+			{"duration_s", frames.empty() ? 0.0 : round4(lastT + 1.0 / f)},
+			{"size", {sizeW, sizeH}},
+			{"frames", frames},
+		};
+	}else{
+		doc = {
+			{"schema", kSchema},
+			{"kind", "recording"},
+			{"source", source},
+			{"fps", std::round(f * 100.0) / 100.0},
+			{"frame_count", frames.size()},
+			{"duration_s", frames.empty() ? 0.0 : round4(lastTSec + 1.0 / f)},
+			{"size", {sizeW, sizeH}},
+			{"live", {{"transport", "udp"}, {"host", "127.0.0.1"}, {"port", 8765},
+			          {"note", "In production each frames[] item is one UDP datagram."}}},
+			{"frames", frames},
+		};
+	}
 	if(!note.empty()) doc["note"] = note;
 	std::ofstream out(path);
 	if(!out.is_open()) return false;

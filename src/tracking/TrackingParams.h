@@ -6,6 +6,7 @@
 
 #include "FlowMotionDetector.h"
 #include "MultiObjectTracker.h"
+#include "OutputSmoother.h"
 #include "ShapeEstimator.h"
 
 // Name <-> field tables for the tunable detector / tracker parameters.
@@ -27,11 +28,13 @@ struct ParamInfo {
 bool setFlowParam(FlowDetectorConfig & c, const std::string & key, double v);
 bool setTrackerParam(TrackerConfig & c, const std::string & key, double v);
 bool setShapeParam(ShapeConfig & c, const std::string & key, double v); // numeric keys only (not `model`)
+bool setSmoothParam(SmoothConfig & c, const std::string & key, double v);
 
 // All parameters with their current values (for saving / GUI listing).
 std::vector<ParamInfo> flowParams(const FlowDetectorConfig & c);
 std::vector<ParamInfo> trackerParams(const TrackerConfig & c);
 std::vector<ParamInfo> shapeParams(const ShapeConfig & c);
+std::vector<ParamInfo> smoothParams(const SmoothConfig & c);
 
 // Apply a flat override map (unknown keys are ignored).
 void applyFlowOverrides(FlowDetectorConfig & c, const std::map<std::string, double> & o);

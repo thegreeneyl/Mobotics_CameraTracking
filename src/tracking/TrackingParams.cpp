@@ -55,6 +55,8 @@ const std::vector<Field<FlowDetectorConfig>> & flowFields(){
 		F_FLOAT(FlowDetectorConfig, mergeAngleDeg),
 		F_FLOAT(FlowDetectorConfig, mergeSpeedRatio),
 		F_FLOAT(FlowDetectorConfig, mergeLateralOverlap),
+		F_BOOL(FlowDetectorConfig, dirSplit),
+		F_FLOAT(FlowDetectorConfig, dirSplitMinFrac),
 		F_BOOL(FlowDetectorConfig, lockAxis),
 		F_INT(FlowDetectorConfig, maxDetections),
 		F_INT(FlowDetectorConfig, edgeMarginPx),
@@ -95,6 +97,20 @@ const std::vector<Field<TrackerConfig>> & trackerFields(){
 		F_FLOAT(TrackerConfig, posProcNoise),
 		F_FLOAT(TrackerConfig, velProcNoise),
 		F_FLOAT(TrackerConfig, clippedMeasNoise),
+		F_BOOL(TrackerConfig, edgeRule),
+		F_FLOAT(TrackerConfig, edgeBirthFrac),
+		F_DOUBLE(TrackerConfig, edgeGraceMs),
+		F_FLOAT(TrackerConfig, minConfirmLen),
+		F_BOOL(TrackerConfig, modelGate),
+		F_INT(TrackerConfig, modelGateOtherHits),
+		F_DOUBLE(TrackerConfig, modelLostMs),
+		F_BOOL(TrackerConfig, coastOccluded),
+		F_DOUBLE(TrackerConfig, occludedMaxMs),
+		F_FLOAT(TrackerConfig, occludedGateGrow),
+		F_BOOL(TrackerConfig, shapeBox),
+		F_INT(TrackerConfig, shapeBoxMaxAge),
+		F_FLOAT(TrackerConfig, shapeBoxTrim),
+		F_BOOL(TrackerConfig, hiddenRear),
 		F_INT(TrackerConfig, trailLen),
 		F_DOUBLE(TrackerConfig, maxDtSec),
 	};
@@ -126,6 +142,20 @@ const std::vector<Field<ShapeConfig>> & shapeFields(){
 		F_INT(ShapeConfig, modelHoldFrames),
 		F_INT(ShapeConfig, modelMaxPerFrame),
 		F_FLOAT(ShapeConfig, fallbackEma),
+		F_BOOL(ShapeConfig, modelClassGate),
+		F_BOOL(ShapeConfig, modelTentative),
+	};
+	return f;
+}
+
+const std::vector<Field<SmoothConfig>> & smoothFields(){
+	static const std::vector<Field<SmoothConfig>> f = {
+		F_BOOL(SmoothConfig, enabled),
+		F_FLOAT(SmoothConfig, boxRate),
+		F_INT(SmoothConfig, outlineVertices),
+		F_FLOAT(SmoothConfig, outlineAlpha),
+		F_DOUBLE(SmoothConfig, fadeInMs),
+		F_DOUBLE(SmoothConfig, fadeOutMs),
 	};
 	return f;
 }
@@ -160,9 +190,13 @@ bool setTrackerParam(TrackerConfig & c, const std::string & key, double v){
 bool setShapeParam(ShapeConfig & c, const std::string & key, double v){
 	return setByKey(shapeFields(), c, key, v);
 }
+bool setSmoothParam(SmoothConfig & c, const std::string & key, double v){
+	return setByKey(smoothFields(), c, key, v);
+}
 std::vector<ParamInfo> flowParams(const FlowDetectorConfig & c){ return listAll(flowFields(), c); }
 std::vector<ParamInfo> trackerParams(const TrackerConfig & c){ return listAll(trackerFields(), c); }
 std::vector<ParamInfo> shapeParams(const ShapeConfig & c){ return listAll(shapeFields(), c); }
+std::vector<ParamInfo> smoothParams(const SmoothConfig & c){ return listAll(smoothFields(), c); }
 
 void applyFlowOverrides(FlowDetectorConfig & c, const std::map<std::string, double> & o){
 	for(const auto & kv : o) setFlowParam(c, kv.first, kv.second);

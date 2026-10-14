@@ -156,14 +156,15 @@ std::vector<Detection> FlowMotionDetector::detect(const cv::Mat & lane, double d
 
 	std::vector<float> vxs, vys, mags;
 	std::vector<Detection> blobs;
-	for(int l = 1; l < n; l++){
-		const int area = stats.at<int>(l, cv::CC_STAT_AREA);
-		if(area < minArea) continue;
-		const int bx = stats.at<int>(l, cv::CC_STAT_LEFT);
-		const int by = stats.at<int>(l, cv::CC_STAT_TOP);
-		const int bw = stats.at<int>(l, cv::CC_STAT_WIDTH);
-		const int bh = stats.at<int>(l, cv::CC_STAT_HEIGHT);
-		if(bw < minW || bh < minH) continue;
+	// one blob from component `l` of a label image
+	const auto emit = [&](const cv::Mat & lab, const cv::Mat & st, int l){
+		const int area = st.at<int>(l, cv::CC_STAT_AREA);
+		if(area < minArea) return;
+		const int bx = st.at<int>(l, cv::CC_STAT_LEFT);
+		const int by = st.at<int>(l, cv::CC_STAT_TOP);
+		const int bw = st.at<int>(l, cv::CC_STAT_WIDTH);
+		const int bh = st.at<int>(l, cv::CC_STAT_HEIGHT);
+		if(bw < minW || bh < minH) return;
 
 		// median flow over the blob — over its flow-seed pixels only when the
 		// fill is on (filled pixels have no usable flow by definition)
@@ -173,7 +174,7 @@ std::vector<Detection> FlowMotionDetector::detect(const cv::Mat & lane, double d
 			vxs.reserve(area); vys.reserve(area); mags.reserve(area);
 			const bool onlySeed = useSeed && pass == 0;
 			for(int y = by; y < by + bh; y++){
-				const int * lrow = labels.ptr<int>(y);
+				const int * lrow = lab.ptr<int>(y);
 				const cv::Vec2f * frow = flowEma.ptr<cv::Vec2f>(y);
 				const uint8_t * srow = onlySeed ? seedMask.ptr<uint8_t>(y) : nullptr;
 				for(int x = bx; x < bx + bw; x++){
@@ -186,14 +187,14 @@ std::vector<Detection> FlowMotionDetector::detect(const cv::Mat & lane, double d
 			}
 			if(!vxs.empty() || !onlySeed) break;
 		}
-		if(vxs.empty()) continue;
+		if(vxs.empty()) return;
 		float mvx = median(vxs);
 		float mvy = median(vys);
 		float meanMag = 0;
 		for(const float m : mags) meanMag += m;
 		meanMag /= mags.size();
 		const float coh = std::hypot(mvx, mvy) / std::max(meanMag, 1e-6f);
-		if(coh < cfg.minCoherence) continue;
+		if(coh < cfg.minCoherence) return;
 		if(cfg.lockAxis) mvy = 0.0f;
 
 		Detection d;
@@ -204,7 +205,7 @@ std::vector<Detection> FlowMotionDetector::detect(const cv::Mat & lane, double d
 		d.vx = mvx * toVx;
 		d.vy = mvy * toVy;
 		const float sp = d.speed();
-		if(sp < cfg.minSpeed) continue;
+		if(sp < cfg.minSpeed) return;
 		if(sp > cfg.maxSpeed){
 			d.vx *= cfg.maxSpeed / sp;
 			d.vy *= cfg.maxSpeed / sp;
@@ -215,6 +216,62 @@ std::vector<Detection> FlowMotionDetector::detect(const cv::Mat & lane, double d
 		d.touchesLeft = bx <= cfg.edgeMarginPx;
 		d.touchesRight = bx + bw >= W - cfg.edgeMarginPx;
 		blobs.push_back(std::move(d));
+	};
+
+	// Direction split (see FlowDetectorConfig::dirSplit): per component,
+	// how many of its flow-seed pixels move +x and how many -x.
+	cv::Mat posSeed, negSeed;
+	std::vector<int> posCnt(n, 0), negCnt(n, 0);
+	if(cfg.dirSplit && n > 1){
+		const float eps = thr * 0.5f;
+		posSeed = (ch[0] > eps) & mask;
+		negSeed = (ch[0] < -eps) & mask;
+		if(!seedMask.empty()){
+			posSeed &= seedMask;
+			negSeed &= seedMask;
+		}
+		for(int y = 0; y < H; y++){
+			const int * lrow = labels.ptr<int>(y);
+			const uint8_t * prow = posSeed.ptr<uint8_t>(y);
+			const uint8_t * nrow = negSeed.ptr<uint8_t>(y);
+			for(int x = 0; x < W; x++){
+				const int l = lrow[x];
+				if(l <= 0) continue;
+				if(prow[x]) posCnt[l]++;
+				if(nrow[x]) negCnt[l]++;
+			}
+		}
+	}
+	const cv::Mat splitKernel = cv::getStructuringElement(
+		cv::MORPH_RECT, cv::Size(std::max(3, closeW | 1), std::max(3, closeH | 1)));
+	for(int l = 1; l < n; l++){
+		const int signedPx = posCnt[l] + negCnt[l];
+		const int minority = std::min(posCnt[l], negCnt[l]);
+		// the minority must be a blob in its own right (minArea) — a train
+		// entering behind a corridor-long one is a few percent of the
+		// signed pixels, so the fraction is only a noise floor
+		const bool mixed = cfg.dirSplit && signedPx > 0
+			&& minority >= cfg.dirSplitMinFrac * signedPx
+			&& minority >= minArea;
+		if(!mixed){
+			emit(labels, stats, l);
+			continue;
+		}
+		// two objects in one component: each sign's seed pixels, grown by
+		// the closing reach but kept inside the component and off the other
+		// sign's pixels, form that object's mask
+		const cv::Mat comp = labels == l;
+		for(int sign = 0; sign < 2; sign++){
+			const cv::Mat & mine = sign == 0 ? posSeed : negSeed;
+			const cv::Mat & other = sign == 0 ? negSeed : posSeed;
+			cv::Mat part = mine & comp;
+			cv::dilate(part, part, splitKernel);
+			part &= comp;
+			part &= ~other;
+			cv::Mat lab2, st2, c2;
+			const int n2 = cv::connectedComponentsWithStats(part, lab2, st2, c2, 8, CV_32S);
+			for(int l2 = 1; l2 < n2; l2++) emit(lab2, st2, l2);
+		}
 	}
 
 	// 7. blobs moving together are one object.

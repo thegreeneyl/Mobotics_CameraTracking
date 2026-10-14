@@ -86,11 +86,16 @@ struct LaneConfig {
 	std::string corridor;  // corridor id; the corridor's label is the class
 	FrameQuad quad;
 	float s0 = 0, s1 = 1;  // corridor axis range covered by lane x 0..1
+	// Optional lateral band (lane y 0..1): detections whose vertical centre
+	// lies outside it are dropped before tracking. Lets a quad stay generous
+	// (lane height floor) while the road band behind the viaduct is ignored.
+	float yBand0 = 0, yBand1 = 1;
 
 	bool operator==(const LaneConfig & o) const {
 		return id == o.id && pane == o.pane && corridor == o.corridor && quad == o.quad
-			&& s0 == o.s0 && s1 == o.s1;
+			&& s0 == o.s0 && s1 == o.s1 && yBand0 == o.yBand0 && yBand1 == o.yBand1;
 	}
+	bool hasYBand() const { return yBand0 > 0.0f || yBand1 < 1.0f; }
 	bool operator!=(const LaneConfig & o) const { return !(*this == o); }
 
 	// lane x (0..1) -> corridor s
@@ -207,6 +212,16 @@ struct ObjectShape {
 	// grid; empty when the grid holds nothing yet
 	std::vector<std::pair<float, float>> outline;
 	std::string source; // "mask" | "foreground" | "model" — what fed obs
+	// bounding box of the outline (corridor coordinates); boxValid when the
+	// outline exists
+	bool boxValid = false;
+	float bx0 = 0, bx1 = 0, by0 = 0, by1 = 0;
+	// segmentation-model bookkeeping for this track (see ShapeFeedback)
+	int modelCalls = 0;      // model runs on this track
+	int modelHits = 0;       // runs that returned an instance of an allowed class
+	int otherClassHits = 0;  // runs that saw only instances of other classes
+	int modelAge = 1 << 20;  // frames since the last hit
+	int modelClass = -1;     // COCO class of the last hit
 
 	float frameW() const { return fx1 - fx0; }
 	float frameH() const { return fy1 - fy0; }
@@ -225,14 +240,41 @@ struct TrackedObject {
 	float w = 0, h = 0;   // size
 	float vx = 0, vy = 0; // velocity (fractions per second)
 	bool clippedLeft = false, clippedRight = false; // edge pinned at a corridor end
-	std::string phase = "moving"; // entering | crossing | exiting | moving
+	// entering | crossing | exiting | moving | stopped | occluded | gone
+	// (gone only from the output smoother, while the object fades out)
+	std::string phase = "moving";
 	int hits = 0;         // matched detections so far
 	int misses = 0;       // consecutive frames without a match
 	int ageFrames = 0;
 	bool confirmed = false;
+	// born clipped at / within edgeBirthFrac of a corridor end (or inherited
+	// an id, or born right after a reset) — the edge rule's precondition
+	bool edgeBorn = true;
+	// 0..1 visibility ramp of the output smoother (fade in at birth, fade
+	// out after the tracker dropped the object); 1 straight from the tracker
+	float presence = 1.0f;
 	float colorR = 1, colorG = 1, colorB = 1; // stable per-id debug color
 	std::vector<std::pair<float, float>> trail; // recent centers, newest last
 	ObjectShape shape; // silhouette (filled by the ShapeEstimator, not the tracker)
+};
+
+// What the ShapeEstimator learned about a track, handed back to the tracker
+// one frame later. The tracker never reads the silhouette itself; this is
+// the deliberate, narrow coupling: (a) the model gate — a tentative track the
+// segmentation model never finds (or only labels as another class) does not
+// confirm; (b) the shape-driven box — while a fresh model silhouette exists
+// its bounding box is the tracker's position measurement, so the published
+// box follows the hull and not the wake; (c) merge priority — a track with a
+// silhouette is never folded into one without.
+struct ShapeFeedback {
+	bool modelAvailable = false; // a segmentation model runs for this corridor
+	int modelCalls = 0;
+	int modelHits = 0;
+	int otherClassHits = 0;
+	int modelAge = 1 << 20;      // frames since the last hit
+	bool boxValid = false;       // silhouette bbox usable (model source, outline exists)
+	float bx0 = 0, bx1 = 0, by0 = 0, by1 = 0; // corridor coordinates
+	bool outlineValid = false;   // a model-derived outline exists
 };
 
 struct CorridorResult {

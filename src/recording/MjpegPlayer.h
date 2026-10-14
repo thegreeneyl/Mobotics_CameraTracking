@@ -43,9 +43,13 @@ public:
 	void next();     // older recording
 	void previous(); // newer recording
 
-	// Seek within the currently playing recording by deltaMs (e.g. +/-1000),
-	// clamped to [0, duration]. Applied on the playback thread.
-	void seekBy(int deltaMs);
+	// Transport, all applied on the playback thread. Seeks and steps show
+	// the target frame at once (also while paused) and continue from there.
+	void seekBy(int deltaMs);      // relative, clamped to [0, duration]
+	void seekTo(double positionMs); // absolute (slider scrub)
+	void stepFrame(int delta);     // +/-N frames from the shown one; the clock parks on it
+	void setPaused(bool paused);   // freezes / resumes the pacing clock
+	bool isPaused() const { return paused; }
 
 	// Copies out the newest decoded frame if newer than lastSeenFrameId.
 	// frameTMs is the frame's recording-relative timestamp in ms.
@@ -85,14 +89,21 @@ private:
 	bool open(size_t index);
 	bool loadSidecar(const std::string & mjpegPath);
 	bool decodeAndPublish(size_t frameIdx);
+	// Shows frames[idx] now and makes it the one playback continues after.
+	void showFrame(size_t idx);
+	// Index of the frame at or before a recording position.
+	size_t frameAt(double positionMs) const;
 	void publishInfo();
 
 	static double nowMs();
 
 	std::thread playThread;
 	std::atomic<bool> running{false};
-	std::atomic<int> pendingJump{0};   // accumulated next(+1)/previous(-1)
-	std::atomic<int> pendingSeekMs{0}; // accumulated seekBy() deltas
+	std::atomic<bool> paused{false};
+	std::atomic<int> pendingJump{0};     // accumulated next(+1)/previous(-1)
+	std::atomic<int> pendingSeekMs{0};   // accumulated seekBy() deltas
+	std::atomic<int> pendingSeekToMs{-1}; // latest seekTo() target, -1 = none
+	std::atomic<int> pendingStep{0};     // accumulated stepFrame() deltas
 	std::atomic<int> decodeScale{1};
 
 	// playback-thread state
@@ -103,6 +114,10 @@ private:
 	double durationMs = 0;
 	size_t frameCursor = 0;   // next frame to show
 	double clockStartMs = 0;  // steady-clock ms when frame 0 was due
+	// While paused the clock stands still: the position is held here and
+	// clockStartMs is re-derived from it on resume.
+	bool wasPaused = false;
+	double pausedPositionMs = 0;
 	std::vector<uint8_t> readBuffer;
 	double lastDecodeMs = 0;
 
@@ -124,6 +139,8 @@ private:
 		size_t frameCursor = 0;
 		size_t frameCount = 0;
 		double clockStartMs = 0;
+		bool paused = false;
+		double pausedPositionMs = 0;
 		double lastDecodeMs = 0;
 	} info;
 

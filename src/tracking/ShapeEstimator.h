@@ -51,6 +51,16 @@ struct ShapeConfig {
 	// full `ema` rate (that turned a train into a blob within three frames
 	// when the model went silent); it drifts toward the fallback at this rate.
 	float fallbackEma = 0.06f;
+	// Only instances of the corridor's class count (train -> COCO train +
+	// bus, boat -> boat; see allowedClasses()). Other classes on the box are
+	// reported to the tracker as "other class" hits, so a track the model
+	// only ever labels car / truck does not confirm (ShapeFeedback).
+	bool modelClassGate = true;
+	// Run the model on edge-born tentative tracks too (after the confirmed
+	// ones, same per-frame budget): the tracker's model gate needs a model
+	// verdict before it confirms, and a train found while still tentative
+	// is published with its silhouette from the first frame.
+	bool modelTentative = true;
 	std::string modelPath;       // resolved ONNX path (not a flat parameter)
 	std::string modelFile;       // the path as written in the config
 };
@@ -97,6 +107,15 @@ public:
 
 	double lastModelMs() const { return modelMsThisFrame; }
 	bool modelLoaded() const { return model && model->isLoaded(); }
+	// Does the segmentation model run for a corridor with this config?
+	// (model source wanted, loaded, and this frame came with colour)
+	bool modelActive(const ShapeConfig & corridorCfg) const;
+
+	// COCO class ids accepted for a corridor label (empty = any class).
+	static std::vector<int> allowedClasses(const std::string & label);
+
+	// Collects the tracker-facing feedback of one object (see ShapeFeedback).
+	static ShapeFeedback feedbackFor(const TrackedObject & o, bool modelAvailable);
 
 private:
 	struct State {
@@ -107,6 +126,10 @@ private:
 		int tileCursor = 0;       // next crop tile to run (round-robin)
 		uint64_t lastSeen = 0;
 		bool fresh = true;        // no observation yet: the first one seeds the grid
+		// model gate bookkeeping (see ObjectShape)
+		int modelCalls = 0, modelHits = 0, otherClassHits = 0;
+		int modelAge = 1 << 20;
+		int modelClass = -1;
 	};
 
 	void ensureModel();
@@ -114,8 +137,10 @@ private:
 	// cells mostly outside it stay unobserved (kUnobserved) instead of empty.
 	void sampleLane(const cv::Mat & laneMask, const LaneInput & li, const ObjectShape & frame, cv::Mat & obs,
 	                const cv::Mat * seen = nullptr) const;
+	// classId / otherClass: what the model saw (see SegModel::Result)
 	bool runModel(const TrackedObject & o, const ShapeConfig & cfg, const LaneInput & li,
-	              const ObjectShape & frame, State & st, cv::Mat & laneMask, cv::Mat & laneSeen);
+	              const ObjectShape & frame, State & st, const std::vector<int> & allow,
+	              cv::Mat & laneMask, cv::Mat & laneSeen, int & classId, int & otherClass);
 	static void extractOutline(const cv::Mat & ema, const ShapeConfig & cfg, ObjectShape & shape);
 
 	ShapeConfig globalCfg;

@@ -161,6 +161,7 @@ void TrackingManager::applyPendingConfig(){
 		cfg.flow = next.flow;
 		cfg.bgs = next.bgs;
 		cfg.tracker = next.tracker;
+		cfg.smoothing = next.smoothing;
 		cfg.laneMaxWidth = next.laneMaxWidth;
 		cfg.laneMinHeight = next.laneMinHeight;
 		cfg.yolo.confThreshold = next.yolo.confThreshold;
@@ -182,7 +183,11 @@ void TrackingManager::applyPendingConfig(){
 			// learned on the previous warp and must start over.
 			lensCorrector.set(cfg.lens);
 			for(auto & lp : lanes) if(lp.detector) lp.detector->reset();
-			for(auto & cp : corridors) if(cp.tracker) cp.tracker->reset();
+			for(auto & cp : corridors){
+				if(cp.tracker) cp.tracker->reset();
+				cp.feedback.clear();
+				cp.smoother.reset();
+			}
 			shapes.reset();
 		}
 		if(!rebuild) applyParams();
@@ -207,6 +212,7 @@ void TrackingManager::applyParams(){
 	}
 	for(auto & cp : corridors){
 		cp.tracker->setConfig(cfg.trackerFor(cp.id));
+		cp.smoother.setConfig(cfg.smoothing);
 		const FlowDetectorConfig f = cfg.flowFor(cp.id);
 		cp.grouping.gapFrac = f.mergeGapFrac;
 		cp.grouping.angleDeg = f.mergeAngleDeg;
@@ -426,7 +432,11 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	const double dtSec = lastTMs < 0 ? 1.0 / 30.0 : (tMs - lastTMs) / 1000.0;
 	if(lastTMs >= 0 && (tMs < lastTMs || tMs - lastTMs > kMaxGapMs)){
 		for(auto & lp : lanes) lp.detector->reset();
-		for(auto & cp : corridors) cp.tracker->reset();
+		for(auto & cp : corridors){
+			cp.tracker->reset();
+			cp.feedback.clear();
+			cp.smoother.reset();
+		}
 		shapes.reset();
 	}
 	lastTMs = tMs;
@@ -473,6 +483,9 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 			const float span = lane.s1 - lane.s0;
 			const bool rev = lane.reversed();
 			for(const Detection & ld : laneDets[li]){
+				// optional lateral band: the road behind the viaduct is
+				// inside the quad but outside the band
+				if(lane.hasYBand() && (ld.cy() < lane.yBand0 || ld.cy() > lane.yBand1)) continue;
 				Detection d = ld;
 				const float sa = lane.toCorridor(ld.x0);
 				const float sb = lane.toCorridor(ld.x1);
@@ -498,7 +511,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 		if(cp.lanes.size() > 1) dets = groupDetections(dets, cp.grouping);
 
 		const double k0 = nowMs();
-		cp.tracker->update(dets, tMs);
+		cp.tracker->update(dets, tMs, &cp.feedback);
 		CorridorResult & cr = res.corridors[ci];
 		cr.id = cp.id;
 		cr.label = cp.label;
@@ -525,10 +538,25 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 			inputs[i].laneH = lanes[i].laneH;
 		}
 		shapes.beginFrame(fullBgr, paneW, paneH, ++frameCounter);
-		for(auto & cr : res.corridors) shapes.updateCorridor(cr, cfg.shapeFor(cr.id), inputs);
+		for(size_t ci = 0; ci < res.corridors.size() && ci < corridors.size(); ci++){
+			CorridorResult & cr = res.corridors[ci];
+			const ShapeConfig scfg = cfg.shapeFor(cr.id);
+			shapes.updateCorridor(cr, scfg, inputs);
+			// what the estimator learned goes back to the tracker next frame
+			std::map<int, ShapeFeedback> & fb = corridors[ci].feedback;
+			fb.clear();
+			const bool modelAvailable = shapes.modelActive(scfg);
+			for(const auto & o : cr.objects) fb[o.id] = ShapeEstimator::feedbackFor(o, modelAvailable);
+		}
 		shapes.endFrame();
 	}
 	const double shapeMs = nowMs() - s0;
+
+	// 4. publisher-side smoothing: bounded box edge rates, fixed-size
+	//    low-passed outline, presence ramps (nothing feeds back)
+	for(size_t ci = 0; ci < res.corridors.size() && ci < corridors.size(); ci++){
+		corridors[ci].smoother.apply(res.corridors[ci].objects, tMs);
+	}
 
 	res.canvas = cfg.canvas;
 	res.frameTMs = tMs;

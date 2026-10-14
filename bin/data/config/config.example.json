@@ -15,7 +15,7 @@
     "detector": "flow",
     "analysisReduce": 2,
     "laneMaxWidth": 800,
-    "laneMinHeight": 64,
+    "laneMinHeight": 96,
     "lens": {
       "enabled": true,
       "fovDeg": 170,
@@ -51,6 +51,8 @@
       "mergeAngleDeg": 40,
       "mergeSpeedRatio": 3,
       "mergeLateralOverlap": 0.25,
+      "dirSplit": true,
+      "dirSplitMinFrac": 0.05,
       "lockAxis": false,
       "maxDetections": 8,
       "edgeMarginPx": 3
@@ -96,7 +98,21 @@
       "clippedMeasNoise": 1e-07,
       "maxDtSec": 5,
       "stopMinWidthFrac": 0.15,
-      "clipFrames": 3
+      "clipFrames": 3,
+      "edgeRule": true,
+      "edgeBirthFrac": 0.08,
+      "edgeGraceMs": 2000,
+      "minConfirmLen": 0,
+      "modelGate": true,
+      "modelGateOtherHits": 3,
+      "modelLostMs": 8000,
+      "coastOccluded": true,
+      "occludedMaxMs": 30000,
+      "occludedGateGrow": 0.05,
+      "shapeBox": true,
+      "shapeBoxMaxAge": 6,
+      "shapeBoxTrim": 0.25,
+      "hiddenRear": true
     },
     "shape": {
       "enabled": true,
@@ -122,7 +138,17 @@
       "padY": 0.15,
       "simplify": 0.5,
       "closeCells": 1,
-      "confirmedOnly": true
+      "confirmedOnly": true,
+      "modelClassGate": true,
+      "modelTentative": true
+    },
+    "smoothing": {
+      "enabled": true,
+      "boxRate": 0.25,
+      "outlineVertices": 32,
+      "outlineAlpha": 0.3,
+      "fadeInMs": 300,
+      "fadeOutMs": 400
     },
     "yolo": {
       "model": "models/yolov8n.onnx",
@@ -157,7 +183,9 @@
           "lockAxis": true,
           "absorbGapFrac": 0.25,
           "mergeGapFrac": 0.15,
-          "stoppedHoldMs": 120000
+          "stoppedHoldMs": 120000,
+          "edgeBirthFrac": 0.2,
+          "minConfirmLen": 0.12
         },
         "placement": {
           "x0": 0,
