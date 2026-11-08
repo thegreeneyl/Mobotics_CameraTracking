@@ -12,6 +12,14 @@ namespace {
 // state indices
 constexpr int X0 = 0, X1 = 1, Y0 = 2, Y1 = 3, VX = 4, VY = 5;
 constexpr int kStates = 6, kMeas = 6;
+// A blob edge this close (corridor fraction) to an internal lane boundary
+// is not a speed measurement: the mask is cut by the lane geometry there
+// (and the neighbouring lane's part of the object may lag a few frames
+// behind), so the edge stalls while the object does not.
+constexpr float kBoundaryMargin = 0.10f;
+// The silhouette "confirms" a blob edge when it ends within this fraction
+// of the blob's length of the blob edge (see TrackerConfig::shapeShrink).
+constexpr float kShrinkTolFrac = 0.2f;
 
 float iou(const TrackedObject & o, const Detection & d){
 	const float ix = std::max(0.0f, std::min(o.x1, d.x1) - std::max(o.x0, d.x0));
@@ -35,7 +43,7 @@ int signOf(float v, float eps){
 }
 } // namespace
 
-MultiObjectTracker::MultiObjectTracker(const TrackerConfig & config) : cfg(config){}
+MultiObjectTracker::MultiObjectTracker(const TrackerConfig & config) : cfg(config), corridorGain(config.flowGain){}
 
 void MultiObjectTracker::reset(){
 	tracks.clear();
@@ -43,6 +51,7 @@ void MultiObjectTracker::reset(){
 	mergeCounts.clear();
 	lastTMs = -1;
 	resetTMs = -1;
+	corridorGain = cfg.flowGain;
 	// nextId is NOT reset: ids stay unique across resets so a re-detected
 	// object after a source switch never reuses a previous id.
 }
@@ -91,6 +100,23 @@ bool MultiObjectTracker::edgeCovered(int heading, int side, const Detection & m,
 	return false;
 }
 
+// A visible oncoming confirmed object overlaps this box. Used when a
+// pinned track loses its detections: if the other train is still on top of
+// it, the rear pin is the occlusion, not a rear that has failed to enter,
+// and coasting must not let go of it.
+bool MultiObjectTracker::overlappedByOncoming(int heading, const TrackedObject & self) const {
+	if(!cfg.hiddenRear || heading == 0) return false;
+	for(const auto & o : tracks){
+		const TrackedObject & ob = o.obj;
+		if(ob.id == self.id || !ob.confirmed || ob.misses > 0) continue;
+		if(o.stoppedSinceMs >= 0 || o.occludedSinceMs >= 0) continue;
+		if(signOf(ob.vx, cfg.minSpeedConfirm) != -heading) continue;
+		if(lateralOverlapFrac(ob.y0, ob.y1, self.y0, self.y1) < cfg.gateLateral) continue;
+		if(gapX(ob.x0, ob.x1, self.x0, self.x1) <= cfg.mergeGapFrac) return true;
+	}
+	return false;
+}
+
 // Is there a confirmed object travelling the same way right next to this
 // measurement? Then it is a fragment of that object, not a new one.
 bool MultiObjectTracker::nearSameDirection(int heading, const Detection & m, int selfId) const {
@@ -134,6 +160,23 @@ bool MultiObjectTracker::leaving(const Track & t) const {
 	return false;
 }
 
+// The wash behind a hull. A settled track (direction voted in) does not
+// follow a detection going back the way it came, one much slower than
+// itself, or one that sits entirely behind its rear edge. The boat in
+// rec_2026-10-12_16-04-00 did: after the hull left, #132 walked back
+// along the wake, lost its direction and parked mid-corridor.
+bool MultiObjectTracker::behindSettled(const Track & t, const Detection & d) const {
+	if(!t.obj.confirmed || t.dirSign == 0 || t.dirVotes < std::min(cfg.confirmFrames, 3)) return false;
+	const int now = d.hasVelocity ? signOf(d.vx, cfg.minSpeedConfirm) : 0;
+	if(now != 0 && now != t.dirSign) return true;
+	const float sv = std::hypot(t.obj.vx, t.obj.vy);
+	if(d.hasVelocity && sv >= cfg.minSpeedConfirm && d.speed() >= cfg.minSpeedConfirm
+	   && sv / std::max(d.speed(), 1e-6f) > cfg.absorbSpeedRatio) return true;
+	if(t.dirSign > 0 && d.x1 < t.obj.x0) return true;
+	if(t.dirSign < 0 && d.x0 > t.obj.x1) return true;
+	return false;
+}
+
 // Has the trailing edge of a coasting object left the corridor?
 bool MultiObjectTracker::pastFarEnd(const Track & t) const {
 	const int h = headingOf(t);
@@ -157,8 +200,11 @@ MultiObjectTracker::Track MultiObjectTracker::makeTrack(const Detection & d, dou
 
 	TrackedObject prior;
 	const int inherited = reacquireId(d, tMs, &prior);
-	const float vx = d.hasVelocity ? d.vx : (inherited ? prior.vx : 0.0f);
-	const float vy = cfg.lockAxis ? 0.0f : (d.hasVelocity ? d.vy : (inherited ? prior.vy : 0.0f));
+	// a new track starts with the corridor's flow gain (an inherited
+	// velocity is already corrected, it came out of the filter)
+	t.flowGain = cfg.flowGainLearn ? corridorGain : cfg.flowGain;
+	const float vx = d.hasVelocity ? d.vx * t.flowGain : (inherited ? prior.vx : 0.0f);
+	const float vy = cfg.lockAxis ? 0.0f : (d.hasVelocity ? d.vy * t.flowGain : (inherited ? prior.vy : 0.0f));
 	t.kf.statePost = (cv::Mat_<float>(kStates, 1) << d.x0, d.x1, d.y0, d.y1, vx, vy);
 
 	t.obj.id = inherited ? inherited : nextId++;
@@ -168,7 +214,7 @@ MultiObjectTracker::Track MultiObjectTracker::makeTrack(const Detection & d, dou
 		t.dirSign = signOf(prior.vx, cfg.minSpeedConfirm);
 		t.dirVotes = cfg.confirmFrames;
 	}else{
-		t.obj.hits = 1;
+	t.obj.hits = 1;
 	}
 	t.obj.clippedLeft = d.touchesLeft;
 	t.obj.clippedRight = d.touchesRight;
@@ -202,6 +248,7 @@ void MultiObjectTracker::refreshDerived(Track & t){
 	t.obj.h = y1 - y0;
 	t.obj.vx = s.at<float>(VX);
 	t.obj.vy = s.at<float>(VY);
+	t.obj.flowGain = cfg.flowGainLearn ? t.flowGain : cfg.flowGain;
 
 	// phase from clipping + travel direction
 	if(t.stoppedSinceMs >= 0){
@@ -242,6 +289,77 @@ void MultiObjectTracker::predict(Track & t, double dtSec){
 	t.kf.errorCovPost = t.kf.errorCovPre.clone();
 	refreshDerived(t);
 	t.obj.ageFrames++;
+}
+
+// Flow gain (see TrackerConfig::flowGain). A free blob edge is placed by
+// the motion mask and crosses the lane at the object's true speed; the
+// flow velocity is biased low on repetitive texture. Each clean edge
+// position goes into a per-edge window; when the window is full, the
+// least-squares slope of x over t is the box velocity. The ratio of that
+// to the mean raw flow over the same window is one gain sample, which
+// nudges the track's gain and, more slowly, the corridor's.
+bool MultiObjectTracker::nearInternalBoundary(float x) const {
+	for(const float s : internalBoundaries){
+		if(std::fabs(x - s) <= kBoundaryMargin) return true;
+	}
+	return false;
+}
+
+void MultiObjectTracker::learnFlowGain(Track & t, double tMs, float x0, float x1,
+                                       bool cleanL, bool cleanR, float vFlow){
+	const int window = std::max(3, cfg.flowGainWindow);
+	float sum = 0.0f;
+	int n = 0;
+	const auto feed = [&](std::vector<Track::EdgeSample> & hist, bool clean, float x){
+		clean = clean && !nearInternalBoundary(x);
+		if(!clean){
+			hist.clear();
+			return;
+		}
+		hist.push_back({tMs, x, vFlow});
+		if(static_cast<int>(hist.size()) > window) hist.erase(hist.begin());
+		if(static_cast<int>(hist.size()) < window) return;
+		// least squares x = a + b t, t in seconds from the first sample
+		const double t0 = hist.front().tMs;
+		double st = 0, sx = 0, stt = 0, stx = 0, sv = 0;
+		for(const auto & s : hist){
+			const double ts = (s.tMs - t0) / 1000.0;
+			st += ts; sx += s.x; stt += ts * ts; stx += ts * s.x; sv += s.vFlow;
+		}
+		const double den = window * stt - st * st;
+		if(den <= 1e-9) return;
+		const double b = (window * stx - st * sx) / den;
+		const double a = (sx - b * st) / window;
+		double rss = 0;
+		for(const auto & s : hist){
+			const double ts = (s.tMs - t0) / 1000.0;
+			const double r = s.x - (a + b * ts);
+			rss += r * r;
+		}
+		// a flickering mask edge is not a speed measurement, nor is one
+		// that does not move (cut by foliage, a mast, the lane geometry)
+		if(std::sqrt(rss / window) > 0.01) return;
+		const double vMean = sv / window;
+		if(std::fabs(vMean) < cfg.minSpeedConfirm || std::fabs(b) < cfg.minSpeedConfirm) return;
+		if((b > 0) != (vMean > 0)) return;
+		const float r = std::clamp(static_cast<float>(b / vMean), cfg.flowGainMin, cfg.flowGainMax);
+		sum += r;
+		n++;
+	};
+	feed(t.edgeHistL, cleanL, x0);
+	feed(t.edgeHistR, cleanR, x1);
+	if(n == 0) return;
+	// robust statistic: the median of the recent accepted ratios
+	const int keep = std::max(4, cfg.flowGainSamples);
+	t.gainSamples.push_back(sum / n);
+	if(static_cast<int>(t.gainSamples.size()) > keep) t.gainSamples.erase(t.gainSamples.begin());
+	if(static_cast<int>(t.gainSamples.size()) < std::max(4, keep / 4)) return;
+	std::vector<float> sorted = t.gainSamples;
+	std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+	const float med = sorted[sorted.size() / 2];
+	const float a = std::clamp(cfg.flowGainAlpha, 0.0f, 1.0f);
+	t.flowGain += a * (med - t.flowGain);
+	corridorGain += 0.25f * a * (med - corridorGain);
 }
 
 void MultiObjectTracker::correct(Track & t, const Detection & d, double dtSec, bool holdRear, bool frontHidden){
@@ -286,9 +404,29 @@ void MultiObjectTracker::correct(Track & t, const Detection & d, double dtSec, b
 	// not entered the lane, the detector merely lost sight of it.
 	const float predW = std::max(1e-3f, pre.at<float>(X1) - pre.at<float>(X0));
 	const float ratio = measW / predW;
-	const bool fragment = t.obj.confirmed && ratio < cfg.sizeJumpTrust;
+	bool fragment = t.obj.confirmed && ratio < cfg.sizeJumpTrust;
 	const bool inflated = t.obj.confirmed && !t.obj.clippedLeft && !t.obj.clippedRight
 	                      && !d.touchesLeft && !d.touchesRight && ratio > 1.0f / cfg.sizeJumpTrust;
+	// Silhouette-confirmed shrink (see TrackerConfig::shapeShrink): the
+	// fragment hold above is lifted once the model and the mask have agreed
+	// on both ends for long enough, so a box stretched by a wake can return
+	// to the hull. Agreement means the silhouette ends at the blob's edge,
+	// not inside it (wake still glued on) and not beyond it (the model sees
+	// more than the mask — a train whose flow mask broke up, where the hold
+	// must stay).
+	if(cfg.shapeShrink){
+		const float len = std::max(0.0f, d.x1 - d.x0);
+		const float tol = kShrinkTolFrac * len;
+		const bool endsFree = !t.obj.clippedLeft && !t.obj.clippedRight && !blobL && !blobR
+		                      && !holdRear && !frontHidden;
+		const bool agree = useShape && t.obj.confirmed && endsFree
+		                   && fb.bx0 >= d.x0 - tol && fb.bx0 <= d.x0 + tol
+		                   && fb.bx1 >= d.x1 - tol && fb.bx1 <= d.x1 + tol;
+		t.shrinkVotes = agree ? std::min(t.shrinkVotes + 1, std::max(1, cfg.shapeShrinkFrames)) : 0;
+		if(agree && t.shrinkVotes >= std::max(1, cfg.shapeShrinkFrames)) fragment = false;
+	}else{
+		t.shrinkVotes = 0;
+	}
 	if(fragment || inflated){
 		for(int i = X0; i <= X1; i++) R.at<float>(i, i) = cfg.posMeasNoise * cfg.sizeJumpNoiseGain;
 	}
@@ -358,8 +496,30 @@ void MultiObjectTracker::correct(Track & t, const Detection & d, double dtSec, b
 		}
 	}
 
-	const float vx = useVel ? d.vx : t.obj.vx;
-	const float vy = cfg.lockAxis ? 0.0f : (useVel ? d.vy : t.obj.vy);
+	// Flow gain: an edge counts as a speed measurement this frame only if
+	// it is free of the lane end before and after this update (no pin /
+	// release re-seed in between), not held or hidden by an oncoming
+	// object, not part of a fragment / inflated blob, and at least
+	// edgeBirthFrac away from the lane end on its side (the mask gets
+	// ragged where the object fades into foliage). The raw blob edge is
+	// used, not the silhouette-trimmed one: a silhouette ageing in and out
+	// would put a step into the window.
+	if(cfg.flowGainLearn && useVel && t.obj.confirmed){
+		const bool hiddenL = (heading > 0 && holdRear) || (heading < 0 && frontHidden);
+		const bool hiddenR = (heading < 0 && holdRear) || (heading > 0 && frontHidden);
+		const bool shapeOk = !fragment && !inflated;
+		const bool cleanL = shapeOk && !blobL && !t.obj.clippedLeft && !touchesLeft && !hiddenL
+		                    && d.x0 >= cfg.edgeBirthFrac;
+		const bool cleanR = shapeOk && !blobR && !t.obj.clippedRight && !touchesRight && !hiddenR
+		                    && d.x1 <= 1.0f - cfg.edgeBirthFrac;
+		learnFlowGain(t, lastTMs, d.x0, d.x1, cleanL, cleanR, d.vx); // lastTMs == this frame
+	}else{
+		t.edgeHistL.clear();
+		t.edgeHistR.clear();
+	}
+	const float gain = cfg.flowGainLearn ? t.flowGain : cfg.flowGain;
+	const float vx = useVel ? d.vx * gain : t.obj.vx;
+	const float vy = cfg.lockAxis ? 0.0f : (useVel ? d.vy * gain : t.obj.vy);
 	// For the very first frames the velocity prior is weak: seed it hard so
 	// the box does not lag behind a fast train while P converges.
 	if(t.obj.hits <= 1 && useVel){
@@ -496,6 +656,7 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 		mergeCounts.clear();
 		dtSec = 0;
 		resetTMs = tMs;
+		corridorGain = cfg.flowGain;
 	}
 	lastTMs = tMs;
 
@@ -506,7 +667,7 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 
 	// 0. newest shape feedback per track
 	if(feedback){
-		for(auto & t : tracks){
+	for(auto & t : tracks){
 			const auto it = feedback->find(t.obj.id);
 			if(it == feedback->end()) continue;
 			t.fb = it->second;
@@ -528,7 +689,7 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 	// 2. association: cost-sorted greedy with gates and a direction veto
 	struct Pair { float cost; int t, d; };
 	std::vector<Pair> pairs;
-	for(size_t ti = 0; ti < tracks.size(); ti++){
+		for(size_t ti = 0; ti < tracks.size(); ti++){
 		const Track & tr = tracks[ti];
 		const TrackedObject & o = tr.obj;
 		const bool hidden = tr.occludedSinceMs >= 0;
@@ -541,11 +702,12 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 		// the longer an object has been hidden, the less exact its
 		// predicted position
 		if(hidden) gate += cfg.occludedGateGrow * static_cast<float>((tMs - tr.occludedSinceMs) / 1000.0);
-		for(size_t di = 0; di < detections.size(); di++){
+			for(size_t di = 0; di < detections.size(); di++){
 			const Detection & d = detections[di];
 			if(lateralOverlapFrac(o.y0, o.y1, d.y0, d.y1) < cfg.gateLateral) continue;
 			const float gap = gapX(o.x0, o.x1, d.x0, d.x1);
 			if(gap > gate) continue;
+			if(behindSettled(tr, d)) continue;
 			// a stopped object only resumes from a detection that overlaps
 			// its frozen box — not from anything passing next to it
 			if(tr.stoppedSinceMs >= 0){
@@ -598,17 +760,17 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 	GroupingParams gp;
 	gp.gapFrac = cfg.absorbGapFrac;
 	gp.angleDeg = cfg.velAngleDeg;
-	gp.speedRatio = 3.0f;
+	gp.speedRatio = cfg.absorbSpeedRatio;
 	gp.lateralOverlap = cfg.absorbLateral;
 	gp.minSpeed = cfg.minSpeedConfirm;
-	for(size_t ti = 0; ti < tracks.size(); ti++){
+		for(size_t ti = 0; ti < tracks.size(); ti++){
 		if(trackMatch[ti] < 0) continue;
 		measurements[ti] = detections[trackMatch[ti]];
 	}
 	bool absorbed = true;
 	while(absorbed){
 		absorbed = false;
-		for(size_t di = 0; di < detections.size(); di++){
+			for(size_t di = 0; di < detections.size(); di++){
 			if(detUsed[di]) continue;
 			const Detection & d = detections[di];
 			int best = -1;
@@ -624,6 +786,7 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 				if(lateralOverlapFrac(by0, by1, d.y0, d.y1) < gp.lateralOverlap) continue;
 				const float gap = gapX(bx0, bx1, d.x0, d.x1);
 				if(gap > gp.gapFrac) continue;
+				if(behindSettled(tracks[ti], d)) continue;
 				if(!velocitiesAgree(asDetection(tracks[ti].obj), d, gp)) continue;
 				if(gap < bestGap){
 					bestGap = gap;
@@ -652,18 +815,25 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 			// direction is settled, a free rear edge that sits inside an
 			// oncoming object's box means the object came in behind that
 			// one — pin the rear at the entry end it must have come
-			// through. (Decided only now, not at birth: a wake fragment's
-			// first velocity sample can point the wrong way.)
+			// through. Not at birth: a wake fragment's first velocity
+			// sample can point the wrong way. And not a one-shot either.
+			// The nose of a train coming out from behind another is a
+			// sliver for the first second (rec_2026-10-12_16-29-11, the
+			// far track at frame ~1100): latching the rejection there left
+			// edgeBorn false for the rest of the pass, so the track never
+			// confirmed. Keep looking while it is still a short covered
+			// piece; give up once the rear is in the lane, the blob is a
+			// same-direction fragment, or a full-size blob is not covered.
 			if(!t.obj.confirmed && !t.hiddenRearChecked && t.dirVotes >= std::min(cfg.confirmFrames, 3)){
-				t.hiddenRearChecked = true;
 				const Detection & m = measurements[ti];
 				const int hd = t.dirSign;
 				const bool rearFree = hd > 0 ? !t.obj.clippedLeft : hd < 0 ? !t.obj.clippedRight : false;
 				const float blobW = std::max(0.0f, m.x1 - m.x0);
-				if(rearFree && (cfg.minConfirmLen <= 0.0f || blobW >= cfg.minConfirmLen)
-				   && !nearSameDirection(hd, m, t.obj.id)
-				   && !sliverInOncoming(hd, m, t.obj.id)
-				   && edgeCovered(hd, hd > 0 ? -1 : +1, m, t.obj.id)){
+				const bool grown = cfg.minConfirmLen <= 0.0f || blobW >= cfg.minConfirmLen;
+				const bool sliver = sliverInOncoming(hd, m, t.obj.id);
+				const bool sameWay = nearSameDirection(hd, m, t.obj.id);
+				const bool covered = edgeCovered(hd, hd > 0 ? -1 : +1, m, t.obj.id);
+				if(rearFree && covered && grown && !sliver && !sameWay){
 					cv::Mat & s = t.kf.statePost;
 					if(hd > 0){
 						s.at<float>(X0) = 0.0f;
@@ -676,11 +846,15 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 					t.clipVotesL = t.clipVotesR = 0;
 					t.bornByTouch = true;
 					t.obj.edgeBorn = true;
+					t.hiddenRearChecked = true;
 					refreshDerived(t);
+				}else if(!rearFree || sameWay || (grown && !sliver && !covered)){
+					t.hiddenRearChecked = true;
 				}
 			}
 		}else{
 			t.obj.misses++;
+			t.shrinkVotes = 0; // the agreement must be a run of matched frames
 			if(t.obj.confirmed && t.stoppedSinceMs < 0 && t.occludedSinceMs < 0
 			   && t.obj.misses > cfg.maxMisses){
 				// A confirmed object that vanished at low speed inside the
@@ -695,7 +869,11 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 				const bool nearEnd = (heading <= 0 && t.obj.x0 < cfg.stopEdgeFrac)
 				                     || (heading >= 0 && t.obj.x1 > 1.0f - cfg.stopEdgeFrac);
 				const bool slow = std::hypot(t.lastMatchVx, t.lastMatchVy) < cfg.stopSpeed;
-				if(slow && !t.obj.clippedLeft && !t.obj.clippedRight && !nearEnd
+				// Boats turn this off: a hull does not halt mid-river. The
+				// slow blob left behind is the wake, and holding it paints
+				// an orphan that the wash can keep reviving. It dies with
+				// its misses instead. A boat still moving coasts out below.
+				if(cfg.stopEnabled && slow && !t.obj.clippedLeft && !t.obj.clippedRight && !nearEnd
 				   && t.obj.w >= cfg.stopMinWidthFrac){
 					t.stoppedSinceMs = tMs;
 					// undo the coasting of the missed frames: back to where it
@@ -710,14 +888,19 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 					s.at<float>(VY) = 0.0f;
 					t.kf.statePre = s.clone();
 					refreshDerived(t);
-				}else if(cfg.coastOccluded && heading != 0){
+				}else if(cfg.coastOccluded && heading != 0 && !(slow && !cfg.stopEnabled)){
 					t.occludedSinceMs = tMs;
 					// coast at the velocity it was last seen with, dead
-					// straight (rails and rivers do not turn here). The
-					// rear edge is released: a rear still pinned at the
-					// entry end would make the box grow without end.
-					if(heading > 0) t.obj.clippedLeft = false;
-					else t.obj.clippedRight = false;
+					// straight (rails and rivers do not turn here). A rear
+					// still pinned at the entry end is released, or the box
+					// would grow without end — unless an oncoming object is
+					// still on top of it. Then the pin is the hidden rear
+					// and the missing detections are that train; letting go
+					// slides the box off the wagons still behind it.
+					if(!overlappedByOncoming(heading, t.obj)){
+						if(heading > 0) t.obj.clippedLeft = false;
+						else t.obj.clippedRight = false;
+					}
 					cv::Mat & s = t.kf.statePost;
 					s.at<float>(VX) = t.lastMatchVx;
 					s.at<float>(VY) = cfg.lockAxis ? 0.0f : t.lastMatchVy;
@@ -787,7 +970,11 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 			// an object that coasted out past the far end has left the
 			// corridor: nothing at that lane end can be it again (glitter
 			// where a boat left resurrected it for 25 s otherwise)
-			if(it->obj.confirmed && !pastFarEnd(*it)) graveyard.push_back({it->obj, tMs});
+			// A slow death is not an occlusion to be reacquired: the wake
+			// where a boat stopped would inherit the id and come back.
+			// One that coasted out past the far end has left for good.
+			const bool slowDeath = std::hypot(it->lastMatchVx, it->lastMatchVy) < cfg.stopSpeed;
+			if(it->obj.confirmed && !pastFarEnd(*it) && !slowDeath) graveyard.push_back({it->obj, tMs});
 			it = tracks.erase(it);
 		}else{
 			++it;
@@ -846,6 +1033,15 @@ void MultiObjectTracker::update(const std::vector<Detection> & detections, doubl
 			if(gapX(a.x0, a.x1, b.x0, b.x1) > cfg.mergeGapFrac) continue;
 			if(std::hypot(a.vx - b.vx, a.vy - b.vy) > cfg.mergeVelTol) continue;
 			if(signOf(a.vx, cfg.minSpeedConfirm) * signOf(b.vx, cfg.minSpeedConfirm) < 0) continue;
+			// the absorption's speed-ratio rule holds here too: a slow blob
+			// the absorption refused must not come in through the back door
+			// as a tentative track (a boat's wake, 0.017 slower than a hull
+			// doing 0.033, is well inside mergeVelTol but half the speed)
+			{
+				const float sa = std::hypot(a.vx, a.vy), sb = std::hypot(b.vx, b.vy);
+				if(sa >= cfg.minSpeedConfirm && sb >= cfg.minSpeedConfirm
+				   && std::max(sa, sb) / std::min(sa, sb) > cfg.absorbSpeedRatio) continue;
+			}
 			// a stopped / hidden object only merges with something leaving
 			// in the direction it arrived from (its own departure), never
 			// with an opposite-direction object passing over it

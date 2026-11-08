@@ -17,6 +17,7 @@
 
 #include "../output/MotionPathWriter.h"
 #include "../recording/RecordingReader.h"
+#include "../tracking/LaneWarp.h"
 #include "../tracking/TrackingConfigJson.h"
 #include "../tracking/TrackingManager.h"
 #include "../util/JpegDecode.h"
@@ -65,13 +66,6 @@ cv::Scalar colorForId(int id){
 	return cv::Scalar(b * 255, g * 255, r * 255);
 }
 
-cv::Point2f project(const cv::Mat & h, float x, float y){
-	const double * m = h.ptr<double>();
-	const double w = m[6] * x + m[7] * y + m[8];
-	return {static_cast<float>((m[0] * x + m[1] * y + m[2]) / w),
-	        static_cast<float>((m[3] * x + m[4] * y + m[5]) / w)};
-}
-
 // Draws the tracked objects of one snapshot onto a BGR thumbnail of the
 // frame. Corridor coordinates are mapped back into each lane and projected
 // onto the photo through the lane quad. Raw detections are drawn thin.
@@ -80,24 +74,38 @@ void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tS
 	const float paneW = static_cast<float>(img.cols) / paneCount;
 	const float paneH = static_cast<float>(img.rows);
 
-	std::vector<cv::Mat> laneH(res.lanes.size());
+	std::vector<tracking::LaneMap> laneMaps(res.lanes.size());
+	const auto projectLane = [&](const tracking::LaneMap & map, float paneOffset, float u, float v){
+		float x, y;
+		if(!map.toPane(u, v, x, y)) return cv::Point2f(paneOffset, 0);
+		return cv::Point2f(paneOffset + x, y);
+	};
 	for(size_t li = 0; li < res.lanes.size(); li++){
 		const tracking::LaneConfig & lane = res.lanes[li].lane;
-		const tracking::FrameQuad quad = lane.quad.isConvex() ? lane.quad : tracking::FrameQuad{};
-		const cv::Point2f src[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
-		cv::Point2f dst[4];
-		for(int c = 0; c < 4; c++){
-			dst[c] = cv::Point2f(lane.pane * paneW + quad.pts[c][0] * paneW, quad.pts[c][1] * paneH);
+		laneMaps[li] = tracking::LaneMap::build(lane, paneW, paneH);
+		const float paneOffset = lane.pane * paneW;
+		std::vector<std::array<float, 2>> top, bottom;
+		lane.borders(top, bottom);
+		const auto pt = [&](const std::array<float, 2> & p){
+			return cv::Point2f(paneOffset + p[0] * paneW, p[1] * paneH);
+		};
+		for(size_t i = 0; i + 1 < top.size(); i++){
+			cv::line(img, pt(top[i]), pt(top[i + 1]), cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
 		}
-		laneH[li] = cv::getPerspectiveTransform(src, dst);
-		for(int c = 0; c < 4; c++){
-			cv::line(img, dst[c], dst[(c + 1) % 4], cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
+		for(size_t i = 0; i + 1 < bottom.size(); i++){
+			cv::line(img, pt(bottom[i]), pt(bottom[i + 1]), cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
 		}
-		cv::putText(img, lane.id, dst[0] + cv::Point2f(2, 10), cv::FONT_HERSHEY_SIMPLEX, 0.35,
-		            cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
+		if(!top.empty() && !bottom.empty()){
+			cv::line(img, pt(top.front()), pt(bottom.front()), cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
+			cv::line(img, pt(top.back()), pt(bottom.back()), cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
+			cv::putText(img, lane.id, pt(top.front()) + cv::Point2f(2, 10), cv::FONT_HERSHEY_SIMPLEX, 0.35,
+			            cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
+		}
 		for(const auto & d : res.lanes[li].detections){
-			const cv::Point2f p[4] = {project(laneH[li], d.x0, d.y0), project(laneH[li], d.x1, d.y0),
-			                          project(laneH[li], d.x1, d.y1), project(laneH[li], d.x0, d.y1)};
+			const cv::Point2f p[4] = {projectLane(laneMaps[li], paneOffset, d.x0, d.y0),
+			                          projectLane(laneMaps[li], paneOffset, d.x1, d.y0),
+			                          projectLane(laneMaps[li], paneOffset, d.x1, d.y1),
+			                          projectLane(laneMaps[li], paneOffset, d.x0, d.y1)};
 			for(int c = 0; c < 4; c++) cv::line(img, p[c], p[(c + 1) % 4], cv::Scalar(160, 160, 160), 1, cv::LINE_AA);
 		}
 	}
@@ -112,14 +120,16 @@ void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tS
 				const tracking::LaneConfig & lane = res.lanes[li].lane;
 				float lx0, lx1;
 				if(!lane.corridorRangeToLane(o.x0, o.x1, lx0, lx1)) continue;
-				const cv::Mat & h = laneH[li];
+				const tracking::LaneMap & map = laneMaps[li];
+				const float paneOffset = lane.pane * paneW;
+				const auto project = [&](float u, float v){ return projectLane(map, paneOffset, u, v); };
 				// silhouette outline (corridor coords -> this lane -> photo)
 				if(o.shape.valid && o.shape.outline.size() >= 3){
 					std::vector<cv::Point> poly;
 					for(const auto & q : o.shape.outline){
 						const float lx = lane.toLane(q.first);
 						if(lx < -0.001f || lx > 1.001f) continue;
-						const cv::Point2f pp = project(h, lx, q.second);
+						const cv::Point2f pp = project(lx, q.second);
 						poly.emplace_back(static_cast<int>(std::lround(pp.x)), static_cast<int>(std::lround(pp.y)));
 					}
 					if(poly.size() >= 3){
@@ -129,8 +139,8 @@ void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tS
 						cv::polylines(img, poly, true, col, thick, cv::LINE_AA);
 					}
 				}
-				const cv::Point2f p[4] = {project(h, lx0, o.y0), project(h, lx1, o.y0),
-				                          project(h, lx1, o.y1), project(h, lx0, o.y1)};
+				const cv::Point2f p[4] = {project(lx0, o.y0), project(lx1, o.y0),
+				                          project(lx1, o.y1), project(lx0, o.y1)};
 				for(int c = 0; c < 4; c++) cv::line(img, p[c], p[(c + 1) % 4], col, thick, cv::LINE_AA);
 				// clipped edge markers
 				if(o.clippedLeft && lane.corridorRangeToLane(0.0f, 0.001f, lx0, lx1)){
@@ -142,13 +152,13 @@ void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tS
 				// center + velocity arrow in lane space
 				const float lcx = lane.toLane(o.x);
 				if(lcx >= 0 && lcx <= 1){
-					const cv::Point2f c = project(h, lcx, o.y);
+					const cv::Point2f c = project(lcx, o.y);
 					cv::circle(img, c, 3, col, -1, cv::LINE_AA);
 					const float span = lane.s1 - lane.s0;
 					float dx = std::fabs(span) > 1e-6f ? o.vx / span : o.vx, dy = o.vy;
 					const float len = std::hypot(dx, dy);
 					if(len > 0.25f){ dx *= 0.25f / len; dy *= 0.25f / len; }
-					const cv::Point2f tip = project(h, lcx + dx, o.y + dy);
+					const cv::Point2f tip = project(lcx + dx, o.y + dy);
 					cv::arrowedLine(img, c, tip, col, thick, cv::LINE_AA, 0, 0.2);
 				}
 				if(!labelled){
@@ -180,16 +190,12 @@ cv::Mat stripSheet(const cv::Mat & frame, const tracking::TrackingResults & res)
 	int width = 0;
 	for(const auto & ld : res.lanes){
 		if(ld.maskW <= 0 || ld.maskH <= 0) continue;
-		const tracking::FrameQuad quad = ld.lane.quad.isConvex() ? ld.lane.quad : tracking::FrameQuad{};
-		cv::Point2f src[4], dst[4] = {{0, 0}, {static_cast<float>(ld.maskW), 0},
-		                              {static_cast<float>(ld.maskW), static_cast<float>(ld.maskH)},
-		                              {0, static_cast<float>(ld.maskH)}};
-		for(int c = 0; c < 4; c++){
-			src[c] = cv::Point2f(ld.lane.pane * paneW + quad.pts[c][0] * paneW, quad.pts[c][1] * paneH);
-		}
+		tracking::LaneMap map = tracking::LaneMap::build(ld.lane, paneW, paneH);
+		map.prepare(ld.maskW, ld.maskH);
+		const cv::Mat pane = frame(cv::Rect(ld.lane.pane * static_cast<int>(paneW), 0,
+		                                    static_cast<int>(paneW), static_cast<int>(paneH)));
 		cv::Mat strip;
-		cv::warpPerspective(frame, strip, cv::getPerspectiveTransform(src, dst),
-		                    cv::Size(ld.maskW, ld.maskH), cv::INTER_LINEAR);
+		map.warp(pane, strip, cv::INTER_LINEAR);
 		cv::Mat mask(ld.maskH, ld.maskW, CV_8U, const_cast<uint8_t *>(ld.mask.data()));
 		cv::Mat maskBgr;
 		cv::cvtColor(mask, maskBgr, cv::COLOR_GRAY2BGR);
@@ -330,18 +336,23 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 					dets.push_back({r4(d.x0), r4(d.x1), r4(d.y0), r4(d.y1), r4(d.vx), r4(d.vy),
 					                r4(d.coherence), r4(d.area), d.touchesLeft ? 1 : 0, d.touchesRight ? 1 : 0});
 				}
-				lanes.push_back({{"id", ld.lane.id}, {"dets", dets}});
+				lanes.push_back({{"id", ld.lane.id}, {"c", ld.lane.corridor},
+				                 {"s0", r4(ld.lane.s0)}, {"s1", r4(ld.lane.s1)}, {"dets", dets}});
 			}
 			ofJson tracks = ofJson::array();
 			for(const auto & cr : res.corridors){
 				for(const auto & o : cr.objects){
-					tracks.push_back({{"id", o.id}, {"c", cr.id}, {"x0", r4(o.x0)}, {"x1", r4(o.x1)},
-					                  {"y0", r4(o.y0)}, {"y1", r4(o.y1)}, {"vx", r4(o.vx)}, {"vy", r4(o.vy)},
+					tracks.push_back({{"id", o.id}, {"c", cr.id},
+					                  {"x0", r4(o.rawX0)}, {"x1", r4(o.rawX1)},
+					                  {"y0", r4(o.rawY0)}, {"y1", r4(o.rawY1)},
+					                  {"vx", r4(o.vx)}, {"vy", r4(o.vy)},
 					                  {"conf", o.confirmed}, {"ph", o.phase}, {"hits", o.hits}, {"miss", o.misses},
 					                  {"cl", o.clippedLeft}, {"cr", o.clippedRight}, {"eb", o.edgeBorn},
+					                  {"fg", r4(o.flowGain)},
 					                  {"pr", r4(o.presence)}, {"mc", o.shape.modelCalls}, {"mh", o.shape.modelHits},
 					                  {"mo", o.shape.otherClassHits}, {"mcls", o.shape.modelClass},
-					                  {"src", o.shape.source}});
+					                  {"src", o.shape.source},
+					                  {"sb", o.shape.boxValid ? ofJson{r4(o.shape.bx0), r4(o.shape.bx1)} : ofJson()}});
 				}
 			}
 			debug << ofJson{{"t", r4(tSec)}, {"lanes", lanes}, {"tracks", tracks}}.dump() << "\n";

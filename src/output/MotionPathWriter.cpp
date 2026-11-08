@@ -4,6 +4,8 @@
 #include <cmath>
 #include <fstream>
 
+#include "../tracking/LaneWarp.h"
+
 namespace output {
 
 namespace {
@@ -108,35 +110,26 @@ std::vector<MotionObject> fromTrackingResults(const tracking::TrackingResults & 
 				}
 				mo.outline = clipPolygonToCanvas(poly);
 			}
-			// Back-project onto each lane of the corridor. The lane quad is
-			// a perspective map; we approximate the box by the bilinear
-			// image of its lane-space corners' bounding box (exact for
-			// rectangular quads, close enough for the overlay).
+			// Back-project onto each lane of the corridor. The published box
+			// stays rectangular in corridor/canvas space; this pane box is
+			// only the photo-space bound of that rectangle after the strip
+			// warp (one homography, or one per slice when the lane curves).
+			const float paneW = res.analysisW > 0 ? static_cast<float>(res.analysisW) : 1.0f;
+			const float paneH = res.analysisH > 0 ? static_cast<float>(res.analysisH) : 1.0f;
 			for(int li : cr.lanes){
 				if(li < 0 || li >= static_cast<int>(res.lanes.size())) continue;
 				const tracking::LaneConfig & lane = res.lanes[li].lane;
 				float lx0, lx1;
 				if(!lane.corridorRangeToLane(o.x0, o.x1, lx0, lx1)) continue;
-				const auto & q = lane.quad.pts;
-				const auto map = [&](float u, float v, float & px, float & py){
-					const float tx = q[0][0] + (q[1][0] - q[0][0]) * u;
-					const float ty = q[0][1] + (q[1][1] - q[0][1]) * u;
-					const float bx = q[3][0] + (q[2][0] - q[3][0]) * u;
-					const float by = q[3][1] + (q[2][1] - q[3][1]) * u;
-					px = tx + (bx - tx) * v;
-					py = ty + (by - ty) * v;
-				};
-				float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
-				const float us[2] = {lx0, lx1}, vs[2] = {o.y0, o.y1};
-				for(float u : us) for(float v : vs){
-					float px, py;
-					map(u, v, px, py);
-					minX = std::min(minX, px); maxX = std::max(maxX, px);
-					minY = std::min(minY, py); maxY = std::max(maxY, py);
-				}
+				const tracking::LaneMap map = tracking::LaneMap::build(lane, paneW, paneH);
+				const cv::Rect2f b = map.paneBounds(lx0, lx1, o.y0, o.y1);
+				if(b.width <= 0 || b.height <= 0) continue;
 				MotionObject::PaneBox pb;
 				pb.pane = lane.pane;
-				pb.x = minX; pb.y = minY; pb.w = maxX - minX; pb.h = maxY - minY;
+				pb.x = b.x / paneW;
+				pb.y = b.y / paneH;
+				pb.w = b.width / paneW;
+				pb.h = b.height / paneH;
 				mo.panes.push_back(pb);
 			}
 			out.push_back(std::move(mo));

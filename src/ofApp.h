@@ -100,13 +100,17 @@ private:
 
 	// lane editing. editLayout is what the mouse edits and what is drawn;
 	// committedLayout is the last valid state handed to the worker (updated
-	// on mouse release, only when the quad is convex) and written back into
-	// trackingConfig.layouts.
+	// on mouse release, only when every strip slice is convex) and written
+	// back into trackingConfig.layouts.
 	tracking::LayoutConfig editLayout;
 	tracking::LayoutConfig committedLayout;
 	int editPaneCount = 0;
 	int dragLane = -1;
-	int dragCorner = -1;
+	int dragEdge = -1;     // 0 = top border, 1 = bottom border
+	int dragStation = -1;  // index along that border
+	int anchorLane = -1;   // last grabbed station, so delete can remove it
+	int anchorEdge = -1;
+	int anchorStation = -1;
 	int lastLaneSelect = -1;
 	bool laneSliderSync = false;
 	void syncEditLayout(int paneCount);
@@ -149,6 +153,12 @@ private:
 	ofParameter<bool> showPixelsParam{"shape pixels (x)", false};
 	ofParameter<bool> showOutlineParam{"shape outline (n)", true};
 	ofParameter<bool> showBoxParam{"bounding box (b)", true};
+	// Result (default): the published box and center. For a boat that is
+	// the outline's bounds. Raw: the flow box the tracker measures with.
+	ofParameter<bool> showResultParam{"result data (q)", true};
+	// candidates: tracks that have not passed the confirmation gates yet
+	// (drawn with a " ?" suffix). Never published; shown only for tuning.
+	ofParameter<bool> showCandidatesParam{"candidates (?)", false};
 	ofParameter<int> resultViewParam{"result 0canvas 1lanes (v)", 0, 0, 1};
 	ofParameter<int> detectorParam{"detector 0flow 1bgs 2yolo", 0, 0, 2};
 	ofParameter<bool> halfResParam{"half-res decode", true};

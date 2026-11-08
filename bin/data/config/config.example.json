@@ -77,6 +77,7 @@
       "velScale": 0.1,
       "absorbGapFrac": 0.15,
       "absorbLateral": 0.4,
+      "absorbSpeedRatio": 3.0,
       "shadowSuppress": true,
       "shadowGapFrac": 0.15,
       "shadowLateral": 0.25,
@@ -96,6 +97,13 @@
       "posProcNoise": 4e-06,
       "velProcNoise": 0.003,
       "clippedMeasNoise": 1e-07,
+      "flowGain": 1.0,
+      "flowGainLearn": true,
+      "flowGainWindow": 8,
+      "flowGainSamples": 32,
+      "flowGainMin": 0.6,
+      "flowGainMax": 2.0,
+      "flowGainAlpha": 0.15,
       "maxDtSec": 5,
       "stopMinWidthFrac": 0.15,
       "clipFrames": 3,
@@ -112,6 +120,8 @@
       "shapeBox": true,
       "shapeBoxMaxAge": 6,
       "shapeBoxTrim": 0.25,
+      "shapeShrink": false,
+      "shapeShrinkFrames": 8,
       "hiddenRear": true
     },
     "shape": {
@@ -215,7 +225,12 @@
           "stoppedHoldMs": 20000,
           "shadowGapFrac": 0.4,
           "shadowLateral": 2.0,
-          "confirmFrames": 20
+          "absorbSpeedRatio": 1.4,
+          "shapeBoxTrim": 0.45,
+          "shapeShrink": true,
+          "stopEnabled": false,
+          "confirmFrames": 20,
+          "flowGainLearn": false
         },
         "placement": {
           "x0": 0,

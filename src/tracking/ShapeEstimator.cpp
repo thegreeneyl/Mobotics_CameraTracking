@@ -1,5 +1,7 @@
 #include "ShapeEstimator.h"
 
+#include "LaneWarp.h"
+
 #include <algorithm>
 #include <cmath>
 
@@ -186,7 +188,9 @@ bool ShapeEstimator::runModel(const TrackedObject & o, const ShapeConfig & cfg, 
                               cv::Mat & laneMask, cv::Mat & laneSeen, int & classId, int & otherClass){
 	classId = -1;
 	otherClass = -1;
-	if(!model || frameBgr.empty() || !li.homography || li.homography->empty()) return false;
+	const bool piece = li.warp && li.warp->segs.size() > 1 && li.warp->laneW > 0;
+	if(!model || frameBgr.empty()) return false;
+	if(!piece && (!li.homography || li.homography->empty())) return false;
 	const LaneConfig & lane = *li.lane;
 	if(lane.pane < 0 || (lane.pane + 1) * paneW > frameBgr.cols) return false;
 
@@ -196,8 +200,13 @@ bool ShapeEstimator::runModel(const TrackedObject & o, const ShapeConfig & cfg, 
 	const float ly0 = std::clamp(f.fy0, 0.0f, 1.0f), ly1 = std::clamp(f.fy1, 0.0f, 1.0f);
 	if(ly1 <= ly0) return false;
 	cv::Mat hInv;
-	cv::invert(*li.homography, hInv);
-	cv::Rect2f region = laneRectToPane(hInv, lx0, lx1, ly0, ly1, li.laneW, li.laneH);
+	cv::Rect2f region;
+	if(piece){
+		region = li.warp->paneBounds(lx0, lx1, ly0, ly1);
+	}else{
+		cv::invert(*li.homography, hInv);
+		region = laneRectToPane(hInv, lx0, lx1, ly0, ly1, li.laneW, li.laneH);
+	}
 	// crop margin so the model sees the whole object, then clamp to the pane
 	const float padW = region.width * cfg.modelPad, padH = region.height * cfg.modelPad;
 	int rx0 = std::clamp(static_cast<int>(std::floor(region.x - padW)), 0, paneW - 1);
@@ -225,8 +234,10 @@ bool ShapeEstimator::runModel(const TrackedObject & o, const ShapeConfig & cfg, 
 	// the unpadded tracked box in tile px = what the instance must cover
 	float tbx0, tbx1;
 	if(!lane.corridorRangeToLane(o.x0, o.x1, tbx0, tbx1)) return false;
-	cv::Rect2f target = laneRectToPane(hInv, tbx0, tbx1, std::clamp(o.y0, 0.0f, 1.0f), std::clamp(o.y1, 0.0f, 1.0f),
-	                                   li.laneW, li.laneH);
+	cv::Rect2f target = piece
+		? li.warp->paneBounds(tbx0, tbx1, std::clamp(o.y0, 0.0f, 1.0f), std::clamp(o.y1, 0.0f, 1.0f))
+		: laneRectToPane(hInv, tbx0, tbx1, std::clamp(o.y0, 0.0f, 1.0f), std::clamp(o.y1, 0.0f, 1.0f),
+		                 li.laneW, li.laneH);
 	target &= cv::Rect2f(static_cast<float>(ax0), static_cast<float>(ry0), static_cast<float>(ax1 - ax0), static_cast<float>(cropH));
 	if(target.area() <= 0) return false;
 	target.x -= ax0;
@@ -239,7 +250,26 @@ bool ShapeEstimator::runModel(const TrackedObject & o, const ShapeConfig & cfg, 
 	otherClass = r.otherClass;
 	if(ok) classId = r.classId;
 
-	// tile px -> pane px -> lane px; the seen area is the tile itself
+	// tile px -> pane px -> lane px; the seen area is the tile itself.
+	// A curved strip has no single homography, so the tile is painted into
+	// the pane and warped with the same slices as the detector image.
+	if(piece){
+		const auto paint = [&](const cv::Mat & tileSrc, cv::Mat & dst){
+			cv::Mat paneMask(paneH, paneW, CV_8U, cv::Scalar(0));
+			const int tw = ax1 - ax0, th = cropH;
+			cv::Mat tile = tileSrc;
+			if(tile.cols != tw || tile.rows != th){
+				cv::resize(tileSrc, tile, cv::Size(tw, th), 0, 0, cv::INTER_NEAREST);
+			}
+			if(tw > 0 && th > 0) tile.copyTo(paneMask(cv::Rect(ax0, ry0, tw, th)));
+			li.warp->warp(paneMask, dst, cv::INTER_NEAREST);
+		};
+		const cv::Mat seenTile(cropH, ax1 - ax0, CV_8U, cv::Scalar(255));
+		paint(seenTile, laneSeen);
+		if(!ok) return false;
+		paint(r.mask, laneMask);
+		return true;
+	}
 	cv::Mat T = cv::Mat::eye(3, 3, CV_64F);
 	T.at<double>(0, 2) = ax0;
 	T.at<double>(1, 2) = ry0;

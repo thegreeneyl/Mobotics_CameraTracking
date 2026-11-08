@@ -18,7 +18,9 @@
 // the canvas edges and objects entirely off the canvas are not published).
 // vx/vy are canvas fractions per second, heading 0 deg = +x (right),
 // 90 deg = +y (down). The uncut corridor-space box travels along in
-// `corridor` for consumers that want the tracker's own view.
+// `corridor`. For a boat that box and its center are the outline's
+// bounds; the velocity is still the flow velocity. The tracker's own
+// box is not published.
 //
 // No UI / OF-graphics dependencies (ofJson is the core nlohmann alias), so
 // this can move into YOUniverse_Steuerung unchanged.
@@ -56,8 +58,9 @@ std::vector<std::pair<float, float>> clipPolygonToCanvas(const std::vector<std::
 
 // Flattens a tracking snapshot: one MotionObject per tracked object of every
 // corridor that still shows on the canvas after the corridor's placement,
-// with per-lane back-projections in `panes` (lane quad -> pane UV via the
-// quad's homography; y is the lane's lateral coordinate).
+// with per-lane back-projections in `panes` (lane strip -> pane UV via the
+// same piecewise homography the detector warps with; y is the lane's
+// lateral coordinate).
 std::vector<MotionObject> fromTrackingResults(const tracking::TrackingResults & res);
 
 // Builds a single frame datagram. tSec: recording-relative seconds; frame:

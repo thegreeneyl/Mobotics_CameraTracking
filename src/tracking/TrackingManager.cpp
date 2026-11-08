@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <set>
 
 #include <opencv2/imgproc.hpp>
 
@@ -28,6 +29,58 @@ int kindFromName(const std::string & n){
 }
 const char * kindName(int k){
 	return k == kYolo ? "yolo" : k == kBgs ? "bgs" : "flow";
+}
+
+// Result presentation. The tracker box stays the measurement; this only
+// rewrites what is published. A boat with a real silhouette (not the
+// rectangle stand-in the smoother draws before the first outline) gets
+// that outline's bounds as its box and the center of those bounds as its
+// center. The flow velocity is left alone. A pinned corridor end is not
+// stretched back onto the box: the visible hull is the result, and the
+// clipped flags still say the object continues past the frame. Trains are
+// not touched — the model outline under-covers a long train.
+void presentResults(std::vector<TrackedObject> & objects,
+                    std::map<int, std::vector<std::pair<float, float>>> & trails,
+                    int trailLen){
+	std::set<int> seen;
+	for(auto & o : objects){
+		o.rawX0 = o.x0; o.rawX1 = o.x1; o.rawY0 = o.y0; o.rawY1 = o.y1;
+		o.rawX = o.x; o.rawY = o.y; o.rawW = o.w; o.rawH = o.h;
+		o.rawTrail = o.trail;
+		o.hullBox = false;
+		const bool boat = o.label == "boat" || o.corridor == "boat";
+		if(boat && o.shape.outline.size() >= 3 && o.w > 1e-4f && o.h > 1e-4f){
+			const float mx = 0.02f * o.w, my = 0.02f * o.h;
+			bool interior = false;
+			float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+			for(const auto & p : o.shape.outline){
+				x0 = std::min(x0, p.first); x1 = std::max(x1, p.first);
+				y0 = std::min(y0, p.second); y1 = std::max(y1, p.second);
+				if(p.first > o.x0 + mx && p.first < o.x1 - mx
+				   && p.second > o.y0 + my && p.second < o.y1 - my) interior = true;
+			}
+			if(interior && x1 - x0 > 1e-4f && y1 - y0 > 1e-4f){
+				o.x0 = x0; o.x1 = x1; o.y0 = y0; o.y1 = y1;
+				o.w = x1 - x0; o.h = y1 - y0;
+				o.x = (x0 + x1) * 0.5f;
+				o.y = (y0 + y1) * 0.5f;
+				o.hullBox = true;
+			}
+		}
+		if(boat){
+			auto & tr = trails[o.id];
+			tr.emplace_back(o.x, o.y);
+			if(trailLen >= 0 && static_cast<int>(tr.size()) > trailLen){
+				tr.erase(tr.begin(), tr.begin() + (static_cast<int>(tr.size()) - trailLen));
+			}
+			o.trail = tr;
+		}
+		seen.insert(o.id);
+	}
+	for(auto it = trails.begin(); it != trails.end();){
+		if(!seen.count(it->first)) it = trails.erase(it);
+		else ++it;
+	}
 }
 
 bool sameLayouts(const std::vector<LayoutConfig> & a, const std::vector<LayoutConfig> & b){
@@ -187,6 +240,7 @@ void TrackingManager::applyPendingConfig(){
 				if(cp.tracker) cp.tracker->reset();
 				cp.feedback.clear();
 				cp.smoother.reset();
+				cp.resultTrails.clear();
 			}
 			shapes.reset();
 		}
@@ -303,34 +357,17 @@ void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH){
 		if(lane.pane < 0 || lane.pane >= paneCount) continue;
 		LanePipeline lp;
 		lp.lane = lane;
-		FrameQuad quad = lane.quad;
-		if(!quad.isConvex()){
-			ofLogWarning("TrackingManager") << "lane " << lane.id << ": invalid quad, using full pane";
-			quad = FrameQuad{};
+		if(!lane.isWarpable()){
+			ofLogWarning("TrackingManager") << "lane " << lane.id
+				<< ": invalid strip, using the full pane";
 		}
-		// Rectified size: keep the quad's on-screen aspect, cap the width,
-		// floor the height (a thin viaduct band would otherwise end up a
-		// few pixels tall and starve the flow estimator).
-		const float aspect = std::max(quad.aspect(paneW, paneH), 0.05f);
-		const auto len = [&](int a, int b){
-			return std::hypot((quad.pts[b][0] - quad.pts[a][0]) * paneW,
-			                  (quad.pts[b][1] - quad.pts[a][1]) * paneH);
-		};
-		const float srcW = (len(0, 1) + len(3, 2)) * 0.5f;
-		lp.laneW = std::clamp(static_cast<int>(std::lround(srcW)), 32, std::max(32, cfg.laneMaxWidth));
-		lp.laneH = std::max(cfg.laneMinHeight, static_cast<int>(std::lround(lp.laneW / aspect)));
-		lp.laneH = std::min(lp.laneH, std::max(32, paneH));
-		const cv::Point2f src[4] = {
-			{quad.pts[0][0] * paneW, quad.pts[0][1] * paneH},
-			{quad.pts[1][0] * paneW, quad.pts[1][1] * paneH},
-			{quad.pts[2][0] * paneW, quad.pts[2][1] * paneH},
-			{quad.pts[3][0] * paneW, quad.pts[3][1] * paneH}};
-		const cv::Point2f dst[4] = {
-			{0, 0},
-			{static_cast<float>(lp.laneW), 0},
-			{static_cast<float>(lp.laneW), static_cast<float>(lp.laneH)},
-			{0, static_cast<float>(lp.laneH)}};
-		lp.homography = cv::getPerspectiveTransform(src, dst);
+		// Rectified size: the strip's centreline length and mean height, cap
+		// the width, floor the height (a thin viaduct band would otherwise
+		// end up a few pixels tall and starve the flow estimator).
+		lp.map = LaneMap::build(lane, static_cast<float>(paneW), static_cast<float>(paneH));
+		lp.map.rectifiedSize(cfg.laneMaxWidth, cfg.laneMinHeight, paneH, lp.laneW, lp.laneH);
+		lp.map.prepare(lp.laneW, lp.laneH);
+		lp.homography = lp.map.paneToLane;
 		lp.detector = makeDetector(lane.corridor);
 		lanes.push_back(std::move(lp));
 	}
@@ -348,6 +385,17 @@ void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH){
 			it = corridors.end() - 1;
 		}
 		it->lanes.push_back(static_cast<int>(i));
+	}
+	// lane ends inside the corridor (several overlapping lanes): the flow
+	// gain is not learnt from blob edges there, see setInternalBoundaries
+	for(auto & cp : corridors){
+		std::vector<float> inner;
+		for(int li : cp.lanes){
+			const LaneConfig & lane = lanes[li].lane;
+			if(lane.s0 > 0.001f) inner.push_back(lane.s0);
+			if(lane.s1 < 0.999f) inner.push_back(lane.s1);
+		}
+		cp.tracker->setInternalBoundaries(std::move(inner));
 	}
 	applyParams(); // fills the grouping params
 
@@ -436,6 +484,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 			cp.tracker->reset();
 			cp.feedback.clear();
 			cp.smoother.reset();
+			cp.resultTrails.clear();
 		}
 		shapes.reset();
 	}
@@ -453,7 +502,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 		LanePipeline & lp = lanes[i];
 		const cv::Mat pane = full(cv::Rect(lp.lane.pane * paneW, 0, paneW, paneH));
 		cv::Mat laneImg;
-		cv::warpPerspective(pane, laneImg, lp.homography, cv::Size(lp.laneW, lp.laneH), cv::INTER_LINEAR);
+		lp.map.warp(pane, laneImg, cv::INTER_LINEAR);
 
 		const double d0 = nowMs();
 		laneDets[i] = lp.detector->detect(laneImg, std::max(dtSec, 1e-3));
@@ -534,6 +583,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 			inputs[i].mask = &lanes[i].detector->debugMask();
 			inputs[i].foreground = &lanes[i].detector->shapeMask();
 			inputs[i].homography = &lanes[i].homography;
+			inputs[i].warp = &lanes[i].map;
 			inputs[i].laneW = lanes[i].laneW;
 			inputs[i].laneH = lanes[i].laneH;
 		}
@@ -552,10 +602,14 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	}
 	const double shapeMs = nowMs() - s0;
 
-	// 4. publisher-side smoothing: bounded box edge rates, fixed-size
-	//    low-passed outline, presence ramps (nothing feeds back)
+	// 4. publisher-side smoothing, then the result box. Smoothing still
+	//    rides the tracker box (nothing feeds back). Afterwards a boat's
+	//    published box and center are taken from the drawn outline; the
+	//    tracker box is kept beside it for the raw view.
 	for(size_t ci = 0; ci < res.corridors.size() && ci < corridors.size(); ci++){
 		corridors[ci].smoother.apply(res.corridors[ci].objects, tMs);
+		const int trailLen = cfg.trackerFor(res.corridors[ci].id).trailLen;
+		presentResults(res.corridors[ci].objects, corridors[ci].resultTrails, trailLen);
 	}
 
 	res.canvas = cfg.canvas;

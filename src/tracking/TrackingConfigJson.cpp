@@ -29,6 +29,24 @@ ofJson quadJson(const FrameQuad & quad){
 	return arr;
 }
 
+bool parsePolyline(const ofJson & arr, std::vector<std::array<float, 2>> & pts){
+	if(!arr.is_array() || arr.size() < 2 || arr.size() > static_cast<size_t>(LaneConfig::kMaxStations)) return false;
+	std::vector<std::array<float, 2>> out;
+	out.reserve(arr.size());
+	for(const auto & p : arr){
+		if(!p.is_array() || p.size() < 2) return false;
+		out.push_back({clamp01(p[0].get<float>()), clamp01(p[1].get<float>())});
+	}
+	pts = std::move(out);
+	return true;
+}
+
+ofJson polylineJson(const std::vector<std::array<float, 2>> & pts){
+	ofJson arr = ofJson::array();
+	for(const auto & p : pts) arr.push_back({p[0], p[1]});
+	return arr;
+}
+
 // {"key": number|bool, ...} -> flat map (bools become 0/1)
 std::map<std::string, double> parseOverrides(const ofJson & obj){
 	std::map<std::string, double> out;
@@ -203,7 +221,8 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 		}
 	}
 
-	// layouts: [{"name","panes","recordings":[..],"lanes":[{"id","pane","corridor","quad":[[x,y]x4],"s0","s1"}]}]
+	// layouts: [{"name","panes","recordings":[..],"lanes":[{"id","pane","corridor",
+	//   "quad":[[x,y]x4], optional "top"/"bottom" polylines, "s0","s1"}]}]
 	c.layouts.clear();
 	if(t.contains("layouts") && t["layouts"].is_array()){
 		for(const auto & lj : t["layouts"]){
@@ -220,6 +239,17 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 					lane.pane = lanej.value("pane", 0);
 					lane.corridor = lanej.value("corridor", lane.id);
 					if(lanej.contains("quad")) parseQuad(lanej["quad"], lane.quad);
+					// Optional finer border. Both polylines, same length, left
+					// to right; the quad stays the four ends for older readers.
+					if(lanej.contains("top") && lanej.contains("bottom")){
+						std::vector<std::array<float, 2>> top, bottom;
+						if(parsePolyline(lanej["top"], top) && parsePolyline(lanej["bottom"], bottom)
+						   && top.size() == bottom.size()){
+							lane.top = std::move(top);
+							lane.bottom = std::move(bottom);
+							lane.syncQuadEnds();
+						}
+					}
 					lane.s0 = lanej.value("s0", 0.0f);
 					lane.s1 = lanej.value("s1", 1.0f);
 					// optional "yBand": [y0, y1] (lane fractions)
@@ -300,14 +330,20 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 		lj["recordings"] = l.recordings;
 		ofJson lanes = ofJson::array();
 		for(const auto & lane : l.lanes){
+			LaneConfig stored = lane;
+			stored.syncQuadEnds();
 			ofJson lanej = {
-				{"id", lane.id},
-				{"pane", lane.pane},
-				{"corridor", lane.corridor},
-				{"quad", quadJson(lane.quad)},
-				{"s0", lane.s0},
-				{"s1", lane.s1},
+				{"id", stored.id},
+				{"pane", stored.pane},
+				{"corridor", stored.corridor},
+				{"quad", quadJson(stored.quad)},
+				{"s0", stored.s0},
+				{"s1", stored.s1},
 			};
+			if(stored.stationCount() > 2){
+				lanej["top"] = polylineJson(stored.top);
+				lanej["bottom"] = polylineJson(stored.bottom);
+			}
 			if(lane.hasYBand()) lanej["yBand"] = {lane.yBand0, lane.yBand1};
 			lanes.push_back(lanej);
 		}

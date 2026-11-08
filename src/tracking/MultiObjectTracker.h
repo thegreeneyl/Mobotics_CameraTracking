@@ -25,6 +25,14 @@ struct TrackerConfig {
 	// one-to-many absorption: fragments inside the expanded predicted box
 	float absorbGapFrac = 0.15f;
 	float absorbLateral = 0.4f;  // min lateral overlap for a fragment (stricter than the gate)
+	// A fragment of the object moves at the object's speed; a blob that
+	// moves much slower right next to it is something else — a boat's wake
+	// travels at about half the hull's speed and, once absorbed, puts the
+	// rear edge on the wash, so the box stretches until the hull leaves.
+	// Max ratio of the faster to the slower speed (track vs fragment).
+	// Trains keep this loose: a low-texture wagon fragment may read slow
+	// in the flow and must still join its train.
+	float absorbSpeedRatio = 3.0f;
 	// a tentative track travelling right next to a confirmed one in the same
 	// direction is a fragment / wake of that object: never confirm it.
 	// Reach of the check: along-axis gap <= shadowGapFrac, lateral gap
@@ -37,7 +45,10 @@ struct TrackerConfig {
 	// stopped objects: a confirmed, unclipped track that loses its
 	// detections at low speed (a train halting at the platform) is held in
 	// place with v = 0 and phase "stopped" for up to stoppedHoldMs so it
-	// keeps its id when it moves again
+	// keeps its id when it moves again. Off for boats: a hull that slows
+	// to a stop in the corridor is the wake it left behind, and parking
+	// it leaves an orphan on screen (rec_2026-10-12_16-04-00).
+	bool stopEnabled = true;
 	float stopSpeed = 0.04f;
 	double stoppedHoldMs = 60000;
 	float stopEdgeFrac = 0.15f;  // no "stopped" this close to the corridor end it heads for: it left
@@ -71,6 +82,34 @@ struct TrackerConfig {
 	float posProcNoise = 4.0e-6f;    // per second
 	float velProcNoise = 3.0e-3f;    // per second
 	float clippedMeasNoise = 1.0e-7f; // a pinned edge is known exactly
+	// --- flow gain: the detector's flow velocity is biased low on
+	// repetitive texture (a wagon side matches one period short; DIS medium
+	// is ~10 % slow on trains, fast ~45 %), and the filter never corrects
+	// it from the box because the position<->velocity coupling is cut on
+	// purpose. A free box edge, on the other hand, is placed by the mask
+	// and moves at the object's true speed. Every flow velocity that
+	// enters the filter is multiplied by a gain: flowGain is the manual
+	// value and the prior; with flowGainLearn the gain is measured per
+	// track as (least-squares slope of a free, unclipped, unhidden edge
+	// over the last flowGainWindow matched frames) / (flow velocity),
+	// clamped to [flowGainMin, flowGainMax]. The track's gain follows the
+	// median of its last flowGainSamples ratios at rate flowGainAlpha (a
+	// median: an edge that stalls for a moment — the mask cut by foliage,
+	// a mast, an internal lane boundary — yields a near-zero ratio that
+	// must not drag the gain). A slower corridor-wide EMA of the same
+	// medians seeds new tracks, so an object entering behind another one
+	// starts out with the corridor's gain. The occluded coast uses the
+	// corrected velocity, so a hidden train travels at its real speed.
+	// Edges within kBoundaryMargin of an internal lane boundary (a lane
+	// end that is not a corridor end, dual layout) are never sampled: the
+	// blob ends there because the lane does.
+	float flowGain = 1.0f;
+	bool flowGainLearn = true;
+	int flowGainWindow = 8;
+	int flowGainSamples = 32;
+	float flowGainMin = 0.6f;
+	float flowGainMax = 2.0f;
+	float flowGainAlpha = 0.15f;
 	// --- edge rule: trains and boats come in from a corridor end and leave
 	// through one. A track confirms only if it was born clipped at an end or
 	// with its box within edgeBirthFrac of one (a track that inherits an id,
@@ -123,6 +162,19 @@ struct TrackerConfig {
 	bool shapeBox = true;
 	int shapeBoxMaxAge = 6;
 	float shapeBoxTrim = 0.25f;
+	// A short measurement is normally a fragment and must not collapse the
+	// box: a train's flow mask breaks up while the train is still there, and
+	// the box keeps its length. With shapeShrink that hold is lifted once the
+	// model silhouette has agreed with the blob for shapeShrinkFrames running
+	// frames — the silhouette ends where the blob ends, both sides, both ends
+	// free of the corridor ends and of any occluder. A silhouette that runs
+	// *past* the blob (the model sees more object than the mask) never
+	// agrees, which is exactly the train case, so the hold stands there even
+	// with this on. Off by default; the boat corridor turns it on, so a box a
+	// wake has stretched can return to the hull instead of staying stretched
+	// until the boat leaves.
+	bool shapeShrink = false;
+	int shapeShrinkFrames = 8;
 	// --- hidden rear / front: two trains meeting on the viaduct, the far
 	// one partly behind the near one. An object first seen in mid corridor
 	// whose rear side is covered by an oncoming (visible, confirmed) object
@@ -134,7 +186,9 @@ struct TrackerConfig {
 	// lies inside an oncoming object's box is ignored and the nose coasts
 	// at v instead of being pushed back by the other train's tail. A
 	// detection right next to a confirmed same-direction object is a
-	// fragment of it and never gets a hidden rear.
+	// fragment of it and never gets a hidden rear. A rear that is still a
+	// short sliver is not rejected for good: the nose grows, and the check
+	// is repeated until it is long enough to pin or clearly not hidden.
 	bool hiddenRear = true;
 	// misc
 	int trailLen = 30;           // debug trail length (frames)
@@ -170,6 +224,11 @@ public:
 	explicit MultiObjectTracker(const TrackerConfig & config);
 
 	void setConfig(const TrackerConfig & config){ cfg = config; }
+	// Corridor positions of lane ends that are not corridor ends (a
+	// corridor made of several overlapping lanes). The flow gain is never
+	// learnt from a blob edge near one: the blob ends there because the
+	// lane does, not because the object does.
+	void setInternalBoundaries(std::vector<float> s){ internalBoundaries = std::move(s); }
 
 	// detections: this frame's (already grouped) corridor detections;
 	// tMs: frame timestamp; feedback: per track id, what the shape
@@ -193,11 +252,21 @@ private:
 		double occludedSinceMs = -1; // >= 0 while coasting hidden
 		bool isShadow = false;  // flagged as a fragment/wake once: never confirms
 		bool bornByTouch = false;   // born clipped at a corridor end
-		bool hiddenRearChecked = false; // hidden-rear decision taken (once, when the direction settled)
+		bool hiddenRearChecked = false; // hidden rear pinned, or ruled out (a short covered nose is still open)
 		int clipVotesL = 0, clipVotesR = 0; // consecutive frames the detection disagreed with clippedLeft/Right
+		int shrinkVotes = 0; // consecutive frames the silhouette confirmed the blob's ends (shapeShrink)
 		ShapeFeedback fb;       // newest feedback for this id
 		double modelSeenMs = -1; // when the model last saw anything (own or other class) on this track
 		int modelOtherSeen = 0;  // otherClassHits at that time
+		// flow gain (see TrackerConfig::flowGain): the multiplier applied
+		// to this track's flow velocity, and the recent positions of each
+		// free edge it is learnt from. A buffer holds consecutive clean
+		// samples only; it is cleared the moment the edge is pinned,
+		// hidden, part of a fragment or near a lane end.
+		float flowGain = 1.0f;
+		struct EdgeSample { double tMs; float x; float vFlow; };
+		std::vector<EdgeSample> edgeHistL, edgeHistR;
+		std::vector<float> gainSamples; // accepted ratios, newest last (<= flowGainSamples)
 	};
 	struct Grave {
 		TrackedObject obj;
@@ -211,6 +280,11 @@ private:
 	// Is the measurement's edge on `side` (+1: x1, -1: x0) inside the box
 	// of an oncoming, visible, confirmed object that continues past it?
 	bool edgeCovered(int heading, int side, const Detection & m, int selfId) const;
+	// Does a visible oncoming confirmed object overlap this box? Then a
+	// loss of detections is that occlusion, and a pinned rear stays pinned
+	// while the track coasts — releasing it lets the box slide off the
+	// hidden wagons (two trains on the viaduct).
+	bool overlappedByOncoming(int heading, const TrackedObject & self) const;
 	// Is a confirmed same-direction object right next to the measurement?
 	bool nearSameDirection(int heading, const Detection & m, int selfId) const;
 	bool sliverInOncoming(int heading, const Detection & m, int selfId) const;
@@ -220,6 +294,17 @@ private:
 	int headingOf(const Track & t) const;
 	bool leaving(const Track & t) const;
 	bool pastFarEnd(const Track & t) const;
+	// Settled track vs a measurement that is the wash behind it: the
+	// opposite direction, much slower than the hull, or lying entirely
+	// behind the rear edge. Accepting that measurement walks the box
+	// back into the corridor.
+	bool behindSettled(const Track & t, const Detection & d) const;
+	// Flow gain learning (see TrackerConfig::flowGain): records this
+	// frame's blob edges where they are clean, and once a window is full
+	// updates the track's and the corridor's gain from the edge slope.
+	// `vFlow` is the raw detector velocity of this measurement.
+	void learnFlowGain(Track & t, double tMs, float x0, float x1, bool cleanL, bool cleanR, float vFlow);
+	bool nearInternalBoundary(float x) const;
 	static void colorForId(int id, float & r, float & g, float & b);
 
 	TrackerConfig cfg;
@@ -229,6 +314,8 @@ private:
 	int nextId = 1;
 	double lastTMs = -1;
 	double resetTMs = -1; // time of the last (re)start, for the edge-rule grace
+	float corridorGain = 1.0f; // slow EMA of the learnt flow gain, seeds new tracks
+	std::vector<float> internalBoundaries; // see setInternalBoundaries
 };
 
 } // namespace tracking

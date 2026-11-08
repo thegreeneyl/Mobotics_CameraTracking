@@ -37,6 +37,12 @@ Usage:
               ojit      mean per-vertex outline displacement between consecutive
                         frames in box-normalised units (x1000), after resampling
                         every outline to 32 vertices
+              vbias     per class, median over 8-frame windows of (least-squares
+                        slope of a free, unpinned box edge) / (published vx), from
+                        <rec>.debug.jsonl; 1.00 = the published speed is the speed
+                        the box really moves at, > 1 = flow reads slow; edges within
+                        0.1 of an internal lane boundary (dual layout) are skipped;
+                        `g` is the median flow gain the tracker applied (`fg`)
 
 Gate per recording: every non-coarse event ok (1 id, maxsim <= allow,
 coverage >= 0.95), no false tracks, nonedge == 0 and middeath == 0.
@@ -62,6 +68,8 @@ from collections import defaultdict
 EDGE_FRAC = 0.20          # born within this of a corridor end counts as an edge birth (train edgeBirthFrac)
 MID_LO, MID_HI = 0.10, 0.90
 RESAMPLE_N = 32
+VBIAS_WINDOW = 8          # frames per free-edge slope fit (tracker flowGainWindow)
+VBIAS_BOUNDARY_MARGIN = 0.10  # no edge samples this close to an internal lane boundary (tracker kBoundaryMargin)
 
 
 def load_events(path):
@@ -142,28 +150,132 @@ def box_normalised(poly, o):
     return [((x - b[0]) / w, (y - b[1]) / h) for x, y in poly]
 
 
-def load_births(debug_path):
-    """(view, id) -> tracker-side birth record from <rec>.debug.jsonl, if present.
+def load_debug(debug_path):
+    """Frames of <rec>.debug.jsonl (tracker-side dump), [] when absent."""
+    frames = []
+    if not os.path.exists(debug_path):
+        return frames
+    with open(debug_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                frames.append(json.loads(line))
+    return frames
+
+
+def births_from(debug_frames):
+    """(view, id) -> tracker-side birth record.
 
     The published stream starts at confirmation, a few frames after the
     tracker created the track (and after the silhouette box may already have
     shrunk it), so the edge rule is judged on the tracker's own birth frame
     when the debug dump is available: `eb` is the tracker's edgeBorn flag."""
     births = {}
-    if not os.path.exists(debug_path):
-        return births
-    with open(debug_path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            fr = json.loads(line)
-            for tr in fr.get("tracks", []):
-                k = (tr.get("c", ""), int(tr["id"]))
-                if k not in births:
-                    births[k] = {"t": fr.get("t", 0.0), "x": [tr["x0"], tr["x1"]],
-                                 "eb": tr.get("eb"), "cl": tr.get("cl"), "cr": tr.get("cr")}
+    for fr in debug_frames:
+        for tr in fr.get("tracks", []):
+            k = (tr.get("c", ""), int(tr["id"]))
+            if k not in births:
+                births[k] = {"t": fr.get("t", 0.0), "x": [tr["x0"], tr["x1"]],
+                             "eb": tr.get("eb"), "cl": tr.get("cl"), "cr": tr.get("cr")}
+            elif tr.get("eb") and not births[k]["eb"]:
+                # hidden rear pins the entry end a few frames after birth;
+                # that is an edge birth even though the first blob was mid lane
+                births[k]["eb"] = True
     return births
+
+
+def load_births(debug_path):
+    return births_from(load_debug(debug_path))
+
+
+def vbias_from(debug_frames):
+    """class -> (median ratio, n) of free-edge slope / published vx.
+
+    The published velocity comes from optical flow, which reads low on
+    repetitive texture; a free box edge is placed by the mask and moves at
+    the object's true speed. For every confirmed, moving track and each
+    edge, runs of consecutive frames in which that edge is unpinned and at
+    least EDGE_FRAC from the lane end are cut into VBIAS_WINDOW-frame
+    windows; the least-squares slope of the edge over the window divided by
+    the mean published vx is one ratio (fits with residual RMS > 1 % of the
+    corridor, |vx| < 0.01 or a sign disagreement are dropped). 1.00 means
+    the published speed is the speed the box moves at."""
+    seqs = defaultdict(list)
+    # lane ends inside a corridor (dual layout): a blob edge there is cut by
+    # the lane geometry and stalls while the object does not — excluded, as
+    # in the tracker (kBoundaryMargin)
+    inner = defaultdict(set)
+    for fr in debug_frames:
+        t = float(fr.get("t", 0.0))
+        for ln in fr.get("lanes", []):
+            if "s0" in ln and "c" in ln:
+                if ln["s0"] > 0.001:
+                    inner[ln["c"]].add(ln["s0"])
+                if ln["s1"] < 0.999:
+                    inner[ln["c"]].add(ln["s1"])
+        for tr in fr.get("tracks", []):
+            if not tr.get("conf") or tr.get("ph") in ("stopped", "occluded", "gone"):
+                continue
+            seqs[(tr.get("c", ""), int(tr["id"]))].append((t, tr))
+    ratios = defaultdict(list)
+
+    def near_inner(cls, x):
+        return any(abs(x - s) <= VBIAS_BOUNDARY_MARGIN for s in inner.get(cls, ()))
+
+    def windows(run):
+        for i in range(0, len(run) - VBIAS_WINDOW + 1):
+            yield run[i:i + VBIAS_WINDOW]
+
+    def fit(win):
+        t0 = win[0][0]
+        ts = [t - t0 for t, _ in win]
+        xs = [x for _, x in win]
+        n = len(win)
+        st, sx = sum(ts), sum(xs)
+        stt = sum(t * t for t in ts)
+        stx = sum(t * x for t, x in zip(ts, xs))
+        den = n * stt - st * st
+        if den <= 1e-12:
+            return None, None
+        b = (n * stx - st * sx) / den
+        a = (sx - b * st) / n
+        rms = math.sqrt(sum((x - (a + b * t)) ** 2 for t, x in zip(ts, xs)) / n)
+        return b, rms
+
+    def consume(cls, run):
+        for win in windows(run):
+            vx = statistics.fmean(v for _, _, v in win)
+            if abs(vx) < 0.01:
+                continue
+            b, rms = fit([(t, x) for t, x, _ in win])
+            if b is None or rms > 0.01 or abs(b) < 0.004 or (b > 0) != (vx > 0):
+                continue
+            ratios[cls].append(b / vx)
+
+    gains = defaultdict(list)  # class -> learnt flow gain per confirmed frame (`fg`)
+    for (cls, _), samples in seqs.items():
+        gains[cls].extend(tr["fg"] for _, tr in samples if "fg" in tr)
+        for edge, clipkey in (("x0", "cl"), ("x1", "cr")):
+            run = []  # (t, x, vx), consecutive frames with this edge free
+            prev_t = None
+            for t, tr in samples:
+                x = tr[edge]
+                free = (not tr.get(clipkey) and EDGE_FRAC <= x <= 1.0 - EDGE_FRAC
+                        and not near_inner(cls, x))
+                gap = prev_t is not None and (t - prev_t <= 0 or t - prev_t > 0.5)
+                prev_t = t
+                if not free or gap:
+                    consume(cls, run)
+                    run = []
+                if free:
+                    run.append((t, x, tr["vx"]))
+            consume(cls, run)
+    out = {}
+    for cls in set(ratios) | set(gains):
+        r = ratios.get(cls, [])
+        g = gains.get(cls, [])
+        out[cls] = (statistics.median(r) if r else None, len(r), statistics.median(g) if g else None)
+    return out
 
 
 def track_summary(key, samples, rec_end_t, birth=None):
@@ -273,12 +385,13 @@ def frames_in(frames, t0, t1):
     return [fr for fr in frames if t0 <= float(fr.get("t", 0.0)) <= t1]
 
 
-def score_recording(name, frames, rec_events, cfg, match, min_track_s, births=None):
+def score_recording(name, frames, rec_events, cfg, match, min_track_s, births=None, vbias=None):
     tol_default = float(cfg.get("tolerance_s", 2.0))
     tol_approx = float(cfg.get("tolerance_approx_s", 4.0))
     rec_end_t = float(frames[-1].get("t", 0.0)) if frames else 0.0
     tracks = track_table(frames)
     births = births or {}
+    vbias = vbias or {}
     summaries = [track_summary(k, v, rec_end_t, births.get(k)) for k, v in tracks.items()]
     by_key = {(s["view"], s["id"]): s for s in summaries}
 
@@ -439,6 +552,8 @@ def score_recording(name, frames, rec_events, cfg, match, min_track_s, births=No
         "box_rate_p95": round(box_rate_p95, 3),
         "outline_missing": round(omiss, 3),
         "outline_jitter_x1000": round(ojit * 1000, 2),
+        "vbias": {c: {"median": None if m is None else round(m, 3), "n": n,
+                      "gain": None if g is None else round(g, 3)} for c, (m, n, g) in vbias.items()},
         "gate_ok": all_gate_ok and not false_tracks and not nonedge and not middeath,
         "tracks": summaries,
     }
@@ -449,9 +564,14 @@ def print_report(results):
         print(f"\n== {r['recording']}  frames={r['frames']}  tracks={r['tracks_total']}  "
               f"false={r['n_false']}  jitter={r['jitter_x1000']}e-3  vstd={r['vstd']}  "
               f"{'OK' if r['gate_ok'] else 'FAIL'}")
+        def vb_cell(c, v):
+            med = "-" if v["median"] is None else f"{v['median']:.3f}"
+            gain = "" if v["gain"] is None else f" g={v['gain']:.3f}"
+            return f"{c}={med}(n={v['n']}{gain})"
+        vb = "  ".join(vb_cell(c, v) for c, v in sorted(r["vbias"].items())) or "-"
         print(f"   nonedge={len(r['nonedge'])}  middeath={len(r['middeath'])}  "
               f"boxrate95={r['box_rate_p95']}/s  omiss={r['outline_missing']}  "
-              f"ojit={r['outline_jitter_x1000']}e-3")
+              f"ojit={r['outline_jitter_x1000']}e-3  vbias {vb}")
         print(f"  {'class':6} {'window':>13} {'ids':>4} {'maxsim':>6} {'allow':>5} {'cover':>6} {'sw':>3} {'dir':>5}  ids")
         for e in r["events"]:
             flag = " (coarse)" if e["coarse"] else " (approx)" if e["approx"] else ""
@@ -491,8 +611,9 @@ def main(argv):
             print(f"(skipping {name}: no events annotated)")
             continue
         _, frames = load_motion(os.path.join(args.eval_dir, fn))
-        births = load_births(os.path.join(args.eval_dir, name + ".debug.jsonl"))
-        r = score_recording(name, frames, rec_cfg["events"], cfg, args.match, args.min_track_s, births)
+        debug = load_debug(os.path.join(args.eval_dir, name + ".debug.jsonl"))
+        r = score_recording(name, frames, rec_cfg["events"], cfg, args.match, args.min_track_s,
+                            births_from(debug), vbias_from(debug))
         with open(os.path.join(args.eval_dir, name + ".tracks.json"), "w", encoding="utf-8") as f:
             json.dump(r["tracks"], f, indent=1)
         results.append(r)

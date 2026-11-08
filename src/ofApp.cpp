@@ -5,6 +5,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "output/MotionPathWriter.h"
+#include "tracking/LaneWarp.h"
 #include "tracking/TrackingConfigJson.h"
 #include "tracking/TrackingParams.h"
 
@@ -17,23 +18,47 @@ constexpr float kFrameHandleRadius = 6;     // drawn size
 constexpr float kFrameHandleHitRadius = 12; // mouse pick radius
 constexpr float kMaxArrow = 0.25f;          // velocity arrow clamp (lane widths)
 
-// Homography mapping lane coordinates (0..1, unit square) onto the four
-// screen-space corners of a lane quad. Returns a 3x3 CV_64F matrix.
-cv::Mat laneToScreenHomography(const tracking::FrameQuad & quad, const ofRectangle & pane){
-	const cv::Point2f src[4] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
-	cv::Point2f dst[4];
-	for(int c = 0; c < 4; c++){
-		dst[c] = cv::Point2f(pane.x + quad.pts[c][0] * pane.width,
-		                     pane.y + quad.pts[c][1] * pane.height);
-	}
-	return cv::getPerspectiveTransform(src, dst);
+// Lane-normalized (u, v) -> screen, through the strip's piecewise homography.
+// The map was built in the pane's own pixel space, so pane-local px plus the
+// pane origin is the screen position.
+glm::vec2 projectLane(const tracking::LaneMap & map, const ofRectangle & pane, float u, float v){
+	float x, y;
+	if(!map.toPane(u, v, x, y)) return {pane.x, pane.y};
+	return {pane.x + x, pane.y + y};
 }
 
-glm::vec2 projectPoint(const cv::Mat & h, float x, float y){
-	const double * m = h.ptr<double>();
-	const double w = m[6] * x + m[7] * y + m[8];
-	return {static_cast<float>((m[0] * x + m[1] * y + m[2]) / w),
-	        static_cast<float>((m[3] * x + m[4] * y + m[5]) / w)};
+// Closest point on either border polyline. t is the fraction along that slice.
+bool nearestBorder(const tracking::LaneConfig & lane, const ofRectangle & pane,
+                   float x, float y, int & edge, int & seg, float & t, float & dist){
+	std::vector<std::array<float, 2>> top, bottom;
+	lane.borders(top, bottom);
+	dist = 1e9f;
+	bool hit = false;
+	const auto consider = [&](int e, const std::vector<std::array<float, 2>> & pts){
+		for(size_t i = 0; i + 1 < pts.size(); i++){
+			const float x0 = pane.x + pts[i][0] * pane.width;
+			const float y0 = pane.y + pts[i][1] * pane.height;
+			const float x1 = pane.x + pts[i + 1][0] * pane.width;
+			const float y1 = pane.y + pts[i + 1][1] * pane.height;
+			const float dx = x1 - x0, dy = y1 - y0;
+			const float len2 = dx * dx + dy * dy;
+			if(len2 < 1.0f) continue;
+			float u = ((x - x0) * dx + (y - y0) * dy) / len2;
+			u = std::min(1.0f, std::max(0.0f, u));
+			const float px = x0 + u * dx, py = y0 + u * dy;
+			const float d = std::hypot(x - px, y - py);
+			if(d < dist){
+				dist = d;
+				edge = e;
+				seg = static_cast<int>(i);
+				t = u;
+				hit = true;
+			}
+		}
+	};
+	consider(0, top);
+	consider(1, bottom);
+	return hit;
 }
 
 bool sameParams(const std::vector<tracking::ParamInfo> & a, const std::vector<tracking::ParamInfo> & b){
@@ -216,6 +241,27 @@ void drawShapeOutline(const std::vector<std::pair<float, float>> & outline, cons
 	ofSetLineWidth(1);
 	ofPopStyle();
 }
+
+// Which box and center the views draw. Result is what is published (a
+// boat's outline bounds); raw is the flow box kept beside it.
+struct ShownGeom {
+	float x0 = 0, x1 = 0, y0 = 0, y1 = 0, x = 0, y = 0, w = 0, h = 0;
+	const std::vector<std::pair<float, float>> * trail = nullptr;
+};
+
+ShownGeom shownGeom(const tracking::TrackedObject & o, bool result){
+	ShownGeom g;
+	if(result){
+		g.x0 = o.x0; g.x1 = o.x1; g.y0 = o.y0; g.y1 = o.y1;
+		g.x = o.x; g.y = o.y; g.w = o.w; g.h = o.h;
+		g.trail = &o.trail;
+	}else{
+		g.x0 = o.rawX0; g.x1 = o.rawX1; g.y0 = o.rawY0; g.y1 = o.rawY1;
+		g.x = o.rawX; g.y = o.rawY; g.w = o.rawW; g.h = o.rawH;
+		g.trail = &o.rawTrail;
+	}
+	return g;
+}
 } // namespace
 
 //--------------------------------------------------------------
@@ -240,6 +286,8 @@ void ofApp::setup(){
 	gui.add(showPixelsParam);
 	gui.add(showOutlineParam);
 	gui.add(showBoxParam);
+	gui.add(showResultParam);
+	gui.add(showCandidatesParam);
 	gui.add(resultViewParam);
 	gui.add(detectorParam);
 	gui.add(halfResParam);
@@ -582,7 +630,9 @@ void ofApp::syncEditLayout(int paneCount){
 	editPaneCount = paneCount;
 	editLayout = tracking::TrackingManager::findLayout(trackingConfig.layouts, paneCount, source);
 	committedLayout = editLayout;
-	dragLane = dragCorner = -1;
+	dragLane = -1;
+	dragEdge = dragStation = -1;
+	anchorLane = anchorEdge = anchorStation = -1;
 	laneSelectParam.setMax(std::max(0, static_cast<int>(editLayout.lanes.size()) - 1));
 	laneSelectParam = std::min(laneSelectParam.get(), laneSelectParam.getMax());
 	lastLaneSelect = -1; // re-sync the s0/s1 sliders
@@ -888,7 +938,7 @@ void ofApp::drawVideo(){
 		const int rows = std::max(1, rowsInPane[lane.pane]);
 		const float cellH = (resultView.height - splitGap * (rows - 1)) / rows;
 		const float cellY = resultView.y + rowCursor[lane.pane]++ * (cellH + splitGap);
-		const float aspect = lane.quad.aspect(texPaneW, texPaneH);
+		const float aspect = lane.aspect(texPaneW, texPaneH);
 		float w = paneRects[lane.pane].width;
 		float h = w / aspect;
 		if(h > cellH){ h = cellH; w = h * aspect; }
@@ -947,7 +997,8 @@ void ofApp::drawCanvasView(){
 	ofSetColor(150);
 	ofDrawRectangle(c);
 	ofDrawBitmapStringHighlight("canvas " + ofToString(trackingConfig.canvas.width) + "x"
-		+ ofToString(trackingConfig.canvas.height) + "  (0,0 top-left, 1,1 bottom-right)",
+		+ ofToString(trackingConfig.canvas.height) + (showResultParam ? "  result" : "  raw")
+		+ "  (0,0 top-left, 1,1 bottom-right)",
 		c.x + 6, c.y - 6, ofColor(0, 140), ofColor(200));
 
 	// placements
@@ -998,8 +1049,10 @@ void ofApp::drawCanvasView(){
 				return true;
 			};
 			for(const auto & obj : cr.objects){
+				if(!obj.confirmed && !showCandidatesParam) continue;
+				const ShownGeom g = shownGeom(obj, showResultParam);
 				float x0, x1, y0, y1;
-				p.mapBox(obj.x0, obj.x1, obj.y0, obj.y1, x0, x1, y0, y1);
+				p.mapBox(g.x0, g.x1, g.y0, g.y1, x0, x1, y0, y1);
 				const ofColor col = objectColor(obj);
 				if(showPixelsParam) drawShapeCells(obj.shape, mapCanvas, ofColor(col, 110));
 				if(showOutlineParam && obj.shape.valid && !obj.shape.outline.empty()){
@@ -1022,12 +1075,12 @@ void ofApp::drawCanvasView(){
 				if(!tracking::CorridorPlacement::clipToCanvas(x0, x1, y0, y1)) continue;
 				const glm::vec2 a = toScreen(x0, y0), b = toScreen(x1, y1);
 
-				if(obj.trail.size() > 1){
-					for(size_t i = 1; i < obj.trail.size(); i++){
-						const glm::vec2 t0 = toScreen(p.toCanvasX(obj.trail[i - 1].first), p.toCanvasY(obj.trail[i - 1].second));
-						const glm::vec2 t1 = toScreen(p.toCanvasX(obj.trail[i].first), p.toCanvasY(obj.trail[i].second));
+				if(g.trail->size() > 1){
+					for(size_t i = 1; i < g.trail->size(); i++){
+						const glm::vec2 t0 = toScreen(p.toCanvasX((*g.trail)[i - 1].first), p.toCanvasY((*g.trail)[i - 1].second));
+						const glm::vec2 t1 = toScreen(p.toCanvasX((*g.trail)[i].first), p.toCanvasY((*g.trail)[i].second));
 						if(!c.inside(t0) || !c.inside(t1)) continue;
-						const float alpha = static_cast<float>(i) / obj.trail.size();
+						const float alpha = static_cast<float>(i) / g.trail->size();
 						ofSetColor(col.r, col.g, col.b, col.a * alpha * 0.6f);
 						ofDrawLine(t0, t1);
 					}
@@ -1038,8 +1091,15 @@ void ofApp::drawCanvasView(){
 					ofSetLineWidth(obj.confirmed ? 2 : 1);
 					ofDrawRectangle(a.x, a.y, b.x - a.x, b.y - a.y);
 					ofSetLineWidth(1);
-					const bool cutL = offL || (p.mirrored() ? obj.clippedRight : obj.clippedLeft);
-					const bool cutR = offR || (p.mirrored() ? obj.clippedLeft : obj.clippedRight);
+					// A corridor-end tick only where the drawn box actually sits on
+					// that end. The flow box can be pinned there while the
+					// hull box is not.
+					const bool pinL = p.mirrored() ? g.x1 >= 0.98f && obj.clippedRight
+					                               : g.x0 <= 0.02f && obj.clippedLeft;
+					const bool pinR = p.mirrored() ? g.x0 <= 0.02f && obj.clippedLeft
+					                               : g.x1 >= 0.98f && obj.clippedRight;
+					const bool cutL = offL || pinL;
+					const bool cutR = offR || pinR;
 					ofSetColor(255, 60, 60);
 					ofSetLineWidth(3);
 					if(cutL) ofDrawLine(a.x, a.y, a.x, b.y);
@@ -1080,18 +1140,18 @@ void ofApp::drawTrackingOverlay(){
 	if(paneRects.empty()) return;
 
 	ofPushStyle();
-	std::vector<cv::Mat> laneH(trackResults.lanes.size());
+	std::vector<tracking::LaneMap> laneMaps(trackResults.lanes.size());
 	for(size_t li = 0; li < trackResults.lanes.size(); li++){
 		const tracking::LaneConfig & lane = trackResults.lanes[li].lane;
 		if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) continue;
-		const tracking::FrameQuad quad = lane.quad.isConvex() ? lane.quad : tracking::FrameQuad{};
-		laneH[li] = laneToScreenHomography(quad, paneRects[lane.pane]);
+		const ofRectangle & pane = paneRects[lane.pane];
+		laneMaps[li] = tracking::LaneMap::build(lane, pane.width, pane.height);
 		if(showDetectionsParam){
 			ofSetColor(170, 170, 170, 160);
 			ofNoFill();
+			const auto proj = [&](float u, float v){ return projectLane(laneMaps[li], pane, u, v); };
 			for(const auto & d : trackResults.lanes[li].detections){
-				const glm::vec2 p[4] = {projectPoint(laneH[li], d.x0, d.y0), projectPoint(laneH[li], d.x1, d.y0),
-				                        projectPoint(laneH[li], d.x1, d.y1), projectPoint(laneH[li], d.x0, d.y1)};
+				const glm::vec2 p[4] = {proj(d.x0, d.y0), proj(d.x1, d.y0), proj(d.x1, d.y1), proj(d.x0, d.y1)};
 				for(int c = 0; c < 4; c++) ofDrawLine(p[c], p[(c + 1) % 4]);
 			}
 		}
@@ -1099,26 +1159,30 @@ void ofApp::drawTrackingOverlay(){
 
 	for(const auto & cr : trackResults.corridors){
 		for(const auto & obj : cr.objects){
+			if(!obj.confirmed && !showCandidatesParam) continue;
+			const ShownGeom g = shownGeom(obj, showResultParam);
 			const ofColor col = objectColor(obj);
 			bool labelled = false;
 			for(int li : cr.lanes){
-				if(li < 0 || li >= static_cast<int>(laneH.size()) || laneH[li].empty()) continue;
+				if(li < 0 || li >= static_cast<int>(laneMaps.size()) || !laneMaps[li].ok) continue;
 				const tracking::LaneConfig & lane = trackResults.lanes[li].lane;
-				const cv::Mat & h = laneH[li];
-				const auto proj = [&h](float x, float y){ return projectPoint(h, x, y); };
+				if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) continue;
+				const ofRectangle & pane = paneRects[lane.pane];
+				const tracking::LaneMap & map = laneMaps[li];
+				const auto proj = [&](float x, float y){ return projectLane(map, pane, x, y); };
 
 				float lx0, lx1;
-				if(!lane.corridorRangeToLane(obj.x0, obj.x1, lx0, lx1)) continue;
+				if(!lane.corridorRangeToLane(g.x0, g.x1, lx0, lx1)) continue;
 
 				// trail (older = more transparent), in this lane where visible
-				if(obj.trail.size() > 1){
-					for(size_t i = 1; i < obj.trail.size(); i++){
-						const float a0 = lane.toLane(obj.trail[i - 1].first);
-						const float a1 = lane.toLane(obj.trail[i].first);
+				if(g.trail->size() > 1){
+					for(size_t i = 1; i < g.trail->size(); i++){
+						const float a0 = lane.toLane((*g.trail)[i - 1].first);
+						const float a1 = lane.toLane((*g.trail)[i].first);
 						if(a0 < 0 || a0 > 1 || a1 < 0 || a1 > 1) continue;
-						const float a = static_cast<float>(i) / obj.trail.size();
+						const float a = static_cast<float>(i) / g.trail->size();
 						ofSetColor(col.r, col.g, col.b, col.a * a * 0.6f);
-						ofDrawLine(proj(a0, obj.trail[i - 1].second), proj(a1, obj.trail[i].second));
+						ofDrawLine(proj(a0, (*g.trail)[i - 1].second), proj(a1, (*g.trail)[i].second));
 					}
 				}
 
@@ -1135,8 +1199,8 @@ void ofApp::drawTrackingOverlay(){
 				}
 
 				ofSetColor(col);
-				const glm::vec2 bTl = proj(lx0, obj.y0), bTr = proj(lx1, obj.y0);
-				const glm::vec2 bBr = proj(lx1, obj.y1), bBl = proj(lx0, obj.y1);
+				const glm::vec2 bTl = proj(lx0, g.y0), bTr = proj(lx1, g.y0);
+				const glm::vec2 bBr = proj(lx1, g.y1), bBl = proj(lx0, g.y1);
 				if(showBoxParam){
 					ofNoFill();
 					ofSetLineWidth(obj.confirmed ? 2 : 1);
@@ -1145,15 +1209,16 @@ void ofApp::drawTrackingOverlay(){
 					ofDrawLine(bBr, bBl);
 					ofDrawLine(bBl, bTl);
 					ofSetLineWidth(1);
-					// clipped edge markers (red) where the corridor end is in this lane
+					// clipped edge markers (red) only when this box's edge
+					// actually sits on the corridor end
 					float e0, e1;
-					if(obj.clippedLeft && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
+					if(obj.clippedLeft && g.x0 <= 0.02f && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
 						ofSetColor(255, 60, 60);
 						ofSetLineWidth(3);
 						ofDrawLine(bTl, bBl);
 						ofSetLineWidth(1);
 					}
-					if(obj.clippedRight && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
+					if(obj.clippedRight && g.x1 >= 0.98f && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
 						ofSetColor(255, 60, 60);
 						ofSetLineWidth(3);
 						ofDrawLine(bTr, bBr);
@@ -1163,9 +1228,9 @@ void ofApp::drawTrackingOverlay(){
 				ofSetColor(col);
 
 				// center + velocity arrow (corridor -> lane velocity scale)
-				const float lcx = lane.toLane(obj.x);
+				const float lcx = lane.toLane(g.x);
 				if(lcx >= 0 && lcx <= 1){
-					const glm::vec2 c = proj(lcx, obj.y);
+					const glm::vec2 c = proj(lcx, g.y);
 					ofFill();
 					ofDrawCircle(c.x, c.y, 3);
 					const float span = lane.s1 - lane.s0;
@@ -1173,7 +1238,7 @@ void ofApp::drawTrackingOverlay(){
 					float dy = obj.vy * arrowScaleParam;
 					const float len = std::hypot(dx, dy);
 					if(len > kMaxArrow){ dx *= kMaxArrow / len; dy *= kMaxArrow / len; }
-					const glm::vec2 tip = proj(lcx + dx, obj.y + dy);
+					const glm::vec2 tip = proj(lcx + dx, g.y + dy);
 					ofDrawArrow(glm::vec3(c.x, c.y, 0), glm::vec3(tip.x, tip.y, 0), 5.0f);
 				}
 
@@ -1193,9 +1258,10 @@ void ofApp::drawTrackingOverlay(){
 }
 
 //--------------------------------------------------------------
-// The draggable lane quads on each pane: outline + corner handles. The
-// selected lane is yellow with handles, other lanes cyan; red = crossed /
-// collapsed quad — drawn but NOT sent to the tracker until it is convex.
+// The draggable lane strips on each pane: top and bottom borders, a rib at
+// each station, handles on every point. The selected lane is yellow, others
+// cyan; red = a crossed slice — drawn but NOT sent to the tracker until
+// every slice is convex again.
 void ofApp::drawLaneEditor(){
 	if(!overlayParam) return;
 
@@ -1205,32 +1271,48 @@ void ofApp::drawLaneEditor(){
 		if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) continue;
 		const ofRectangle & pane = paneRects[lane.pane];
 		const bool selected = static_cast<int>(li) == laneSelectParam.get();
-		const bool valid = lane.quad.isConvex();
+		const bool valid = lane.isWarpable();
 		const ofColor col = !valid ? ofColor(240, 80, 80)
 			: selected ? ofColor(255, 210, 60) : ofColor(80, 200, 230);
 
-		glm::vec2 pts[4];
-		for(int c = 0; c < 4; c++){
-			pts[c] = {pane.x + lane.quad.pts[c][0] * pane.width,
-			          pane.y + lane.quad.pts[c][1] * pane.height};
-		}
+		std::vector<std::array<float, 2>> top, bottom;
+		lane.borders(top, bottom);
+		const auto scr = [&](const std::array<float, 2> & p){
+			return glm::vec2(pane.x + p[0] * pane.width, pane.y + p[1] * pane.height);
+		};
 
 		ofSetColor(col, selected ? 220 : 130);
 		ofNoFill();
-		for(int c = 0; c < 4; c++) ofDrawLine(pts[c], pts[(c + 1) % 4]);
+		for(size_t i = 0; i + 1 < top.size(); i++) ofDrawLine(scr(top[i]), scr(top[i + 1]));
+		for(size_t i = 0; i + 1 < bottom.size(); i++) ofDrawLine(scr(bottom[i]), scr(bottom[i + 1]));
+		ofSetColor(col, selected ? 90 : 50);
+		for(size_t i = 0; i < top.size() && i < bottom.size(); i++) ofDrawLine(scr(top[i]), scr(bottom[i]));
+
+		ofSetColor(col, selected ? 220 : 130);
 		ofDrawBitmapStringHighlight(lane.id + " -> " + lane.corridor
 			+ " s " + ofToString(lane.s0, 2) + ".." + ofToString(lane.s1, 2),
-			pts[0].x + 4, pts[0].y + 12, ofColor(0, 140), col);
+			scr(top.front()).x + 4, scr(top.front()).y + 12, ofColor(0, 140), col);
+		if(selected){
+			ofDrawBitmapStringHighlight("shift-click an edge to add an anchor, delete removes it",
+			                            scr(top.front()).x + 4, scr(top.front()).y + 28, ofColor(0, 140), col);
+		}
 
 		ofFill();
-		for(int c = 0; c < 4; c++){
-			const bool dragged = (static_cast<int>(li) == dragLane && c == dragCorner);
-			ofSetColor(col, dragged ? 255 : selected ? 200 : 110);
-			ofDrawCircle(pts[c].x, pts[c].y, dragged ? kFrameHandleRadius + 2 : selected ? kFrameHandleRadius : 4);
-		}
+		const auto handle = [&](int edge, int index, const glm::vec2 & p){
+			const bool end = index == 0 || index + 1 == static_cast<int>(top.size());
+			const bool dragged = static_cast<int>(li) == dragLane && edge == dragEdge && index == dragStation;
+			const bool anchored = static_cast<int>(li) == anchorLane && edge == anchorEdge && index == anchorStation;
+			ofSetColor(col, dragged || anchored ? 255 : selected ? 200 : 110);
+			const float r = dragged ? kFrameHandleRadius + 2
+			                        : (selected && (end || anchored)) ? kFrameHandleRadius
+			                        : selected ? 4.5f : 3.5f;
+			ofDrawCircle(p.x, p.y, r);
+		};
+		for(size_t i = 0; i < top.size(); i++) handle(0, static_cast<int>(i), scr(top[i]));
+		for(size_t i = 0; i < bottom.size(); i++) handle(1, static_cast<int>(i), scr(bottom[i]));
 		if(!valid){
 			ofSetColor(col);
-			ofDrawBitmapStringHighlight("invalid lane quad (crossed) - keeping the last valid one",
+			ofDrawBitmapStringHighlight("invalid lane (crossed) - keeping the last valid one",
 			                            pane.x + 6, pane.getBottom() - 8, ofColor(0, 160), col);
 		}
 	}
@@ -1263,7 +1345,8 @@ void ofApp::drawTrackingResults(){
 		ofSetColor(static_cast<int>(li) == laneSelectParam.get() ? ofColor(255, 210, 60) : ofColor(110));
 		ofDrawRectangle(r);
 		ofSetColor(200);
-		ofDrawBitmapStringHighlight(lane.id + "  (lane 0..1, corridor " + lane.corridor + ")",
+		ofDrawBitmapStringHighlight(lane.id + "  (lane 0..1, corridor " + lane.corridor + ")"
+		                            + (showResultParam ? "  result" : "  raw"),
 		                            r.x + 6, r.y + 14, ofColor(0, 140), ofColor(220));
 
 		if(!trackingParam) continue;
@@ -1288,21 +1371,23 @@ void ofApp::drawTrackingResults(){
 		for(const auto & cr : trackResults.corridors){
 			if(std::find(cr.lanes.begin(), cr.lanes.end(), workerLane) == cr.lanes.end()) continue;
 			for(const auto & obj : cr.objects){
+				if(!obj.confirmed && !showCandidatesParam) continue;
+				const ShownGeom g = shownGeom(obj, showResultParam);
 				float lx0, lx1;
-				if(!lane.corridorRangeToLane(obj.x0, obj.x1, lx0, lx1)) continue;
+				if(!lane.corridorRangeToLane(g.x0, g.x1, lx0, lx1)) continue;
 				const ofColor col = objectColor(obj);
-				const float bx = r.x + lx0 * r.width, by = r.y + obj.y0 * r.height;
-				const float bw = (lx1 - lx0) * r.width, bh = obj.h * r.height;
+				const float bx = r.x + lx0 * r.width, by = r.y + g.y0 * r.height;
+				const float bw = (lx1 - lx0) * r.width, bh = g.h * r.height;
 
-				if(obj.trail.size() > 1){
-					for(size_t i = 1; i < obj.trail.size(); i++){
-						const float a0 = lane.toLane(obj.trail[i - 1].first);
-						const float a1 = lane.toLane(obj.trail[i].first);
+				if(g.trail->size() > 1){
+					for(size_t i = 1; i < g.trail->size(); i++){
+						const float a0 = lane.toLane((*g.trail)[i - 1].first);
+						const float a1 = lane.toLane((*g.trail)[i].first);
 						if(a0 < 0 || a0 > 1 || a1 < 0 || a1 > 1) continue;
-						const float a = static_cast<float>(i) / obj.trail.size();
+						const float a = static_cast<float>(i) / g.trail->size();
 						ofSetColor(col.r, col.g, col.b, col.a * a * 0.6f);
-						ofDrawLine(r.x + a0 * r.width, r.y + obj.trail[i - 1].second * r.height,
-						           r.x + a1 * r.width, r.y + obj.trail[i].second * r.height);
+						ofDrawLine(r.x + a0 * r.width, r.y + (*g.trail)[i - 1].second * r.height,
+						           r.x + a1 * r.width, r.y + (*g.trail)[i].second * r.height);
 					}
 				}
 
@@ -1324,13 +1409,13 @@ void ofApp::drawTrackingResults(){
 					ofDrawRectangle(bx, by, bw, bh);
 					ofSetLineWidth(1);
 					float e0, e1;
-					if(obj.clippedLeft && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
+					if(obj.clippedLeft && g.x0 <= 0.02f && lane.corridorRangeToLane(0.0f, 0.002f, e0, e1)){
 						ofSetColor(255, 60, 60);
 						ofSetLineWidth(3);
 						ofDrawLine(bx, by, bx, by + bh);
 						ofSetLineWidth(1);
 					}
-					if(obj.clippedRight && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
+					if(obj.clippedRight && g.x1 >= 0.98f && lane.corridorRangeToLane(0.998f, 1.0f, e0, e1)){
 						ofSetColor(255, 60, 60);
 						ofSetLineWidth(3);
 						ofDrawLine(bx + bw, by, bx + bw, by + bh);
@@ -1338,9 +1423,9 @@ void ofApp::drawTrackingResults(){
 					}
 				}
 				ofSetColor(col);
-				const float lcx = lane.toLane(obj.x);
+				const float lcx = lane.toLane(g.x);
 				if(lcx >= 0 && lcx <= 1){
-					const float cx = r.x + lcx * r.width, cy = r.y + obj.y * r.height;
+					const float cx = r.x + lcx * r.width, cy = r.y + g.y * r.height;
 					ofFill();
 					ofDrawCircle(cx, cy, 3);
 					const float span = lane.s1 - lane.s0;
@@ -1351,7 +1436,7 @@ void ofApp::drawTrackingResults(){
 					ofDrawArrow(glm::vec3(cx, cy, 0), glm::vec3(cx + dx * r.width, cy + dy * r.height, 0), 5.0f);
 				}
 				std::string text = "#" + ofToString(obj.id) + " " + obj.phase
-					+ "  s=" + ofToString(obj.x, 2) + " w=" + ofToString(obj.w, 2)
+					+ "  s=" + ofToString(g.x, 2) + " w=" + ofToString(g.w, 2)
 					+ " v=" + ofToString(obj.vx, 3);
 				if(!obj.confirmed) text += " ?";
 				ofDrawBitmapStringHighlight(text, bx, by - 6, ofColor(0, 160), col);
@@ -1435,7 +1520,8 @@ void ofApp::drawSensorPanel(){
 	ofDrawBitmapStringHighlight("Tracking", lx, y);
 	y += 22;
 	ofDrawBitmapString("layout = " + (trackResults.layoutName.empty() ? std::string("-") : trackResults.layoutName)
-		+ "  lanes " + ofToString(trackResults.lanes.size()), lx, y);
+		+ "  lanes " + ofToString(trackResults.lanes.size())
+		+ (showResultParam ? "  data = result" : "  data = raw"), lx, y);
 	y += 16;
 	for(const auto & cr : trackResults.corridors){
 		int confirmed = 0;
@@ -1468,6 +1554,7 @@ void ofApp::drawStatsBar(){
 			for(const auto & o : c.objects) if(o.confirmed) objCount++;
 		}
 		trackInfo = "   trk[" + (trackResults.detectorName.empty() ? std::string("-") : trackResults.detectorName)
+			+ (showResultParam ? " result" : " raw")
 			+ "] " + ofToString(objCount) + " obj"
 			+ " dec " + ofToString(trackResults.decodeMs, 1)
 			+ " det " + ofToString(trackResults.detectMs, 1)
@@ -1561,6 +1648,22 @@ void ofApp::exit(){
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
+	if((key == OF_KEY_BACKSPACE || key == OF_KEY_DEL)
+	   && anchorLane >= 0 && anchorLane < static_cast<int>(editLayout.lanes.size())){
+		tracking::LaneConfig & lane = editLayout.lanes[anchorLane];
+		const tracking::LaneConfig backup = lane;
+		if(lane.removeStation(anchorStation)){
+			if(lane.isWarpable()){
+				anchorStation = -1;
+				commitLayout();
+			}else{
+				lane = backup;
+				ofLogWarning("ofApp") << "lane '" << lane.id
+					<< "' would be crossed without that anchor - keeping it";
+			}
+		}
+		return;
+	}
 	if(key == 'r'){
 		onReconnectPressed();
 	}else if(key == 'p'){
@@ -1588,6 +1691,10 @@ void ofApp::keyPressed(int key){
 		showOutlineParam = !showOutlineParam;
 	}else if(key == 'b'){
 		showBoxParam = !showBoxParam;
+	}else if(key == 'q'){
+		showResultParam = !showResultParam;
+	}else if(key == '?'){
+		showCandidatesParam = !showCandidatesParam;
 	}else if(key == '['){
 		if(laneSelectParam > laneSelectParam.getMin()) laneSelectParam = laneSelectParam - 1;
 	}else if(key == ']'){
@@ -1612,10 +1719,12 @@ void ofApp::keyPressed(int key){
 }
 
 //--------------------------------------------------------------
-// lane editing: drag a corner handle of any lane quad (grabbing one selects
-// that lane). The edit is committed (sent to the worker) on release, and
-// only when the quad is convex — a crossed shape stays visible in red and
-// keeps the last valid lane active.
+// lane editing: drag a station of any lane strip (grabbing one selects that
+// lane). Shift-click or double-click a top or bottom edge to insert a
+// station there; the other border gains the matching point so the slice
+// can still be flattened. The edit is committed on release, and only when
+// every slice is convex — a crossed shape stays red and keeps the last
+// valid lane active.
 
 void ofApp::mousePressed(int x, int y, int){
 	if(!overlayParam) return; // handles are hidden -> nothing to grab
@@ -1624,8 +1733,8 @@ void ofApp::mousePressed(int x, int y, int){
 
 	float bestD2 = kFrameHandleHitRadius * kFrameHandleHitRadius;
 	dragLane = -1;
-	dragCorner = -1;
-	// the selected lane wins ties (checked first with a slight bonus)
+	dragEdge = dragStation = -1;
+	// the selected lane wins ties (checked first)
 	const int sel = laneSelectParam.get();
 	for(int pass = 0; pass < 2; pass++){
 		for(size_t li = 0; li < editLayout.lanes.size(); li++){
@@ -1635,20 +1744,86 @@ void ofApp::mousePressed(int x, int y, int){
 			if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) continue;
 			const ofRectangle & pane = paneRects[lane.pane];
 			if(pane.width <= 0 || pane.height <= 0) continue;
-			for(int c = 0; c < 4; c++){
-				const float hx = pane.x + lane.quad.pts[c][0] * pane.width;
-				const float hy = pane.y + lane.quad.pts[c][1] * pane.height;
-				const float d2 = (hx - x) * (hx - x) + (hy - y) * (hy - y);
-				if(d2 < bestD2){
-					bestD2 = d2;
-					dragLane = static_cast<int>(li);
-					dragCorner = c;
+			std::vector<std::array<float, 2>> top, bottom;
+			lane.borders(top, bottom);
+			const auto consider = [&](int edge, const std::vector<std::array<float, 2>> & pts){
+				for(size_t i = 0; i < pts.size(); i++){
+					const float hx = pane.x + pts[i][0] * pane.width;
+					const float hy = pane.y + pts[i][1] * pane.height;
+					const float d2 = (hx - x) * (hx - x) + (hy - y) * (hy - y);
+					if(d2 < bestD2){
+						bestD2 = d2;
+						dragLane = static_cast<int>(li);
+						dragEdge = edge;
+						dragStation = static_cast<int>(i);
+					}
 				}
-			}
+			};
+			consider(0, top);
+			consider(1, bottom);
 		}
 		if(dragLane >= 0) break;
 	}
-	if(dragLane >= 0 && dragLane != sel) laneSelectParam = dragLane;
+
+	const uint64_t now = ofGetElapsedTimeMillis();
+	static uint64_t lastMs = 0;
+	static int lastX = 0, lastY = 0;
+	const bool dbl = now - lastMs < 400 && std::hypot(x - lastX, y - lastY) < 8.0f;
+	const bool shift = ofGetKeyPressed(OF_KEY_LEFT_SHIFT) || ofGetKeyPressed(OF_KEY_RIGHT_SHIFT);
+	lastMs = now;
+	lastX = x;
+	lastY = y;
+
+	// No handle: shift-click or double-click on a border inserts a station
+	// and grabs it, so the new point can be pulled off the edge at once.
+	if(dragLane < 0 && (shift || dbl)){
+		float bestEdge = 14.0f;
+		int insLane = -1, insEdge = 0, insSeg = 0;
+		float insT = 0;
+		for(int pass = 0; pass < 2; pass++){
+			for(size_t li = 0; li < editLayout.lanes.size(); li++){
+				const bool isSel = static_cast<int>(li) == sel;
+				if((pass == 0) != isSel) continue;
+				const tracking::LaneConfig & lane = editLayout.lanes[li];
+				if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) continue;
+				const ofRectangle & pane = paneRects[lane.pane];
+				if(pane.width <= 0 || pane.height <= 0) continue;
+				int edge = 0, seg = 0;
+				float t = 0, dist = 0;
+				if(!nearestBorder(lane, pane, x, y, edge, seg, t, dist)) continue;
+				if(dist < bestEdge && t > 0.05f && t < 0.95f){
+					bestEdge = dist;
+					insLane = static_cast<int>(li);
+					insEdge = edge;
+					insSeg = seg;
+					insT = t;
+				}
+			}
+			if(insLane >= 0) break;
+		}
+		if(insLane >= 0){
+			tracking::LaneConfig & lane = editLayout.lanes[insLane];
+			const ofRectangle & pane = paneRects[lane.pane];
+			const float ux = ofClamp((x - pane.x) / pane.width, 0, 1);
+			const float uy = ofClamp((y - pane.y) / pane.height, 0, 1);
+			const int at = lane.insertStation(insEdge, insSeg, insT, ux, uy);
+			if(at >= 0){
+				dragLane = insLane;
+				dragEdge = insEdge;
+				dragStation = at;
+			}else{
+				ofLogWarning("ofApp") << "lane '" << lane.id << "' already has "
+					<< tracking::LaneConfig::kMaxStations << " anchors per border";
+			}
+		}
+	}
+
+	if(dragLane >= 0){
+		if(dragLane != sel) laneSelectParam = dragLane;
+		anchorLane = dragLane;
+		anchorEdge = dragEdge;
+		anchorStation = dragStation;
+	}
 	if(dragLane < 0 && resultViewParam == 0) mousePressCanvas(x, y);
 }
 
@@ -1740,9 +1915,10 @@ void ofApp::mouseDragged(int x, int y, int){
 	if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) return;
 	const ofRectangle & pane = paneRects[lane.pane];
 	if(pane.width <= 0 || pane.height <= 0) return;
-	// corners stay inside the pane
-	lane.quad.pts[dragCorner][0] = ofClamp((x - pane.x) / pane.width, 0, 1);
-	lane.quad.pts[dragCorner][1] = ofClamp((y - pane.y) / pane.height, 0, 1);
+	// stations stay inside the pane
+	lane.setStation(dragEdge, dragStation,
+	                ofClamp((x - pane.x) / pane.width, 0, 1),
+	                ofClamp((y - pane.y) / pane.height, 0, 1));
 }
 
 void ofApp::mouseReleased(int, int, int){
@@ -1753,14 +1929,14 @@ void ofApp::mouseReleased(int, int, int){
 		return;
 	}
 	if(dragLane < 0) return;
-	if(dragLane < static_cast<int>(editLayout.lanes.size()) && editLayout.lanes[dragLane].quad.isConvex()){
+	if(dragLane < static_cast<int>(editLayout.lanes.size()) && editLayout.lanes[dragLane].isWarpable()){
 		commitLayout();
 	}else if(dragLane < static_cast<int>(editLayout.lanes.size())){
-		ofLogWarning("ofApp") << "lane quad '" << editLayout.lanes[dragLane].id
+		ofLogWarning("ofApp") << "lane '" << editLayout.lanes[dragLane].id
 			<< "' is crossed/collapsed - keeping the last valid lane active";
 	}
 	dragLane = -1;
-	dragCorner = -1;
+	dragEdge = dragStation = -1;
 }
 
 //--------------------------------------------------------------

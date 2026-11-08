@@ -47,6 +47,14 @@ entry is a stub for later.
   pixels currently attributed to it (`x`, off by default), its smoothed
   outline (`n`) and its bounding box (`b`). Each is independent; see
   *Object outline*
+- `q` — result data (default) / raw tracker data. Result is what UDP and
+  the motion export send. For a boat the box and the center are the
+  outline's bounds; the arrow is still the flow velocity, drawn from that
+  center. Raw draws the flow box the tracker measures with. Trains stay on
+  the flow box in both, because the outline covers only part of a train.
+  See *Result and raw*
+- `?` — show candidates (unconfirmed tracks). Off by default; see
+  *Candidates and verified objects*
 - `[` / `]` — select the previous / next lane for editing
 - `v` — result view: output canvas (default) / rectified lane strips
 - `,` / `.` — select the previous / next corridor for placing on the canvas
@@ -60,7 +68,7 @@ entry is a stub for later.
 - GUI: preview toggle, JPEG quality (preview only), COM dump toggle,
   record toggle, export toggle, playback-mode toggle, tracking/overlay/mask/detections
   toggles, the three result layers (`shape pixels`, `shape outline`,
-  `bounding box`), result view switch (0 canvas / 1 lane strips), detector switch
+  `bounding box`), the `result data (q)` toggle, the `candidates (?)` toggle, result view switch (0 canvas / 1 lane strips), detector switch
   (0 flow / 1 bgs / 2 yolo), half-res display decode toggle, UDP publish
   toggle
 - Playback panel (playback mode only, between the stream and tracking
@@ -86,13 +94,19 @@ entry is a stub for later.
   nothing else in the file is touched. The sliders edit the *base*
   `flow`/`tracker` blocks; per-corridor parameter overrides
   (`tracking.corridors.<id>.flow/.tracker`) stay as they are in the file.
-- Lane editor: every lane of the active layout is a draggable four-corner
-  quad on its pane (the selected lane is highlighted; grabbing a corner
-  selects that lane; overlay must be visible). Only pixels inside a lane are
-  analysed — the quad is perspective-warped to an upright rectangle before
-  detection, so it also corrects a skewed camera view. A crossed/collapsed
-  quad turns red and is ignored until it is convex again; releasing a
-  corner commits the lane (the worker rebuilds that layout's pipelines).
+- Lane editor: every lane of the active layout is a strip on its pane
+  (the selected lane is highlighted; grabbing a point selects that lane;
+  overlay must be visible). The strip has a top border and a bottom border.
+  With only the four corners it is the old quad. **Shift-click** a border
+  (or double-click it) to add an anchor anywhere along that edge; the other
+  border gets the matching point, and you drag either one. **Delete** or
+  **Backspace** removes the selected anchor (not the four corners). Only
+  pixels inside a lane are analysed. Each slice between anchors is
+  perspective-warped into the next section of one upright rectangle before
+  detection, so a lane can follow a curve and the tracking view below is
+  still flat. A crossed/collapsed slice turns red and is ignored until it
+  is convex again; releasing a point commits the lane (the worker rebuilds
+  that layout's pipelines).
 - Result view (below the video, `v` switches):
   - **canvas** (default) — the output canvas in the proportions of the
     Lines facade area (832×442) with a faint 10 % grid, every corridor's
@@ -108,7 +122,7 @@ entry is a stub for later.
     detector sees (with the motion mask behind it when `m` is on), the raw
     detections (`d`) and the tracked corridor objects mapped into that lane.
   The overlay on the photo above projects the same data back through the
-  lane quads; red ticks on a box mark an edge pinned to a corridor end
+  lane strip; red ticks on a box mark an edge pinned to a corridor end
   (object still entering / already leaving).
 
 ### Recording & playback
@@ -214,10 +228,21 @@ drag them back onto it.
 
 ### Lanes and corridors
 
-The geometry is configured, not detected. A **lane** is a four-corner quad
-on one lens-corrected camera pane (`tracking.layouts[].lanes[]`, corners
-TL,TR,BR,BL in pane UV) that is perspective-warped to an upright strip (at most
-`laneMaxWidth` px wide, at least `laneMinHeight` px high) before analysis.
+The geometry is configured, not detected. A **lane** is a strip on one
+lens-corrected camera pane (`tracking.layouts[].lanes[]`). `quad` is the
+four ends, TL, TR, BR, BL in pane UV. To follow a curve, add
+`top` and `bottom`: two polylines of the same length, left to right, pane
+UV. The first and last points are the quad's ends (`top` TL→TR, `bottom`
+BL→BR); the entries in between are the anchors you add in the editor.
+Omit `top`/`bottom` when the lane is just the four corners. Each slice
+between anchors is perspective-warped into the next section of one
+upright rectangle (at most `laneMaxWidth` px wide, at least
+`laneMinHeight` px high). Along-track position in that rectangle is the
+centreline length, so a bend keeps its share of the width. The lane view
+below the video, the detector and everything published (corridor `x`/`y`,
+the canvas box, UDP, the motion file) stay on that flat rectangle. The
+overlay on the photo maps them back through the same slices, so the box
+follows the curve on screen and is rectangular in the result.
 A **corridor** is the physical path an object follows (`train`, `boat`,
 …); one or more lanes feed it, each covering the corridor range `s0..s1`
 (lane x 0..1 maps linearly onto it, `s0 > s1` for a lane that sees the
@@ -318,20 +343,26 @@ matter of one more value):
    the viaduct is excluded permanently; a train behind it does not exist
    for the detector. Lane ends must be placed accordingly (see above).
 3. *Velocity comes from flow, not from the box,* and the coupling is cut
-   on purpose (a fragment must not flip the velocity). The price: a
-   systematic flow bias (fast preset, repetitive texture) is never
-   corrected from the box motion, and a track that has lost its
-   detections coasts at the last flow estimate.
+   on purpose (a fragment must not flip the velocity). The systematic
+   flow bias (repetitive texture) is now corrected by the learnt flow
+   gain (see *Tracker*), measured on free edges only — so an object that
+   never shows a free edge in the lane (corridor-long, both ends pinned
+   throughout) still runs on the corridor's gain from earlier objects,
+   or on the manual `flowGain`. The larger speed error is geometric: a
+   corridor unit is not the same distance everywhere along `s` (see *What
+   the gain cannot fix*), so a hidden train coasts at the rate of where
+   it was last seen.
 4. *Confirmation and stopping know size and motion, nothing about
    appearance.* Anything that moves coherently for `confirmFrames` and is
    large enough is an object; wake, glitter drift and cars behind the
    viaduct are held off by per-corridor size/speed limits, which is a
    dataset-specific fence, not a classifier.
 
-Beyond that, the honest next steps are (a) a measured velocity from the
-*box* (edge displacement over a few frames, weighted by how many edges
-are free), fused with the flow velocity — this removes the bias and lets a
-lost track coast on real motion; (b) a per-corridor appearance/size prior
+Beyond that, the honest next steps are (a) ~~a measured velocity from the
+box fused with the flow velocity~~ — done as the flow gain, see
+*Tracker*, which in turn showed that the remaining speed error is a rate
+profile along `s`, to be measured from free edges per position and
+applied to the coast; (b) a per-corridor appearance/size prior
 for confirmation (a boat is this long and sits on the water line) so wake
 and glitter are rejected on what they look like, not on how they move;
 (c) if outlines matter more than cost, a light segmentation model on the
@@ -382,8 +413,15 @@ agreement — a single frame in which a fragment does not reach the lane end
 no longer unpins and re-pins the edge, which was the dominant source of
 box jitter). Association is greedy by cost (along-axis
 gap, IoU, velocity difference) with a direction veto; leftover fragments
-within `absorbGapFrac` are absorbed into the matched track (1:N); two
-confirmed tracks travelling together for `mergeFrames` merge; a track that
+within `absorbGapFrac` that move at the track's speed (faster/slower
+ratio ≤ `absorbSpeedRatio`) are absorbed into the matched track (1:N); two
+confirmed tracks travelling together for `mergeFrames` merge, under the
+same speed-ratio rule. The ratio is loose for trains (3: a low-texture
+wagon fragment may read slow in the flow and must still join) and tight
+for boats (1.4 in the shipped config): a wake travels at about half the
+hull's speed, and a wake absorbed — or merged in as a tentative track,
+bringing its lane-end pin along — puts the box's rear edge on the wash,
+so the box stretched until the hull left (`rec_…15-48-29`); a track that
 dies and reappears where it was heading within `reacquireMs` inherits its
 id (boats passing under the bridge) — except one that coasted out past
 the far end: it has left the corridor, and nothing at that lane end can
@@ -396,6 +434,14 @@ and resumes with the same id only in the direction it arrived from. Only
 an object at least `stopMinWidthFrac` of the corridor long may halt — a
 car glimpsed behind the viaduct, a wake patch after the boat has gone, are
 too short to be a train or a boat and must not be parked for two minutes.
+Boats set `stopEnabled` false: a hull does not halt in the river, and the
+blob that does is the wake. It is deleted with its misses instead of
+being parked, and a slow death is not put in the reacquire graveyard, so
+the wash cannot inherit the id. A settled track also refuses a detection
+that is the wash behind it — opposite the direction it voted in, slower
+than `absorbSpeedRatio` allows, or lying entirely behind its rear edge
+(`rec_…16-04-00`, the boat that left and whose track then wandered back
+with the wake and stopped mid-corridor).
 
 Smoothing lives in the Kalman measurement noise: `posMeasNoise` (box
 edges) and `velMeasNoise` (flow velocity). Raising `posMeasNoise` from
@@ -403,11 +449,115 @@ edges) and `velMeasNoise` (flow velocity). Raising `posMeasNoise` from
 lag; the along-axis position is dominated by the pinned edges and the
 velocity anyway.
 
+**Flow gain** (`flowGain`, `flowGainLearn`, `flowGainWindow`,
+`flowGainSamples`, `flowGainMin` / `flowGainMax`, `flowGainAlpha`). The flow velocity is
+biased *low* on repetitive texture: DIS matches a wagon side one period
+short, the median over the blob is taken by those pixels, and the filter
+cannot correct it from the box because the position↔velocity coupling is
+cut on purpose (fast preset ≈ 45 % slow on trains, medium ≈ 10 %). A
+hidden train coasted on that value and fell further behind the longer it
+was covered. A *free* box edge, however, is placed by the mask and
+crosses the lane at the object's true speed. Every flow velocity that
+enters the filter is therefore multiplied by a gain: `flowGain` is the
+manual value (per corridor via `corridors.train.tracker.flowGain`) and
+the prior; with `flowGainLearn` the gain is measured. An edge counts as a
+speed sample in a frame only if it is unpinned before and after the
+update, not held or hidden by an oncoming object, not part of a fragment
+or inflated blob, at least `edgeBirthFrac` from the lane end on its
+side (the mask frays where the object fades into foliage), and more than
+0.1 corridor from an *internal* lane boundary (`dual`: the `train_M1` /
+`train_M2` ends at 0.58 and 0.37 — a blob edge there is cut by the lane
+geometry and stalls while the train does not; in `rec_…14-43-02` those
+stalls alone read as a 0.75 "bias"). The raw blob
+edge is used, not the silhouette-trimmed one — a silhouette ageing in and
+out would put a step into the window. Over `flowGainWindow` consecutive
+clean frames the least-squares slope of the edge is the box velocity; its
+ratio to the mean raw flow over the same window is one gain sample,
+accepted if the fit's residual RMS is under 1 % of the corridor (a
+fraying edge is not a speed), both agree on the sign, and both are
+above `minSpeedConfirm`; clamped to `[flowGainMin, flowGainMax]`. The
+track's gain follows the *median* of its last `flowGainSamples` accepted
+ratios at rate `flowGainAlpha` (a plain EMA was dragged by stalled-edge
+outliers) and a corridor-wide gain follows it at a quarter of that; a new
+track starts with the corridor's gain, so a train entering behind another
+one starts out corrected. `lastMatchVx`
+and the occluded coast read the corrected velocity, so a hidden train
+travels at its real speed. Nothing changes with `flowGainLearn` off and
+`flowGain` 1. The boat corridor turns learning *off*: a hull is smooth,
+its flow is not texture-biased, and the boat blob is not the hull — the
+mask runs over the disturbed water ahead of the bow, whose front edge
+moves ~20 % faster than the boat (measured on `rec_…15-48-29`), so the
+learnt gain over-corrected boats to 0.86 of their real speed. Trains in
+the single layouts measured 1.00–1.03 with learning on, from 1.02–1.09
+without (the published edge is attenuated toward 1 by the silhouette
+trim, so the raw flow under-read is somewhat larger than those numbers),
+with all gates and jitter unchanged. `vbias` in
+`tools/eval/score.py` reports both the ratio and the applied gain (`fg`
+in the debug dump).
+
+*What the gain cannot fix.* Measured on the raw blob edges, the ratio
+depends far more on *where* the edge is than on the flow: in `single` the
+same train reads 1.15–1.3 at its left edge and 0.8–0.95 at its right edge
+in both directions, i.e. a given physical speed is ~25 % fewer corridor
+units per second at `x ≈ 0.8` than at `x ≈ 0.4`; in `dual` both ends run
+at ~0.6 of the middle (a train fully in view has both edges at 0.57 of
+its flow). That is the lane mapping — the quad is a homography of the
+track plane, the train is a tall body seen obliquely, and the lens
+residual adds to it — not the flow. The learner therefore sees
+rate(edge) / rate(blob mass): per-track gains swing 0.7–1.6 within one
+pass as the clean edge changes, in `single` the net effect is the
++2–9 % above, in `dual` the clean edges are the compressed ends and the
+gain settles at 0.82–0.95 (hidden trains coast slower; all gates still
+pass, `omiss` rises only because the occluded phase lasts longer). This
+position dependence is also the likely remaining cause of a hidden train
+looking slow: it coasts at the corridor rate of where it was last seen
+(often an end), while the visible train in front moves at the middle
+rate. The remedy is a rate profile along `s` (or lane corners placed on
+the train's own height), not a scalar gain.
+
 **Lifecycle.** A track is *tentative* until it passes every confirmation
 gate, *confirmed* while it is seen, *occluded* while it coasts unseen,
 *stopped* while it is parked, and (from the output smoother only) *gone*
-while it fades out. Only confirmed objects are published. The gates, all
-in `tracking.tracker` and overridable per corridor:
+while it fades out. Only confirmed objects are published.
+
+**Candidates and verified objects.** The two layers are that one flag.
+A track starts as a *candidate* (`confirmed == false`, drawn with a ` ?`
+suffix) and becomes a *verified object* only when every gate below holds
+in the same frame. Candidates are what the water glitter is: a few frames
+of motion, no hull, dead after `tentativeMaxMisses` misses (default 3).
+They are not a second tracker — suppressing their creation would blind
+`hiddenRear` (an object appearing from behind one already verified) and
+id reacquisition. The overlay hides them unless `candidates (?)` is on
+(`?` key, GUI toggle, off by default); the status line still counts them
+(`+N tentative`). The batch contact sheets keep drawing them (a tuning
+artefact). Nothing else does: the output smoother, the UDP stream to the
+control software, the editor export and the motion file all drop
+`!confirmed`. Measured on all eleven annotated recordings (shipped
+config, old layouts for the September set): 40–140 candidates per
+recording, almost all of them in the boat corridor, and not one
+confirmed outside an annotated window — the 31 confirmed tracks are
+exactly the 31 annotated passes (`false=0` everywhere).
+
+A candidate confirms only when all of these hold (`tracking.tracker`,
+overridable per corridor):
+
+- **Lifetime** — `confirmFrames` matched frames (boat corridor: 20, about
+  0.7 s) with a settled direction (`dirVotes` ≥ min(`confirmFrames`, 3))
+  and speed at least `minSpeedConfirm`.
+- **Entry** — `edgeRule`: born clipped at a corridor end, or with its box
+  within `edgeBirthFrac` of one (boat 0.08, train 0.2). Exempt when the
+  track inherits an id, is born within `edgeGraceMs` of a reset, or
+  (`hiddenRear`) appears from behind an already confirmed object.
+- **Length** — `minConfirmLen` (train override 0.12 of the corridor).
+- **Outline** — `modelGate`: the segmentation model has found the
+  corridor's class on it at least once, and has not labelled another
+  class at least `modelGateOtherHits` times and more than twice as often.
+  No effect when the model is off.
+- **Not a shadow** — `shadowSuppress`: not a fragment or wake travelling
+  beside a confirmed object in the same direction (`shadowGapFrac`,
+  `shadowLateral`); once flagged, it stays a shadow.
+
+The gates in detail:
 
 - **Edge rule** (`edgeRule`, `edgeBirthFrac`, `edgeGraceMs`). Trains and
   boats come in through a corridor end. A track confirms only if it was
@@ -455,7 +605,8 @@ in `tracking.tracker` and overridable per corridor:
 moving is hidden, not gone: another train in front of it, a mast, the
 sun on the water. After `maxMisses` it switches to `occluded` and coasts
 at the velocity it was last seen with, size frozen (its rear pin is
-released so the box does not grow without end), until a detection moving
+released so the box does not grow without end — unless an oncoming object
+still overlaps it, in which case the pin is the hidden rear and stays), until a detection moving
 *its* way overlaps the prediction — then it continues under the same id,
 corrected to the new box — or its trailing edge has passed the far
 corridor end. The direction veto is unconditional while hidden: the
@@ -471,11 +622,12 @@ edge cannot keep a departed boat alive. An object that vanished *slowly*
 is still parked as `stopped` as before; `occludedMaxMs` is the safety
 cap. The stop rule is unchanged otherwise.
 
-**Shape-driven box** (`shapeBox`, `shapeBoxMaxAge`, `shapeBoxTrim`). While
+**Shape-driven box** (`shapeBox`, `shapeBoxMaxAge`, `shapeBoxTrim`,
+`shapeShrink`, `shapeShrinkFrames`). While
 a model silhouette no older than `shapeBoxMaxAge` frames exists for a
 confirmed object, its bounding box *trims* the motion blob before the
-blob becomes the Kalman position measurement: the published box follows
-the hull, not the wake the closing glued to it (a boat box with wake was
+blob becomes the Kalman position measurement: the tracker box is pulled
+toward the hull, not the wake the closing glued to it (a boat box with wake was
 ~3× the hull), the roof, not the dilated foreground. The blob stays the
 outer bound and the anchor — the silhouette lives in the box's own
 (padded) frame, so taken as the measurement itself it could only ever
@@ -484,6 +636,25 @@ fell short of the crop border; a corridor-long train lost two thirds of
 its box that way. A silhouette edge therefore counts only inside the
 blob and may take at most `shapeBoxTrim` of the blob's length / height
 off each end; an edge the blob has at a corridor end stays pinned there.
+The cap is 0.25 for trains and 0.45 for boats (shipped config): a boat is
+short and the model finds the hull reliably, while the wash behind the
+stern is often one blob with the hull and up to twice its length, so a
+quarter of the blob is not enough to get back to the hull. What the cap
+cannot undo is a single model frame that takes the white wash for boat:
+the box jumps out at once and the size-constancy rule then holds the
+inflated length (`rec_…15-48-29` at 23 s). `shapeShrink` is the way back
+out: once the silhouette has ended where the blob ends — both sides,
+within a fifth of the blob's length, both ends free of the corridor ends
+and of any occluder — for `shapeShrinkFrames` running frames, the short
+measurement is trusted and the box follows it instead of being held. A
+silhouette that runs *past* the blob never qualifies (the model sees more
+than the mask: a train whose flow mask broke up), so the hold stands for
+trains even with it on; it ships off everywhere and on for boats. On that
+recording the box stayed ~0.36 wide until the hull left; with the shrink it
+narrows as soon as the wake separates (0.38 at 26 s, 0.25 at 31 s) and is
+on the hull by the time the boat leaves (0.19 at 33 s, against 0.31 without
+it). The convergence takes a few seconds
+because the corrected measurement still goes through the filter.
 Merge priority uses the same feedback: a track with a model outline is
 never folded into one without — the survivor is the one the model found.
 These are the only three couplings from the shape estimator back into the
@@ -507,9 +678,16 @@ measured again and the output smoother glides the box to its real
 extent. A detection right next to a confirmed same-direction object is a
 fragment of it and never gets a hidden rear; a sliver sitting entirely
 inside the oncoming box (or shorter than `minConfirmLen`) is the same.
-The decision is taken only once the tentative track's direction has
-settled (three agreeing frames), not at birth — a wake fragment's first
-velocity sample can point the wrong way.
+The decision waits until the tentative track's direction has settled
+(three agreeing frames), not at birth — a wake fragment's first velocity
+sample can point the wrong way. It is not final while the blob is still a
+short sliver sitting in the oncoming box: the nose of a train coming out
+from behind another stays that way for about a second
+(`rec_2026-10-12_16-29-11` near frame 1100, once the lane hugs the rails),
+and giving up on that first look left the track unconfirmed for the whole
+pass. The check is repeated until the blob is long enough to pin, or until
+the rear is clearly not hidden (already in the lane, a same-direction
+fragment, or a full-size blob with nothing oncoming behind it).
 
 ### Object outline
 
@@ -625,6 +803,33 @@ job is that whatever is published never jumps — nothing feeds back.
   `fadeOutMs` (400) with phase `gone`; `presence` (0..1) is published per
   object. An id that comes back while fading (reacquire) ramps up again.
 
+### Result and raw
+
+`q` (GUI: `result data`) switches every view between the published result
+and the tracker's own box. Default is the result, which is also what UDP
+and the motion export send.
+
+For a **boat**, once the drawn outline is a real silhouette and not the
+rectangle stand-in, the published box is that outline's bounds and the
+published center is the center of that box. The velocity stays the flow
+velocity, so the arrow reports how the boat is moving but starts on the
+hull. The flow box is not stretched back to a corridor end: while the
+boat is only partly in frame the box is the visible hull, and `clipped`
+still says the object continues past the end. Until the first silhouette
+the outline is the flow rectangle, so result and raw match. The outline
+eases onto the hull, so the published box follows over a few frames. The
+path follows the result center. Smoothing of that box itself is the next
+step; this view is the place it will show.
+
+**Trains** keep the flow box as the result. The model outline usually
+covers less of a train than the motion box, and publishing it would make
+the train too short. Raw and result look the same for a train.
+
+Raw (`q` off) draws the flow box, its center and its trail. The outline
+is the same polygon in both modes, so the two can be compared directly.
+The flow box is never fed by the outline. The stats bar shows `result` or
+`raw`.
+
 ### Evaluation harness
 
 Headless batch mode processes recordings unpaced (~80 fps single, ~40 fps
@@ -660,7 +865,8 @@ frames (the format of `B3S-FacadeEditor/packages/frontend/public/camera/
 sample-motion-path.json`): frame `size` is the canvas (832×442 by default)
 and all object coordinates are canvas-normalized (0..1, see *Canvas
 placement*): per object `id`, `class`, `bbox` `[x, y, w, h]`, `x`/`y`
-(center), `vx`/`vy`/`speed`, `heading`/`heading_deg`, `phase`
+(center — for a boat, the center of the outline bounds; see *Result and raw*),
+`vx`/`vy`/`speed`, `heading`/`heading_deg`, `phase`
 (`entering|crossing|exiting|moving|stopped|occluded|gone`), `presence`
 (0..1 fade ramp, see *Output smoothing*), `clipped`, `region`, `fill`, a
 short `path`, and — extra — `outline` (the object's silhouette as a closed
@@ -692,8 +898,11 @@ The debug overlay (`o`) draws per object, in a stable per-id color: the
 shape pixels (`x`), the outline (`n`) and the bounding box (`b`) — each per
 lane it is visible in — plus center point, velocity arrow (1 s
 lookahead × `overlay.arrowScale`), fading trail, and `#id label phase
-speed shape:<source>`. Tentative tracks are dimmed with a `?`. The batch
-contact sheets and lane strips draw the outline together with the box.
+speed shape:<source>`. With `result data` on (the default) the box and
+the center are the published ones; `q` shows the flow box instead. Candidates (unconfirmed tracks) are hidden unless
+`candidates (?)` is on, and when shown are dimmed with a `?` — see
+*Candidates and verified objects*. The batch contact sheets and lane
+strips draw the outline together with the box, candidates included.
 
 ### Threading & decode
 

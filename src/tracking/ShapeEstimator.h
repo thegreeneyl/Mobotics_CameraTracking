@@ -13,6 +13,8 @@
 
 namespace tracking {
 
+struct LaneMap;
+
 struct ShapeConfig {
 	bool enabled = true;
 	// Silhouette source per frame:
@@ -86,7 +88,8 @@ public:
 		const LaneConfig * lane = nullptr;
 		const cv::Mat * mask = nullptr;       // fused motion mask, lane px, 8U
 		const cv::Mat * foreground = nullptr; // detector's shape mask, lane px, 8U
-		const cv::Mat * homography = nullptr; // pane px -> lane px, 3x3 CV_64F
+		const cv::Mat * homography = nullptr; // pane px -> lane px, 3x3 CV_64F (one slice)
+		const LaneMap * warp = nullptr;    // piecewise strip; used when it has more than one slice
 		int laneW = 0, laneH = 0;
 	};
 

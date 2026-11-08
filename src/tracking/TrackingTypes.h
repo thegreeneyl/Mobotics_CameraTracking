@@ -12,10 +12,14 @@
 //
 // Geometry model
 // --------------
-// A *lane* is a four-corner quad on one module pane (the viaduct band, the
-// river band). The pane is perspective-warped so the quad becomes an upright
-// rectangle; only pixels inside reach the detector. Detections come out in
-// lane-normalized coordinates (x 0..1 across the lane, y 0..1 down the lane).
+// A *lane* is a strip on one module pane (the viaduct band, the river band):
+// a top and a bottom border, each a polyline of the same length, left to
+// right. Two points per border is the old four-corner quad. Extra stations
+// let the strip follow a curve. Each slice between stations is
+// perspective-warped into the next section of one upright rectangle, so
+// detections still come out in lane-normalized coordinates (x 0..1 across
+// the lane, y 0..1 down the lane) and the published corridor stays
+// rectangular.
 //
 // A *corridor* is the physical object path (the rail line, the river). One or
 // more lanes feed a corridor; each lane maps its x range onto the corridor
@@ -81,22 +85,159 @@ struct FrameQuad {
 
 // One lane of a layout (see header comment).
 struct LaneConfig {
+	static constexpr int kMaxStations = 12; // points on each border, including the ends
+
 	std::string id;        // "train_M1"
 	int pane = 0;          // module pane index (0 = M1, 1 = M2)
 	std::string corridor;  // corridor id; the corridor's label is the class
-	FrameQuad quad;
+	FrameQuad quad;        // the four ends: TL, TR, BR, BL. Kept in sync with the borders.
+	// Border polylines in pane UV, left to right, same count. Empty means
+	// "just the quad" (top = TL->TR, bottom = BL->BR).
+	std::vector<std::array<float, 2>> top;
+	std::vector<std::array<float, 2>> bottom;
 	float s0 = 0, s1 = 1;  // corridor axis range covered by lane x 0..1
 	// Optional lateral band (lane y 0..1): detections whose vertical centre
 	// lies outside it are dropped before tracking. Lets a quad stay generous
 	// (lane height floor) while the road band behind the viaduct is ignored.
 	float yBand0 = 0, yBand1 = 1;
 
-	bool operator==(const LaneConfig & o) const {
-		return id == o.id && pane == o.pane && corridor == o.corridor && quad == o.quad
-			&& s0 == o.s0 && s1 == o.s1 && yBand0 == o.yBand0 && yBand1 == o.yBand1;
+	// Effective borders: the stored polylines, or the quad ends when unset.
+	void borders(std::vector<std::array<float, 2>> & topOut,
+	             std::vector<std::array<float, 2>> & bottomOut) const {
+		if(top.size() >= 2 && top.size() == bottom.size()){
+			topOut = top;
+			bottomOut = bottom;
+			return;
+		}
+		topOut = {quad.pts[0], quad.pts[1]};
+		bottomOut = {quad.pts[3], quad.pts[2]};
+	}
+	int stationCount() const {
+		return (top.size() >= 2 && top.size() == bottom.size()) ? static_cast<int>(top.size()) : 2;
 	}
 	bool hasYBand() const { return yBand0 > 0.0f || yBand1 < 1.0f; }
+
+	bool operator==(const LaneConfig & o) const {
+		if(id != o.id || pane != o.pane || corridor != o.corridor) return false;
+		if(s0 != o.s0 || s1 != o.s1 || yBand0 != o.yBand0 || yBand1 != o.yBand1) return false;
+		std::vector<std::array<float, 2>> ta, ba, tb, bb;
+		borders(ta, ba);
+		o.borders(tb, bb);
+		return ta == tb && ba == bb;
+	}
 	bool operator!=(const LaneConfig & o) const { return !(*this == o); }
+
+	void materializeBorders(){
+		if(top.size() >= 2 && top.size() == bottom.size()) return;
+		top = {quad.pts[0], quad.pts[1]};
+		bottom = {quad.pts[3], quad.pts[2]};
+	}
+	void syncQuadEnds(){
+		if(top.size() < 2 || top.size() != bottom.size()) return;
+		quad.pts[0] = top.front();
+		quad.pts[1] = top.back();
+		quad.pts[2] = bottom.back();
+		quad.pts[3] = bottom.front();
+	}
+
+	// Every slice TL,TR,BR,BL strictly convex and not collapsed, so each one
+	// has a homography. A crossed strip must not be warped.
+	bool isWarpable() const {
+		std::vector<std::array<float, 2>> t, b;
+		borders(t, b);
+		if(t.size() < 2) return false;
+		for(size_t i = 0; i + 1 < t.size(); i++){
+			const std::array<float, 2> p[4] = {t[i], t[i + 1], b[i + 1], b[i]};
+			const float span = std::hypot(t[i + 1][0] - t[i][0], t[i + 1][1] - t[i][1])
+			                 + std::hypot(b[i + 1][0] - b[i][0], b[i + 1][1] - b[i][1]);
+			if(span < 1e-3f) return false;
+			for(int k = 0; k < 4; k++){
+				const auto & a = p[k];
+				const auto & c = p[(k + 1) % 4];
+				const auto & d = p[(k + 2) % 4];
+				const float cross = (c[0] - a[0]) * (d[1] - c[1]) - (c[1] - a[1]) * (d[0] - c[0]);
+				if(cross <= 1e-6f) return false;
+			}
+		}
+		return true;
+	}
+
+	// Rectified aspect (width / height) from the border lengths in pane pixels.
+	// Two stations: identical to FrameQuad::aspect.
+	float aspect(float panePxW, float panePxH) const {
+		std::vector<std::array<float, 2>> t, b;
+		borders(t, b);
+		const auto len = [&](const std::array<float, 2> & p, const std::array<float, 2> & q){
+			return std::hypot((q[0] - p[0]) * panePxW, (q[1] - p[1]) * panePxH);
+		};
+		float w = 0, h = 0;
+		for(size_t i = 0; i + 1 < t.size(); i++){
+			w += 0.5f * (len(t[i], t[i + 1]) + len(b[i], b[i + 1]));
+		}
+		for(size_t i = 0; i < t.size(); i++) h += len(t[i], b[i]);
+		h /= static_cast<float>(std::max<size_t>(1, t.size()));
+		if(w <= 0 || h <= 0) return panePxH > 0 ? panePxW / panePxH : 1.0f;
+		return w / h;
+	}
+
+	// Centerline length and mean rib length, in pane pixels (the rectified size).
+	void stripSize(float panePxW, float panePxH, float & widthPx, float & heightPx) const {
+		std::vector<std::array<float, 2>> t, b;
+		borders(t, b);
+		const auto len = [&](const std::array<float, 2> & p, const std::array<float, 2> & q){
+			return std::hypot((q[0] - p[0]) * panePxW, (q[1] - p[1]) * panePxH);
+		};
+		widthPx = 0;
+		heightPx = 0;
+		for(size_t i = 0; i + 1 < t.size(); i++){
+			widthPx += 0.5f * (len(t[i], t[i + 1]) + len(b[i], b[i + 1]));
+		}
+		for(size_t i = 0; i < t.size(); i++) heightPx += len(t[i], b[i]);
+		heightPx /= static_cast<float>(std::max<size_t>(1, t.size()));
+	}
+
+	void setStation(int edge, int index, float x, float y){
+		materializeBorders();
+		if(index < 0 || index >= static_cast<int>(top.size())) return;
+		x = std::min(1.0f, std::max(0.0f, x));
+		y = std::min(1.0f, std::max(0.0f, y));
+		(edge == 0 ? top : bottom)[static_cast<size_t>(index)] = {x, y};
+		syncQuadEnds();
+	}
+
+	// Split slice `seg` at fraction t. The clicked border gets (x, y); the
+	// other border gets the point at the same fraction, so the new rib
+	// matches. Returns the new station index, or -1.
+	int insertStation(int edge, int seg, float t, float x, float y){
+		materializeBorders();
+		if(static_cast<int>(top.size()) >= kMaxStations) return -1;
+		if(seg < 0 || seg + 1 >= static_cast<int>(top.size())) return -1;
+		t = std::min(0.98f, std::max(0.02f, t));
+		const auto lerp = [](const std::array<float, 2> & a, const std::array<float, 2> & b, float u){
+			return std::array<float, 2>{a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u};
+		};
+		auto nt = lerp(top[static_cast<size_t>(seg)], top[static_cast<size_t>(seg + 1)], t);
+		auto nb = lerp(bottom[static_cast<size_t>(seg)], bottom[static_cast<size_t>(seg + 1)], t);
+		x = std::min(1.0f, std::max(0.0f, x));
+		y = std::min(1.0f, std::max(0.0f, y));
+		if(edge == 0) nt = {x, y};
+		else nb = {x, y};
+		const int at = seg + 1;
+		top.insert(top.begin() + at, nt);
+		bottom.insert(bottom.begin() + at, nb);
+		syncQuadEnds();
+		return at;
+	}
+
+	// Drops one station from both borders. The two ends stay.
+	bool removeStation(int index){
+		materializeBorders();
+		if(index <= 0 || index >= static_cast<int>(top.size()) - 1) return false;
+		top.erase(top.begin() + index);
+		bottom.erase(bottom.begin() + index);
+		syncQuadEnds();
+		return true;
+	}
 
 	// lane x (0..1) -> corridor s
 	float toCorridor(float x) const { return s0 + x * (s1 - s0); }
@@ -235,10 +376,20 @@ struct TrackedObject {
 	int id = 0;
 	std::string label;    // corridor label (class): train | boat | ...
 	std::string corridor; // corridor id
-	float x0 = 0, x1 = 0, y0 = 0, y1 = 0; // filtered bbox edges
-	float x = 0, y = 0;   // center
-	float w = 0, h = 0;   // size
-	float vx = 0, vy = 0; // velocity (fractions per second)
+	float x0 = 0, x1 = 0, y0 = 0, y1 = 0; // published bbox (see hullBox)
+	float x = 0, y = 0;   // published center
+	float w = 0, h = 0;   // published size
+	float vx = 0, vy = 0; // velocity (fractions per second); always the flow velocity
+	// Tracker box after output smoothing, before the result step. For a
+	// boat whose outline is a real silhouette the published box above is
+	// that outline's bounds and the center is the center of those bounds.
+	// These stay the flow box, which the raw view draws. Nothing here is
+	// fed back into the tracker. Trains are not replaced: the model
+	// outline covers less of a train than the flow box does.
+	float rawX0 = 0, rawX1 = 0, rawY0 = 0, rawY1 = 0;
+	float rawX = 0, rawY = 0, rawW = 0, rawH = 0;
+	std::vector<std::pair<float, float>> rawTrail; // flow-box centers
+	bool hullBox = false; // published box came from the outline
 	bool clippedLeft = false, clippedRight = false; // edge pinned at a corridor end
 	// entering | crossing | exiting | moving | stopped | occluded | gone
 	// (gone only from the output smoother, while the object fades out)
@@ -250,11 +401,14 @@ struct TrackedObject {
 	// born clipped at / within edgeBirthFrac of a corridor end (or inherited
 	// an id, or born right after a reset) — the edge rule's precondition
 	bool edgeBorn = true;
+	// multiplier the tracker applies to this object's flow velocity (see
+	// TrackerConfig::flowGain); 1 when learning is off. Diagnostic only.
+	float flowGain = 1.0f;
 	// 0..1 visibility ramp of the output smoother (fade in at birth, fade
 	// out after the tracker dropped the object); 1 straight from the tracker
 	float presence = 1.0f;
 	float colorR = 1, colorG = 1, colorB = 1; // stable per-id debug color
-	std::vector<std::pair<float, float>> trail; // recent centers, newest last
+	std::vector<std::pair<float, float>> trail; // published centers, newest last
 	ObjectShape shape; // silhouette (filled by the ShapeEstimator, not the tracker)
 };
 

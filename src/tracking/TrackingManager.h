@@ -15,6 +15,7 @@
 #include "MultiObjectTracker.h"
 #include "OutputSmoother.h"
 #include "ShapeEstimator.h"
+#include "LaneWarp.h"
 #include "TrackingTypes.h"
 #include "YoloDetector.h"
 #include "../util/LensCorrector.h"
@@ -142,7 +143,8 @@ private:
 	struct LanePipeline {
 		LaneConfig lane;
 		std::unique_ptr<IDetector> detector;
-		cv::Mat homography; // pane px -> lane px
+		LaneMap map;
+		cv::Mat homography; // pane px -> lane px; empty when the strip has more than one slice
 		int laneW = 0, laneH = 0;
 	};
 	struct CorridorPipeline {
@@ -153,6 +155,10 @@ private:
 		GroupingParams grouping;
 		std::map<int, ShapeFeedback> feedback; // shape estimator -> tracker, one frame late
 		OutputSmoother smoother;
+		// Published centers of boat tracks (outline center once a hull
+		// exists, the flow center until then). The tracker's own trail
+		// stays on TrackedObject::rawTrail for the raw view.
+		std::map<int, std::vector<std::pair<float, float>>> resultTrails;
 	};
 
 	void threadFn();
