@@ -20,17 +20,6 @@ namespace {
 // tracks — covers live<->playback switches and recording wraps.
 constexpr double kMaxGapMs = 5000.0;
 
-constexpr int kFlow = 0, kBgs = 1, kYolo = 2;
-
-int kindFromName(const std::string & n){
-	if(n == "yolo") return kYolo;
-	if(n == "bgs") return kBgs;
-	return kFlow;
-}
-const char * kindName(int k){
-	return k == kYolo ? "yolo" : k == kBgs ? "bgs" : "flow";
-}
-
 // Result presentation. The tracker box stays the measurement; this only
 // rewrites what is published. A boat with a real silhouette (not the
 // rectangle stand-in the smoother draws before the first outline) gets
@@ -130,7 +119,6 @@ void TrackingManager::setup(const TrackingConfig & config){
 	lensCorrector.set(cfg.lens);
 	shapes.setConfig(cfg.shape);
 	enabled = cfg.enabled;
-	detectorKind = kindFromName(cfg.detector);
 	running = true;
 	worker = std::thread(&TrackingManager::threadFn, this);
 }
@@ -141,7 +129,6 @@ void TrackingManager::setupSync(const TrackingConfig & config){
 	lensCorrector.set(cfg.lens);
 	shapes.setConfig(cfg.shape);
 	enabled = cfg.enabled;
-	detectorKind = kindFromName(cfg.detector);
 }
 
 void TrackingManager::stop(){
@@ -152,17 +139,7 @@ void TrackingManager::stop(){
 	corridors.clear();
 	shapes.reset();
 	builtPanes = 0;
-	builtKind = -1;
 	lastTMs = -1;
-}
-
-void TrackingManager::setDetectorType(const std::string & type){
-	detectorKind = kindFromName(type);
-	yoloUnavailable = false;
-}
-
-std::string TrackingManager::getDetectorType() const {
-	return kindName(detectorKind);
 }
 
 void TrackingManager::setSourceName(const std::string & name){
@@ -177,9 +154,9 @@ void TrackingManager::setLiveConfig(const TrackingConfig & config){
 	hasPendingCfg = true;
 }
 
-// Worker thread: pull the newest GUI tuning / source name into cfg. A
-// layout or source change invalidates the pipeline geometry -> rebuild;
-// parameter changes are pushed into the live detectors and trackers.
+// Worker thread: pull the newest config / source name into cfg. A layout
+// or source change invalidates the pipeline geometry -> rebuild; parameter
+// changes are pushed into the live detectors and trackers.
 void TrackingManager::applyPendingConfig(){
 	TrackingConfig next;
 	bool haveCfg = false;
@@ -212,13 +189,10 @@ void TrackingManager::applyPendingConfig(){
 		cfg.corridors = next.corridors;
 		cfg.canvas = next.canvas;
 		cfg.flow = next.flow;
-		cfg.bgs = next.bgs;
 		cfg.tracker = next.tracker;
 		cfg.smoothing = next.smoothing;
 		cfg.laneMaxWidth = next.laneMaxWidth;
 		cfg.laneMinHeight = next.laneMinHeight;
-		cfg.yolo.confThreshold = next.yolo.confThreshold;
-		cfg.yolo.nmsThreshold = next.yolo.nmsThreshold;
 		cfg.lens = next.lens;
 		// model path / input stay as loaded (startup-only); everything else
 		// in `shape` is live
@@ -255,13 +229,8 @@ void TrackingManager::applyPendingConfig(){
 
 void TrackingManager::applyParams(){
 	for(auto & lp : lanes){
-		const std::string & cid = lp.lane.corridor;
 		if(auto * f = dynamic_cast<FlowMotionDetector *>(lp.detector.get())){
-			f->setConfig(cfg.flowFor(cid));
-		}else if(auto * b = dynamic_cast<BgsDetector *>(lp.detector.get())){
-			b->setConfig(cfg.bgs);
-		}else if(auto * y = dynamic_cast<YoloDetector *>(lp.detector.get())){
-			y->setThresholds(cfg.yolo.confThreshold, cfg.yolo.nmsThreshold);
+			f->setConfig(cfg.flowFor(lp.lane.corridor));
 		}
 	}
 	for(auto & cp : corridors){
@@ -325,14 +294,6 @@ LayoutConfig TrackingManager::findLayout(const std::vector<LayoutConfig> & layou
 	return fallbackLayout(paneCount);
 }
 
-std::unique_ptr<IDetector> TrackingManager::makeDetector(const std::string & corridorId){
-	switch(builtKind){
-		case kYolo: return std::make_unique<YoloDetector>(cfg.yolo);
-		case kBgs: return std::make_unique<BgsDetector>(cfg.bgs);
-		default: return std::make_unique<FlowMotionDetector>(cfg.flowFor(corridorId));
-	}
-}
-
 void TrackingManager::retargetMaps(int originX, int originY){
 	const float iw = static_cast<float>(builtPaneW);
 	const float ih = static_cast<float>(builtPaneH);
@@ -349,19 +310,6 @@ void TrackingManager::retargetMaps(int originX, int originY){
 void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH, int originX, int originY){
 	lanes.clear();
 	corridors.clear();
-
-	builtKind = detectorKind;
-	if(builtKind == kYolo){
-		auto probe = std::make_unique<YoloDetector>(cfg.yolo);
-		if(!probe->isLoaded()){
-			ofLogWarning("TrackingManager")
-				<< "YOLO model not available (" << cfg.yolo.modelPath
-				<< ") — falling back to optical flow";
-			detectorKind = kFlow;
-			builtKind = kFlow;
-			yoloUnavailable = true;
-		}
-	}
 
 	const LayoutConfig layout = findLayout(cfg.layouts, paneCount, cfg.sourceName);
 	layoutName = layout.name;
@@ -382,7 +330,7 @@ void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH, int 
 		lp.map.rectifiedSize(cfg.laneMaxWidth, cfg.laneMinHeight, paneH, lp.laneW, lp.laneH);
 		lp.map.prepare(lp.laneW, lp.laneH);
 		lp.homography = lp.map.paneToLane;
-		lp.detector = makeDetector(lane.corridor);
+		lp.detector = std::make_unique<FlowMotionDetector>(cfg.flowFor(lane.corridor));
 		lanes.push_back(std::move(lp));
 	}
 
@@ -421,8 +369,7 @@ void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH, int 
 	lastTMs = -1;
 	ofLogNotice("TrackingManager")
 		<< "layout '" << layoutName << "' for " << paneCount << " pane(s), "
-		<< lanes.size() << " lane(s), " << corridors.size() << " corridor(s), detector "
-		<< kindName(builtKind);
+		<< lanes.size() << " lane(s), " << corridors.size() << " corridor(s)";
 }
 
 // ------------------------------------------------------------------- worker
@@ -455,16 +402,13 @@ void TrackingManager::threadFn(){
 
 bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs, TrackingResults & res){
 	applyPendingConfig();
-	int wantKind = detectorKind;
-	if(wantKind == kYolo && yoloUnavailable) wantKind = kFlow;
 
 	// Analysis decode: reduced scaled decode of only what is needed —
-	// grayscale for flow/bgs, BGR for YOLO or when the shape estimator's
+	// grayscale for the flow detector, BGR when the shape estimator's
 	// segmentation model is on (the detector then gets a gray copy).
 	const double t0 = nowMs();
-	bool shapeColor = shapes.wantsColor(cfg.shape);
-	for(const auto & cc : cfg.corridors) shapeColor = shapeColor || shapes.wantsColor(cfg.shapeFor(cc.id));
-	const bool wantColor = wantKind == kYolo || shapeColor;
+	bool wantColor = shapes.wantsColor(cfg.shape);
+	for(const auto & cc : cfg.corridors) wantColor = wantColor || shapes.wantsColor(cfg.shapeFor(cc.id));
 	cv::Mat full, fullBgr;
 	const bool decoded = wantColor
 		? jpegdecode::decodeToBgrMat(data, size, full, cfg.analysisReduce)
@@ -480,7 +424,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	}
 	if(wantColor){
 		fullBgr = full;
-		if(wantKind != kYolo) cv::cvtColor(fullBgr, full, cv::COLOR_BGR2GRAY);
+		cv::cvtColor(fullBgr, full, cv::COLOR_BGR2GRAY);
 	}
 	const double decodeMs = nowMs() - t0;
 
@@ -498,7 +442,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	const int originY = g.innerW > 0 ? g.innerY : 0;
 
 	if(resetRequested.exchange(false)) builtPanes = 0;
-	if(builtPanes != paneCount || builtPaneW != innerW || builtPaneH != innerH || builtKind != wantKind){
+	if(builtPanes != paneCount || builtPaneW != innerW || builtPaneH != innerH){
 		rebuildPipelines(paneCount, innerW, innerH, originX, originY);
 	}else if(builtOriginX != originX || builtOriginY != originY){
 		retargetMaps(originX, originY);
@@ -653,7 +597,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	res.lensInnerY = originY;
 	res.lensInnerW = innerW;
 	res.lensInnerH = innerH;
-	res.detectorName = kindName(builtKind);
+	res.detectorName = lanes.empty() ? std::string("flow") : lanes.front().detector->name();
 	return true;
 }
 

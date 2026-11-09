@@ -312,8 +312,6 @@ bool MotionPathRecording::save(const std::string & path, const std::string & not
 			{"frame_count", frames.size()},
 			{"duration_s", frames.empty() ? 0.0 : round4(lastTSec + 1.0 / f)},
 			{"size", {sizeW, sizeH}},
-			{"live", {{"transport", "udp"}, {"host", "127.0.0.1"}, {"port", 8765},
-			          {"note", "In production each frames[] item is one UDP datagram."}}},
 			{"frames", frames},
 		};
 	}

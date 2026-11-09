@@ -321,13 +321,13 @@ struct LayoutConfig {
 struct Detection {
 	float x0 = 0, x1 = 0, y0 = 0, y1 = 0; // bbox edges
 	float vx = 0, vy = 0;      // measured velocity (units per second)
-	bool hasVelocity = false;  // false for detectors without flow (bgs/yolo)
+	bool hasVelocity = false;  // false for a detector without flow
 	float coherence = 1.0f;    // 0..1 flow agreement inside the blob
 	float area = 0;            // moving-pixel area (normalized units^2), merge weight
 	float confidence = 1.0f;
 	bool touchesLeft = false, touchesRight = false; // clipped at a lane/corridor end
 	int lane = -1;
-	std::string label; // empty = unknown (bgs/flow); COCO name for yolo
+	std::string label; // empty = unknown; a COCO class name when a model named it
 
 	float cx() const { return (x0 + x1) * 0.5f; }
 	float cy() const { return (y0 + y1) * 0.5f; }
@@ -469,7 +469,7 @@ struct TrackingResults {
 	// in the recovered border is outside 0..1. Zero inner size means the
 	// pane is the filled frame (no border).
 	int lensInnerX = 0, lensInnerY = 0, lensInnerW = 0, lensInnerH = 0;
-	std::string detectorName; // "flow" | "bgs" | "yolo"
+	std::string detectorName; // IDetector::name() of the lane detectors ("flow")
 	uint64_t revision = 0;    // increments per published frame
 };
 

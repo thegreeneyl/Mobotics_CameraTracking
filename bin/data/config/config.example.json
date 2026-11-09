@@ -1,18 +1,25 @@
 {
+  "cameras": [
+    {
+      "id": "north_dual",
+      "enabled": true,
+      "host": "192.168.178.230",
+      "user": "admin",
+      "password": "",
+      "stream": "full",
+      "fps": 0,
+      "preview": false,
+      "previewSize": "1280x720",
+      "quality": 60
+    }
+  ],
   "recordingsDir": "recordings",
   "display": {
-    "decodeScale": 2
-  },
-  "output": {
-    "udp": {
-      "enabled": false,
-      "host": "127.0.0.1",
-      "port": 8765
-    }
+    "decodeScale": 2,
+    "arrowScale": 1.0
   },
   "tracking": {
     "enabled": true,
-    "detector": "flow",
     "analysisReduce": 2,
     "laneMaxWidth": 800,
     "laneMinHeight": 96,
@@ -56,15 +63,6 @@
       "lockAxis": false,
       "maxDetections": 8,
       "edgeMarginPx": 3
-    },
-    "bgs": {
-      "history": 500,
-      "varThreshold": 16,
-      "learningRate": -1,
-      "minAreaNorm": 0.0005,
-      "maxAreaNorm": 0.5,
-      "morphOpen": 3,
-      "morphClose": 9
     },
     "tracker": {
       "confirmFrames": 4,
@@ -122,7 +120,8 @@
       "shapeBoxTrim": 0.25,
       "shapeShrink": false,
       "shapeShrinkFrames": 8,
-      "hiddenRear": true
+      "hiddenRear": true,
+      "trailLen": 30
     },
     "shape": {
       "enabled": true,
@@ -160,22 +159,9 @@
       "fadeInMs": 300,
       "fadeOutMs": 400
     },
-    "yolo": {
-      "model": "models/yolov8n.onnx",
-      "inputSize": 640,
-      "confThreshold": 0.35,
-      "nmsThreshold": 0.45,
-      "classes": [
-        "train",
-        "boat",
-        "car",
-        "truck",
-        "bus"
-      ]
-    },
-    "overlay": {
-      "arrowScale": 1.0,
-      "trailFrames": 30
+    "canvas": {
+      "width": 832,
+      "height": 442
     },
     "corridors": {
       "train": {
@@ -464,31 +450,6 @@
           }
         ]
       }
-    ],
-    "canvas": {
-      "width": 832,
-      "height": 442
-    }
-  },
-  "cameras": [
-    {
-      "id": "north_dual",
-      "enabled": true,
-      "host": "192.168.178.230",
-      "user": "admin",
-      "password": "",
-      "stream": "full",
-      "fps": 0,
-      "preview": false,
-      "previewSize": "1280x720",
-      "quality": 60
-    },
-    {
-      "id": "west_brightness",
-      "enabled": false,
-      "host": "0.0.0.0",
-      "user": "admin",
-      "password": ""
-    }
-  ]
+    ]
+  }
 }

@@ -87,21 +87,42 @@ ofJson overridesJson(const std::map<std::string, double> & o, const std::vector<
 	}
 	return obj;
 }
+
+// Applies every numeric/bool member of obj through a TrackingParams setter,
+// warning about keys the schema does not know.
+template <typename Target, typename Setter>
+void applyParams(const ofJson & obj, Target & target, Setter setter, const char * section){
+	if(!obj.is_object()) return;
+	for(auto it = obj.begin(); it != obj.end(); ++it){
+		double v = 0;
+		if(it->is_boolean()) v = it->get<bool>() ? 1 : 0;
+		else if(it->is_number()) v = it->get<double>();
+		else continue;
+		if(!setter(target, it.key(), v)){
+			ofLogWarning("TrackingConfig") << "unknown " << section << " parameter '" << it.key() << "'";
+		}
+	}
+}
 } // namespace
 
 LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
                                         const std::function<std::string(const std::string &)> & resolvePath){
 	LoadedTrackingConfig out;
 	out.recordingsDir = root.value("recordingsDir", std::string("recordings"));
-	if(root.contains("display")){
-		out.displayDecodeScale = root["display"].value("decodeScale", 2);
+	bool haveArrowScale = false;
+	if(root.contains("display") && root["display"].is_object()){
+		const auto & d = root["display"];
+		out.displayDecodeScale = d.value("decodeScale", 2);
+		if(d.contains("arrowScale")){
+			out.displayArrowScale = d.value("arrowScale", 1.0f);
+			haveArrowScale = true;
+		}
 	}
 	TrackingConfig & c = out.config;
-	if(!root.contains("tracking")) return out;
+	if(!root.contains("tracking") || !root["tracking"].is_object()) return out;
 	const auto & t = root["tracking"];
 
 	c.enabled = t.value("enabled", true);
-	c.detector = t.value("detector", std::string("flow"));
 	c.analysisReduce = t.value("analysisReduce", 2);
 	c.laneMaxWidth = t.value("laneMaxWidth", 800);
 	c.laneMinHeight = t.value("laneMinHeight", 64);
@@ -118,83 +139,34 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 		c.lens.centerY = l.value("centerY", c.lens.centerY);
 	}
 
-	if(t.contains("flow") && t["flow"].is_object()){
-		for(auto it = t["flow"].begin(); it != t["flow"].end(); ++it){
-			double v = 0;
-			if(it->is_boolean()) v = it->get<bool>() ? 1 : 0;
-			else if(it->is_number()) v = it->get<double>();
-			else continue;
-			if(!setFlowParam(c.flow, it.key(), v)){
-				ofLogWarning("TrackingConfig") << "unknown flow parameter '" << it.key() << "'";
-			}
-		}
-	}
-	if(t.contains("bgs")){
-		const auto & b = t["bgs"];
-		c.bgs.history = b.value("history", 500);
-		c.bgs.varThreshold = b.value("varThreshold", 16.0);
-		c.bgs.learningRate = b.value("learningRate", -1.0);
-		c.bgs.minAreaNorm = b.value("minAreaNorm", 0.0005f);
-		c.bgs.maxAreaNorm = b.value("maxAreaNorm", 0.5f);
-		c.bgs.morphOpenPx = b.value("morphOpen", 3);
-		c.bgs.morphClosePx = b.value("morphClose", 9);
-	}
-	if(t.contains("tracker") && t["tracker"].is_object()){
-		for(auto it = t["tracker"].begin(); it != t["tracker"].end(); ++it){
-			double v = 0;
-			if(it->is_boolean()) v = it->get<bool>() ? 1 : 0;
-			else if(it->is_number()) v = it->get<double>();
-			else continue;
-			if(!setTrackerParam(c.tracker, it.key(), v)){
-				ofLogWarning("TrackingConfig") << "unknown tracker parameter '" << it.key() << "'";
-			}
-		}
-	}
+	if(t.contains("flow")) applyParams(t["flow"], c.flow, setFlowParam, "flow");
+	if(t.contains("tracker")) applyParams(t["tracker"], c.tracker, setTrackerParam, "tracker");
 	// shape: flat ShapeEstimator parameters plus "model" (ONNX path)
 	c.shape.modelFile = "models/yolov8n-seg.onnx";
 	if(t.contains("shape") && t["shape"].is_object()){
-		for(auto it = t["shape"].begin(); it != t["shape"].end(); ++it){
-			if(it.key() == "model"){
-				if(it->is_string()) c.shape.modelFile = it->get<std::string>();
-				continue;
-			}
-			double v = 0;
-			if(it->is_boolean()) v = it->get<bool>() ? 1 : 0;
-			else if(it->is_number()) v = it->get<double>();
-			else continue;
-			if(!setShapeParam(c.shape, it.key(), v)){
-				ofLogWarning("TrackingConfig") << "unknown shape parameter '" << it.key() << "'";
-			}
+		ofJson shape = t["shape"];
+		if(shape.contains("model")){
+			if(shape["model"].is_string()) c.shape.modelFile = shape["model"].get<std::string>();
+			shape.erase("model");
 		}
+		applyParams(shape, c.shape, setShapeParam, "shape");
 	}
 	c.shape.modelPath = c.shape.modelFile.empty() ? std::string() : resolvePath(c.shape.modelFile);
-	// smoothing: flat OutputSmoother parameters
-	if(t.contains("smoothing") && t["smoothing"].is_object()){
-		for(auto it = t["smoothing"].begin(); it != t["smoothing"].end(); ++it){
-			double v = 0;
-			if(it->is_boolean()) v = it->get<bool>() ? 1 : 0;
-			else if(it->is_number()) v = it->get<double>();
-			else continue;
-			if(!setSmoothParam(c.smoothing, it.key(), v)){
-				ofLogWarning("TrackingConfig") << "unknown smoothing parameter '" << it.key() << "'";
-			}
-		}
-	}
-	if(t.contains("yolo")){
-		const auto & y = t["yolo"];
-		c.yolo.modelPath = resolvePath(y.value("model", std::string("models/yolov8n.onnx")));
-		c.yolo.inputSize = y.value("inputSize", 640);
-		c.yolo.confThreshold = y.value("confThreshold", 0.35f);
-		c.yolo.nmsThreshold = y.value("nmsThreshold", 0.45f);
-		c.yolo.classFilter.clear();
-		if(y.contains("classes") && y["classes"].is_array()){
-			for(const auto & cls : y["classes"]) c.yolo.classFilter.push_back(cls.get<std::string>());
-		}
-	}
-	if(t.contains("overlay")){
+	if(t.contains("smoothing")) applyParams(t["smoothing"], c.smoothing, setSmoothParam, "smoothing");
+
+	// Older documents. Read once, then gone on the next save.
+	if(t.contains("overlay") && t["overlay"].is_object()){
 		const auto & o = t["overlay"];
-		out.overlayArrowScale = o.value("arrowScale", 1.0f);
-		c.tracker.trailLen = o.value("trailFrames", c.tracker.trailLen);
+		if(!haveArrowScale) out.displayArrowScale = o.value("arrowScale", 1.0f);
+		if(!(t.contains("tracker") && t["tracker"].is_object() && t["tracker"].contains("trailLen"))){
+			c.tracker.trailLen = o.value("trailFrames", c.tracker.trailLen);
+		}
+		ofLogNotice("TrackingConfig") << "legacy key tracking.overlay read (now display.arrowScale / tracker.trailLen)";
+	}
+	for(const char * legacy : {"detector", "bgs", "yolo"}){
+		if(t.contains(legacy)){
+			ofLogNotice("TrackingConfig") << "legacy key tracking." << legacy << " ignored (flow is the only detector)";
+		}
 	}
 
 	// canvas: {"width": 832, "height": 442} — output proportions
@@ -271,9 +243,14 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 	return out;
 }
 
-void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overlayArrowScale){
-	auto & t = root["tracking"];
-	t["detector"] = cfg.detector;
+ofJson displayJson(int decodeScale, float arrowScale){
+	return {{"decodeScale", decodeScale}, {"arrowScale", arrowScale}};
+}
+
+ofJson trackingJson(const TrackingConfig & cfg){
+	ofJson t = ofJson::object();
+	t["enabled"] = cfg.enabled;
+	t["analysisReduce"] = cfg.analysisReduce;
 	t["laneMaxWidth"] = cfg.laneMaxWidth;
 	t["laneMinHeight"] = cfg.laneMinHeight;
 	t["lens"] = {
@@ -288,24 +265,11 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 		{"centerY", cfg.lens.centerY},
 	};
 	t["flow"] = paramsJson(flowParams(cfg.flow));
-	t["bgs"]["history"] = cfg.bgs.history;
-	t["bgs"]["varThreshold"] = cfg.bgs.varThreshold;
-	t["bgs"]["learningRate"] = cfg.bgs.learningRate;
-	t["bgs"]["minAreaNorm"] = cfg.bgs.minAreaNorm;
-	t["bgs"]["maxAreaNorm"] = cfg.bgs.maxAreaNorm;
-	t["bgs"]["morphOpen"] = cfg.bgs.morphOpenPx;
-	t["bgs"]["morphClose"] = cfg.bgs.morphClosePx;
-	ofJson tracker = paramsJson(trackerParams(cfg.tracker));
-	tracker.erase("trailLen"); // lives under overlay.trailFrames
-	t["tracker"] = tracker;
+	t["tracker"] = paramsJson(trackerParams(cfg.tracker));
 	ofJson shape = paramsJson(shapeParams(cfg.shape));
 	shape["model"] = cfg.shape.modelFile;
 	t["shape"] = shape;
 	t["smoothing"] = paramsJson(smoothParams(cfg.smoothing));
-	t["yolo"]["confThreshold"] = cfg.yolo.confThreshold;
-	t["yolo"]["nmsThreshold"] = cfg.yolo.nmsThreshold;
-	t["overlay"]["arrowScale"] = overlayArrowScale;
-	t["overlay"]["trailFrames"] = cfg.tracker.trailLen;
 
 	t["canvas"]["width"] = cfg.canvas.width;
 	t["canvas"]["height"] = cfg.canvas.height;
@@ -355,8 +319,7 @@ void writeTrackingTuning(ofJson & root, const TrackingConfig & cfg, float overla
 		layouts.push_back(lj);
 	}
 	t["layouts"] = layouts;
-	t.erase("zones");
-	t.erase("frames");
+	return t;
 }
 
 } // namespace tracking

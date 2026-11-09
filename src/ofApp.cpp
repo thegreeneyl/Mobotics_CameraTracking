@@ -1,22 +1,18 @@
 #include "ofApp.h"
 
-#include <chrono>
-
-#include <opencv2/imgproc.hpp>
+#include <algorithm>
+#include <cmath>
 
 #include "output/MotionPathWriter.h"
 #include "tracking/LaneWarp.h"
-#include "tracking/TrackingConfigJson.h"
-#include "tracking/TrackingParams.h"
+
+using Mode = CameraTrackingSession::Mode;
 
 namespace {
-constexpr double kSettingsDebounceMs = 600;
-// Live tracking tuning is pushed to the worker at most this often while a
-// slider moves (avoids recreating the MOG2 model on every slider pixel).
-constexpr double kTuningPushIntervalMs = 250;
 constexpr float kFrameHandleRadius = 6;     // drawn size
 constexpr float kFrameHandleHitRadius = 12; // mouse pick radius
 constexpr float kMaxArrow = 0.25f;          // velocity arrow clamp (lane widths)
+constexpr float kBarHeight = 64;            // stats bar at the bottom
 
 // Lane-normalized (u, v) -> screen, through the strip's piecewise homography.
 // The map was built in the pane's own pixel space, so pane-local px plus the
@@ -61,47 +57,6 @@ bool nearestBorder(const tracking::LaneConfig & lane, const ofRectangle & pane,
 	return hit;
 }
 
-bool sameParams(const std::vector<tracking::ParamInfo> & a, const std::vector<tracking::ParamInfo> & b){
-	if(a.size() != b.size()) return false;
-	for(size_t i = 0; i < a.size(); i++){
-		if(a[i].key != b[i].key || a[i].value != b[i].value) return false;
-	}
-	return true;
-}
-
-bool sameLayouts(const std::vector<tracking::LayoutConfig> & a, const std::vector<tracking::LayoutConfig> & b){
-	if(a.size() != b.size()) return false;
-	for(size_t i = 0; i < a.size(); i++){
-		if(a[i].name != b[i].name || a[i].panes != b[i].panes
-		   || a[i].recordings != b[i].recordings || a[i].lanes != b[i].lanes) return false;
-	}
-	return true;
-}
-
-bool sameCorridors(const std::vector<tracking::CorridorConfig> & a, const std::vector<tracking::CorridorConfig> & b){
-	if(a.size() != b.size()) return false;
-	for(size_t i = 0; i < a.size(); i++){
-		if(a[i].id != b[i].id || a[i].label != b[i].label || a[i].placement != b[i].placement
-		   || a[i].flow != b[i].flow || a[i].tracker != b[i].tracker || a[i].shape != b[i].shape) return false;
-	}
-	return true;
-}
-
-// Fieldwise comparison of the live-tunable parts of a TrackingConfig.
-bool tuningEquals(const tracking::TrackingConfig & a, const tracking::TrackingConfig & b){
-	return sameParams(tracking::flowParams(a.flow), tracking::flowParams(b.flow))
-		&& sameParams(tracking::trackerParams(a.tracker), tracking::trackerParams(b.tracker))
-		&& sameParams(tracking::shapeParams(a.shape), tracking::shapeParams(b.shape))
-		&& a.bgs.history == b.bgs.history
-		&& a.bgs.varThreshold == b.bgs.varThreshold
-		&& a.yolo.confThreshold == b.yolo.confThreshold
-		&& a.yolo.nmsThreshold == b.yolo.nmsThreshold
-		&& a.canvas == b.canvas
-		&& a.lens == b.lens
-		&& sameCorridors(a.corridors, b.corridors)
-		&& sameLayouts(a.layouts, b.layouts);
-}
-
 // Stable colour per corridor id for the canvas view.
 ofColor corridorColor(const std::string & id){
 	uint32_t h = 2166136261u;
@@ -122,12 +77,6 @@ void endScissor(){
 	glDisable(GL_SCISSOR_TEST);
 }
 
-std::string formatLux(float lux){
-	return lux < 0 ? "n/a" : ofToString(lux, 1) + " lx";
-}
-std::string formatTemp(float temp){
-	return temp < 0 ? "n/a" : ofToString(temp, 1) + " C";
-}
 std::string formatClock(double ms){
 	const int totalSec = static_cast<int>(ms / 1000.0);
 	const int m = totalSec / 60;
@@ -135,17 +84,11 @@ std::string formatClock(double ms){
 	return ofToString(m, 2, '0') + ":" + ofToString(s, 2, '0');
 }
 
-double wallClockSec(){
-	using namespace std::chrono;
-	return duration<double>(system_clock::now().time_since_epoch()).count();
-}
-
 // ofTexture::loadData only reallocates when the new frame is LARGER than the
 // current allocation; a smaller frame is uploaded into a sub-region and the
 // texture keeps its old size (and stale pixels outside the region). Frame
 // sizes change when playback cycles between dual- and single-camera
-// recordings, when toggling half-res decode, or live when toggling the
-// preview stream — so reallocate whenever the dimensions differ.
+// recordings — so reallocate whenever the dimensions differ.
 void loadFrameTexture(ofTexture & tex, const ofPixels & pixels){
 	if(tex.isAllocated()
 	   && (static_cast<size_t>(tex.getWidth()) != pixels.getWidth()
@@ -154,9 +97,6 @@ void loadFrameTexture(ofTexture & tex, const ofPixels & pixels){
 	}
 	tex.loadData(pixels);
 }
-
-// The picture on screen is the lens-corrected frame. src stays untouched
-// so the same pixels can be rewarped when the sliders move.
 
 // Draws one corrected pane. paneOut is the bright filled frame (lane UV
 // 0..1). The recovered border around it is veiled, so the pixels the crop
@@ -190,6 +130,8 @@ void drawCorrectedPane(const ofTexture & tex, float texX, float texW, float texH
 	ofSetColor(255);
 }
 
+// Stations stay inside the recovered picture (the bright frame plus the
+// dim border). Past that there is no sensor pixel.
 void clampLaneDrag(const LensGeometry & g, const ofRectangle & pane, int x, int y, float & u, float & v){
 	u = pane.width > 0 ? (x - pane.x) / pane.width : 0.0f;
 	v = pane.height > 0 ? (y - pane.y) / pane.height : 0.0f;
@@ -197,21 +139,6 @@ void clampLaneDrag(const LensGeometry & g, const ofRectangle & pane, int x, int 
 	g.uvLimits(u0, v0, u1, v1);
 	u = std::min(u1, std::max(u0, u));
 	v = std::min(v1, std::max(v0, v));
-}
-void uploadCorrected(ofTexture & tex, const ofPixels & src, LensCorrector & corr){
-	if(!src.isAllocated()) return;
-	const int w = static_cast<int>(src.getWidth());
-	const int h = static_cast<int>(src.getHeight());
-	const int ch = static_cast<int>(src.getNumChannels());
-	const int type = ch == 4 ? CV_8UC4 : ch == 3 ? CV_8UC3 : CV_8UC1;
-	const cv::Mat in(h, w, type, const_cast<unsigned char *>(src.getData()), src.getBytesStride());
-	cv::Mat out;
-	corr.apply(in, out);
-	if(out.empty()) return;
-	ofPixels pix;
-	const ofPixelFormat fmt = ch == 4 ? OF_PIXELS_RGBA : ch == 3 ? OF_PIXELS_RGB : OF_PIXELS_GRAY;
-	pix.setFromPixels(out.data, static_cast<size_t>(out.cols), static_cast<size_t>(out.rows), fmt);
-	loadFrameTexture(tex, pix);
 }
 
 ofColor objectColor(const tracking::TrackedObject & obj){
@@ -311,15 +238,21 @@ void ofApp::setup(){
 	ofSetVerticalSync(true);
 	ofBackground(12);
 
-	loadConfig();
+	session.load("config/config.json");
 
-	gui.setup("stream", "gui.xml");
-	gui.add(previewParam);
-	gui.add(qualityParam);
-	gui.add(showComDumpParam);
+	// Headless runs: CAMTRACK_AUTOPLAYBACK=1 starts in playback mode
+	// (tracking against a recording, no camera); CAMTRACK_RECORDINGS
+	// overrides the recordings folder, so a single recording can be played
+	// by pointing it at a folder holding just that one. CAMTRACK_AUTOEXPORT=1
+	// starts a motion export right away.
+	if(std::getenv("CAMTRACK_AUTOPLAYBACK")){
+		if(const char * dir = std::getenv("CAMTRACK_RECORDINGS")) session.setRecordingsDir(ofToDataPath(dir, true));
+	}
+
+	gui.setup("camera tracking", "gui.xml");
+	gui.add(playbackParam);
 	gui.add(recordParam);
 	gui.add(exportParam);
-	gui.add(playbackParam);
 	gui.add(trackingParam);
 	gui.add(overlayParam);
 	gui.add(imageScaleParam);
@@ -329,11 +262,7 @@ void ofApp::setup(){
 	gui.add(showOutlineParam);
 	gui.add(showBoxParam);
 	gui.add(showResultParam);
-	gui.add(showCandidatesParam);
 	gui.add(resultViewParam);
-	gui.add(detectorParam);
-	gui.add(halfResParam);
-	gui.add(udpParam);
 	reconnectButton.setup("reconnect (r)");
 	gui.add(&reconnectButton);
 	gui.setPosition(10, 10);
@@ -360,124 +289,37 @@ void ofApp::setup(){
 	prevRecordingButton.addListener(this, &ofApp::onPrevRecordingPressed);
 	nextRecordingButton.addListener(this, &ofApp::onNextRecordingPressed);
 
-	// tracking tuning panel. Values always come from config.json (assigned
-	// below, after setup — so a stale tracking_gui.xml can never shadow the
-	// config) and go back to config.json via the save button.
-	trackingGui.setup("tracking", "tracking_gui.xml");
-	trackingGui.add(lensEnabledParam);
-	trackingGui.add(lensFovParam);
-	trackingGui.add(lensK1Param);
-	trackingGui.add(lensK2Param);
-	trackingGui.add(lensBalanceParam);
-	trackingGui.add(lensCenterXParam);
-	trackingGui.add(lensCenterYParam);
-	trackingGui.add(laneSelectParam);
-	trackingGui.add(laneS0Param);
-	trackingGui.add(laneS1Param);
-	trackingGui.add(corridorSelectParam);
-	trackingGui.add(placeX0Param);
-	trackingGui.add(placeX1Param);
-	trackingGui.add(placeY0Param);
-	trackingGui.add(placeY1Param);
-	trackingGui.add(flowMinFlowParam);
-	trackingGui.add(flowEmaParam);
-	trackingGui.add(flowBusyThreshParam);
-	trackingGui.add(flowUseMogParam);
-	trackingGui.add(flowMogVarParam);
-	trackingGui.add(flowCloseWParam);
-	trackingGui.add(flowCloseHParam);
-	trackingGui.add(flowMinAreaParam);
-	trackingGui.add(flowMinCoherenceParam);
-	trackingGui.add(flowMinSpeedParam);
-	trackingGui.add(flowMergeGapParam);
-	trackingGui.add(trkConfirmParam);
-	trackingGui.add(trkMaxMissesParam);
-	trackingGui.add(trkGateGapParam);
-	trackingGui.add(trkAbsorbGapParam);
-	trackingGui.add(trkMergeFramesParam);
-	trackingGui.add(trkReacquireMsParam);
-	trackingGui.add(trkVelMeasNoiseParam);
-	trackingGui.add(trkTrailParam);
-	trackingGui.add(shapeSourceParam);
-	trackingGui.add(shapeEmaParam);
-	trackingGui.add(shapeThreshParam);
-	trackingGui.add(shapePadXParam);
-	trackingGui.add(shapePadYParam);
-	trackingGui.add(shapeSimplifyParam);
-	trackingGui.add(yoloConfParam);
-	trackingGui.add(yoloNmsParam);
-	trackingGui.add(arrowScaleParam);
-	saveTrackingButton.setup("save to config.json");
-	trackingGui.add(&saveTrackingButton);
+	// edit panel: the only values that leave the window are the lane
+	// anchors and the corridor placements, written by the save button.
+	editGui.setup("edit", "edit_gui.xml");
+	editGui.add(laneSelectParam);
+	editGui.add(laneS0Param);
+	editGui.add(laneS1Param);
+	editGui.add(corridorSelectParam);
+	editGui.add(placeX0Param);
+	editGui.add(placeX1Param);
+	editGui.add(placeY0Param);
+	editGui.add(placeY1Param);
+	saveButton.setup("save config.json");
+	editGui.add(&saveButton);
+	saveButton.addListener(this, &ofApp::onSavePressed);
 	layoutGuiPanels();
-	saveTrackingButton.addListener(this, &ofApp::onSaveTrackingPressed);
 
-	loadGuiFromConfig();
-
-	previewParam = camConfig.preview;
-	qualityParam = camConfig.quality;
-	recordParam = false;   // never restore a stale "recording" state from gui.xml
-	exportParam = false;   // same for an open export
-	playbackParam = false; // always start live
-	trackingParam = trackingConfig.enabled;
-	detectorParam = trackingConfig.detector == "yolo" ? 2 : trackingConfig.detector == "bgs" ? 1 : 0;
-	halfResParam = (displayDecodeScale >= 2);
-	udpParam = udpEnabled;
-	previewParam.addListener(this, &ofApp::onPreviewChanged);
-	qualityParam.addListener(this, &ofApp::onQualityChanged);
+	// never restore a stale state from gui.xml
+	recordParam = false;
+	exportParam = false;
+	playbackParam = false;
+	trackingParam = session.isTrackingEnabled();
 	recordParam.addListener(this, &ofApp::onRecordChanged);
 	exportParam.addListener(this, &ofApp::onExportChanged);
 	playbackParam.addListener(this, &ofApp::onPlaybackChanged);
 	trackingParam.addListener(this, &ofApp::onTrackingChanged);
-	detectorParam.addListener(this, &ofApp::onDetectorChanged);
-	halfResParam.addListener(this, &ofApp::onHalfResChanged);
-	udpParam.addListener(this, &ofApp::onUdpChanged);
 	reconnectButton.addListener(this, &ofApp::onReconnectPressed);
 
-	// tracking worker (fed below by the raw-frame taps)
-	trackingConfig.enabled = trackingParam;
-	trackingConfig.sourceName = currentSourceName();
-	lastSourceName = trackingConfig.sourceName;
-	trackingManager.setup(trackingConfig);
-	pushedTuning = currentTrackingTuning(); // worker already has this state
+	session.start();
 
-	if(udpEnabled) udp.open(udpHost, udpPort);
-
-	// Raw-frame taps: the exact JPEG bytes of every complete frame, called
-	// on the stream / playback thread. Recording and tracking both hang off
-	// these; the main thread never touches raw frames.
-	client.setDecodeScale(halfResParam ? 2 : 1);
-	client.setRawFrameCallback([this](const uint8_t * data, size_t size, double tsMs){
-		if(recorder.isRecording()) recorder.addFrame(data, size, tsMs);
-		if(mode == AppMode::Live) trackingManager.submitRawJpeg(data, size, tsMs);
-	});
-	player.setDecodeScale(halfResParam ? 2 : 1);
-	player.setRawFrameCallback([this](const uint8_t * data, size_t size, double tMs){
-		if(mode == AppMode::Playback) trackingManager.submitRawJpeg(data, size, tMs);
-	});
-
-	if(camConfig.enabled && !camConfig.host.empty()){
-		ofLogNotice("ofApp") << "starting stream: " << camConfig.buildStreamUrl();
-		client.start(camConfig);
-	}else{
-		ofLogError("ofApp") << "no enabled camera in config/config.json";
-	}
-
-	// Headless verification: CAMTRACK_AUTOSHOT=<path> saves a screenshot
-	// after CAMTRACK_AUTOSHOT_SEC (default 8) seconds and quits.
-	// CAMTRACK_AUTOPLAYBACK=1 additionally starts in playback mode (tracking
-	// against a recording, no camera); CAMTRACK_RECORDINGS overrides the
-	// recordings folder, so a single recording can be played by pointing it at
-	// a folder holding just that one. CAMTRACK_AUTOEXPORT=1 starts a motion
-	// export right away (written when the autoshot quits).
-	if(const char * autoshot = std::getenv("CAMTRACK_AUTOSHOT")){
-		autoshotPath = autoshot;
-		if(const char * sec = std::getenv("CAMTRACK_AUTOSHOT_SEC")) autoshotSec = std::max(1.0f, static_cast<float>(std::atof(sec)));
-		ofLogNotice("ofApp") << "autoshot enabled -> " << autoshotPath << " after " << autoshotSec << " s";
-	}
 	if(std::getenv("CAMTRACK_AUTOPLAYBACK")){
 		ofLogNotice("ofApp") << "autoplayback enabled";
-		if(const char * dir = std::getenv("CAMTRACK_RECORDINGS")) recordingsDir = ofToDataPath(dir, true);
 		playbackParam = true;
 	}
 	if(std::getenv("CAMTRACK_AUTOEXPORT")){
@@ -487,191 +329,12 @@ void ofApp::setup(){
 }
 
 //--------------------------------------------------------------
-void ofApp::loadConfig(){
-	recordingsDir = ofToDataPath("recordings", true);
-
-	std::string path = "config/config.json";
-	if(!ofFile::doesFileExist(path)){
-		path = "config/config.example.json";
-		ofLogWarning("ofApp") << "config/config.json not found, falling back to " << path;
-	}
-	configPath = path; // save target for the tracking-settings button
-	ofJson json;
-	try {
-		json = ofLoadJson(path);
-	} catch(const std::exception & e){
-		ofLogError("ofApp") << "failed to load " << path << ": " << e.what();
-		return;
-	}
-	const auto loaded = tracking::loadTrackingConfig(json, [](const std::string & p){ return ofToDataPath(p, true); });
-	trackingConfig = loaded.config;
-	overlayArrowScale = loaded.overlayArrowScale;
-	displayDecodeScale = loaded.displayDecodeScale;
-	recordingsDir = ofToDataPath(loaded.recordingsDir, true);
-
-	if(json.contains("output") && json["output"].contains("udp")){
-		const auto & u = json["output"]["udp"];
-		udpEnabled = u.value("enabled", false);
-		udpHost = u.value("host", std::string("127.0.0.1"));
-		udpPort = u.value("port", 8765);
-	}
-
-	if(!json.contains("cameras") || !json["cameras"].is_array()){
-		ofLogError("ofApp") << path << " has no cameras array";
-		return;
-	}
-	for(const auto & cam : json["cameras"]){
-		if(!cam.value("enabled", false)) continue;
-		camConfig.id = cam.value("id", "camera");
-		camConfig.enabled = true;
-		camConfig.host = cam.value("host", "");
-		camConfig.user = cam.value("user", "");
-		camConfig.password = cam.value("password", "");
-		camConfig.stream = cam.value("stream", "full");
-		camConfig.fps = cam.value("fps", 0.0f);
-		camConfig.preview = cam.value("preview", false);
-		camConfig.previewSize = cam.value("previewSize", "1280x720");
-		camConfig.quality = cam.value("quality", 60);
-		break; // v1: first enabled camera only
-	}
-}
-
-void ofApp::loadGuiFromConfig(){
-	const auto & lens = trackingConfig.lens;
-	lensEnabledParam = lens.enabled;
-	lensFovParam = lens.fovDeg;
-	lensK1Param = lens.k1;
-	lensK2Param = lens.k2;
-	lensBalanceParam = lens.balance;
-	lensCenterXParam = lens.centerX;
-	lensCenterYParam = lens.centerY;
-	const auto & f = trackingConfig.flow;
-	flowMinFlowParam = f.minFlowPx;
-	flowEmaParam = f.flowEma;
-	flowBusyThreshParam = f.busyThresh;
-	flowUseMogParam = f.useMog2;
-	flowMogVarParam = f.mogVarThreshold;
-	flowCloseWParam = f.closeWFrac;
-	flowCloseHParam = f.closeHFrac;
-	flowMinAreaParam = f.minAreaFrac;
-	flowMinCoherenceParam = f.minCoherence;
-	flowMinSpeedParam = f.minSpeed;
-	flowMergeGapParam = f.mergeGapFrac;
-	const auto & k = trackingConfig.tracker;
-	trkConfirmParam = k.confirmFrames;
-	trkMaxMissesParam = k.maxMisses;
-	trkGateGapParam = k.gateGapFrac;
-	trkAbsorbGapParam = k.absorbGapFrac;
-	trkMergeFramesParam = k.mergeFrames;
-	trkReacquireMsParam = static_cast<float>(k.reacquireMs);
-	trkVelMeasNoiseParam = k.velMeasNoise;
-	trkTrailParam = k.trailLen;
-	const auto & s = trackingConfig.shape;
-	shapeSourceParam = s.source;
-	shapeEmaParam = s.ema;
-	shapeThreshParam = s.threshold;
-	shapePadXParam = s.padX;
-	shapePadYParam = s.padY;
-	shapeSimplifyParam = s.simplify;
-	yoloConfParam = trackingConfig.yolo.confThreshold;
-	yoloNmsParam = trackingConfig.yolo.nmsThreshold;
-	arrowScaleParam = overlayArrowScale;
-}
-
-std::string ofApp::currentSourceName() const {
-	return mode == AppMode::Playback ? player.getCurrentName() : std::string("live");
-}
-
-//--------------------------------------------------------------
-// The loaded config (corridors, model path, analysisReduce, layouts with
-// the committed lane edits) with the live GUI values written over it — the
-// exact state the worker should run with, and what the save button writes.
-tracking::TrackingConfig ofApp::currentTrackingTuning() const {
-	tracking::TrackingConfig c = trackingConfig;
-	c.lens.enabled = lensEnabledParam;
-	c.lens.fovDeg = lensFovParam;
-	c.lens.k1 = lensK1Param;
-	c.lens.k2 = lensK2Param;
-	c.lens.balance = lensBalanceParam;
-	c.lens.centerX = lensCenterXParam;
-	c.lens.centerY = lensCenterYParam;
-	c.flow.minFlowPx = flowMinFlowParam;
-	c.flow.flowEma = flowEmaParam;
-	c.flow.busyThresh = flowBusyThreshParam;
-	c.flow.useMog2 = flowUseMogParam;
-	c.flow.mogVarThreshold = flowMogVarParam;
-	c.flow.closeWFrac = flowCloseWParam;
-	c.flow.closeHFrac = flowCloseHParam;
-	c.flow.minAreaFrac = flowMinAreaParam;
-	c.flow.minCoherence = flowMinCoherenceParam;
-	c.flow.minSpeed = flowMinSpeedParam;
-	c.flow.mergeGapFrac = flowMergeGapParam;
-	c.tracker.confirmFrames = trkConfirmParam;
-	c.tracker.maxMisses = trkMaxMissesParam;
-	c.tracker.gateGapFrac = trkGateGapParam;
-	c.tracker.absorbGapFrac = trkAbsorbGapParam;
-	c.tracker.mergeFrames = trkMergeFramesParam;
-	c.tracker.reacquireMs = trkReacquireMsParam;
-	c.tracker.velMeasNoise = trkVelMeasNoiseParam;
-	c.tracker.trailLen = trkTrailParam;
-	c.shape.source = shapeSourceParam;
-	c.shape.ema = shapeEmaParam;
-	c.shape.threshold = shapeThreshParam;
-	c.shape.padX = shapePadXParam;
-	c.shape.padY = shapePadYParam;
-	c.shape.simplify = shapeSimplifyParam;
-	c.yolo.confThreshold = yoloConfParam;
-	c.yolo.nmsThreshold = yoloNmsParam;
-	return c;
-}
-
-void ofApp::pushTrackingTuning(){
-	const double now = MobotixMjpegClient::nowMs();
-	if(now - lastTuningPushMs < kTuningPushIntervalMs) return;
-	const tracking::TrackingConfig tuning = currentTrackingTuning();
-	if(tuningEquals(tuning, pushedTuning)) return;
-	trackingManager.setLiveConfig(tuning);
-	pushedTuning = tuning;
-	lastTuningPushMs = now;
-}
-
-// Save button: write the current tuning + layouts back into the loaded
-// config file, touching only the tracking keys (cameras etc. stay as-is).
-void ofApp::onSaveTrackingPressed(){
-	ofJson json;
-	try {
-		json = ofLoadJson(configPath);
-	} catch(const std::exception & e){
-		ofLogError("ofApp") << "save: failed to re-read " << configPath << ": " << e.what();
-	}
-	if(!json.is_object()) json = ofJson::object();
-
-	tracking::TrackingConfig tuning = currentTrackingTuning();
-	tuning.detector = detectorParam == 2 ? "yolo" : detectorParam == 1 ? "bgs" : "flow";
-	tracking::writeTrackingTuning(json, tuning, arrowScaleParam.get());
-
-	if(ofSavePrettyJson(configPath, json)){
-		ofLogNotice("ofApp") << "tracking settings saved to " << configPath;
-	}else{
-		ofLogError("ofApp") << "failed to save tracking settings to " << configPath;
-	}
-}
-
-//--------------------------------------------------------------
-// Lane editing state follows the current source / pane count: the layout
-// the worker resolves for it becomes the editable copy. A synthesized
-// fallback layout is materialized into trackingConfig.layouts on the first
-// commit so it can be saved.
-void ofApp::syncEditLayout(int paneCount){
-	const std::string source = currentSourceName();
-	if(paneCount == editPaneCount && source == lastSourceName) return;
-	if(source != lastSourceName){
-		lastSourceName = source;
-		trackingManager.setSourceName(source);
-	}
-	editPaneCount = paneCount;
-	editLayout = tracking::TrackingManager::findLayout(trackingConfig.layouts, paneCount, source);
-	committedLayout = editLayout;
+// Lane editing state follows the session's resolved layout (source and
+// pane count): that layout becomes the editable copy.
+void ofApp::syncEditLayout(){
+	if(session.layoutRevision() == seenLayoutRev) return;
+	seenLayoutRev = session.layoutRevision();
+	editLayout = session.currentLayout();
 	dragLane = -1;
 	dragEdge = dragStation = -1;
 	anchorLane = anchorEdge = anchorStation = -1;
@@ -682,126 +345,47 @@ void ofApp::syncEditLayout(int paneCount){
 }
 
 void ofApp::commitLayout(){
-	committedLayout = editLayout;
-	auto it = std::find_if(trackingConfig.layouts.begin(), trackingConfig.layouts.end(),
-	                       [&](const tracking::LayoutConfig & l){ return l.name == committedLayout.name; });
-	if(it != trackingConfig.layouts.end()){
-		*it = committedLayout;
-	}else{
-		// a synthesized fallback layout gets a proper name once edited
-		committedLayout.name = editPaneCount > 1 ? "dual" : "single";
-		editLayout.name = committedLayout.name;
-		trackingConfig.layouts.push_back(committedLayout);
-	}
-	// picked up by pushTrackingTuning() in update(); the worker rebuilds
-	// its lanes (background models and tracks restart)
-}
-
-// Corridors that can be placed: the configured ones (config order) plus any
-// the edited layout references without a config entry.
-std::vector<std::string> ofApp::editCorridorIds() const {
-	std::vector<std::string> ids;
-	for(const auto & c : trackingConfig.corridors) ids.push_back(c.id);
-	for(const auto & lane : editLayout.lanes){
-		if(std::find(ids.begin(), ids.end(), lane.corridor) == ids.end()) ids.push_back(lane.corridor);
-	}
-	return ids;
-}
-
-tracking::CorridorPlacement & ofApp::placementRef(const std::string & id){
-	for(auto & c : trackingConfig.corridors){
-		if(c.id == id) return c.placement;
-	}
-	tracking::CorridorConfig cc;
-	cc.id = id;
-	cc.label = id;
-	trackingConfig.corridors.push_back(cc);
-	return trackingConfig.corridors.back().placement;
-}
-
-//--------------------------------------------------------------
-void ofApp::applyStreamSettings(){
-	camConfig.preview = previewParam;
-	camConfig.quality = qualityParam;
-	client.restart(camConfig);
+	// a synthesized fallback layout comes back with its real name
+	editLayout.name = session.setLayout(editLayout).name;
 }
 
 //--------------------------------------------------------------
 void ofApp::update(){
-	bool gotFrame = false;
-	if(mode == AppMode::Playback){
-		// live stream keeps running in the background but is ignored;
-		// the player paces/reads/decodes on its own thread.
-		ofPixels pixels;
-		if(player.getLatestFrame(pixels, sensors, playbackSeenFrameId, playbackFrameTMs,
-		                         showComDumpParam ? &comDump : nullptr)){
-			rawFrame = pixels;
-			rawFrameMode = AppMode::Playback;
-			gotFrame = true;
-		}
-		// playhead slider mirrors the player, except while the mouse is
-		// dragging it — then the slider drives the player (onPlayheadChanged)
+	session.update();
+	const bool playback = session.getMode() == Mode::Playback;
+
+	// newest corrected frame -> texture (an empty preview clears it)
+	ofPixels pixels;
+	if(session.takePreview(pixels, previewGeometry, previewRev)){
+		if(pixels.isAllocated()) loadFrameTexture(texture, pixels);
+		else texture.clear();
+	}
+	syncEditLayout();
+
+	// playhead slider mirrors the player, except while the mouse is
+	// dragging it — then the slider drives the player (onPlayheadChanged)
+	if(playback){
 		const bool scrubbing = ofGetMousePressed()
 			&& playbackGui.getShape().inside(ofGetMouseX(), ofGetMouseY());
 		if(!scrubbing){
-			const float durationSec = static_cast<float>(player.getDurationMs() / 1000.0);
+			const float durationSec = static_cast<float>(session.durationSec());
 			if(durationSec > 0 && playheadParam.getMax() != durationSec) playheadParam.setMax(durationSec);
 			playheadSync = true;
-			playheadParam = static_cast<float>(player.getPositionMs() / 1000.0);
+			playheadParam = static_cast<float>(session.positionSec());
 			playheadSync = false;
-		}
-	}else{
-		ofPixels pixels;
-		double receivedAtMs = 0;
-		if(client.getLatestFrame(pixels, sensors, lastSeenFrameId, receivedAtMs,
-		                         showComDumpParam ? &comDump : nullptr)){
-			rawFrame = pixels;
-			rawFrameMode = AppMode::Live;
-			gotFrame = true;
-			lastFrameReceivedMs = receivedAtMs;
-			lastUploadLatencyMs = MobotixMjpegClient::nowMs() - receivedAtMs;
-		}
-	}
-	// Show the corrected frame, and rewarp the last one as soon as a lens
-	// slider moves (playback may be sitting on one frame).
-	if(rawFrame.isAllocated() && rawFrameMode == mode){
-		const LensCorrection lens = currentTrackingTuning().lens;
-		if(gotFrame || lens != shownLens){
-			shownLens = lens;
-			displayLens.set(lens);
-			uploadCorrected(mode == AppMode::Playback ? playbackTexture : texture, rawFrame, displayLens);
 		}
 	}
 
 	// newest tracking results (published by the tracking thread)
-	if(trackingManager.getLatestResults(trackResults, trackResultsRevision)){
-		if(udp.isOpen() || motionExport){
-			// canvas-space objects: the one mapping both outputs publish
-			const std::vector<output::MotionObject> objects = output::fromTrackingResults(trackResults);
-			const double tSec = trackResults.frameTMs / 1000.0;
-			if(udp.isOpen()){
-				const ofJson frame = output::buildFrame(objects, tSec, ++udpFrameIndex, 30.0,
-				                                        currentSourceName(), trackResults.canvas.width,
-				                                        trackResults.canvas.height, wallClockSec());
-				udp.send(frame.dump());
-			}
-			if(motionExport){
-				// a new source means new track ids and a new time base:
-				// finish this file and start the next one
-				if(currentSourceName() != motionExportSource) startMotionExport();
-				motionExport->addFrame(objects, tSec, wallClockSec());
-			}
-		}
+	if(session.takeResults(trackResults, trackResultsRev) && showMaskParam){
 		// lane masks -> textures (only when shown)
-		if(showMaskParam){
-			if(laneMaskTex.size() < trackResults.lanes.size()) laneMaskTex.resize(trackResults.lanes.size());
-			for(size_t i = 0; i < trackResults.lanes.size(); i++){
-				const auto & dbg = trackResults.lanes[i];
-				if(dbg.maskW <= 0 || dbg.maskH <= 0 || dbg.mask.empty()) continue;
-				ofPixels p;
-				p.setFromPixels(dbg.mask.data(), dbg.maskW, dbg.maskH, OF_PIXELS_GRAY);
-				loadFrameTexture(laneMaskTex[i], p);
-			}
+		if(laneMaskTex.size() < trackResults.lanes.size()) laneMaskTex.resize(trackResults.lanes.size());
+		for(size_t i = 0; i < trackResults.lanes.size(); i++){
+			const auto & dbg = trackResults.lanes[i];
+			if(dbg.maskW <= 0 || dbg.maskH <= 0 || dbg.mask.empty()) continue;
+			ofPixels p;
+			p.setFromPixels(dbg.mask.data(), dbg.maskW, dbg.maskH, OF_PIXELS_GRAY);
+			loadFrameTexture(laneMaskTex[i], p);
 		}
 	}
 
@@ -810,10 +394,8 @@ void ofApp::update(){
 		const int sel = ofClamp(laneSelectParam.get(), 0, static_cast<int>(editLayout.lanes.size()) - 1);
 		if(sel != lastLaneSelect){
 			lastLaneSelect = sel;
-			laneSliderSync = true;
 			laneS0Param = editLayout.lanes[sel].s0;
 			laneS1Param = editLayout.lanes[sel].s1;
-			laneSliderSync = false;
 		}else{
 			tracking::LaneConfig & lane = editLayout.lanes[sel];
 			if(lane.s0 != laneS0Param.get() || lane.s1 != laneS1Param.get()){
@@ -827,12 +409,12 @@ void ofApp::update(){
 	// corridor selector -> placement sliders (and back). While the mouse
 	// drags a placement the sliders follow it; otherwise they drive it.
 	{
-		const std::vector<std::string> ids = editCorridorIds();
+		const std::vector<std::string> ids = session.corridorIds();
 		corridorSelectParam.setMax(std::max(0, static_cast<int>(ids.size()) - 1));
 		if(!ids.empty()){
 			const int sel = ofClamp(corridorSelectParam.get(), 0, static_cast<int>(ids.size()) - 1);
 			if(sel != corridorSelectParam.get()) corridorSelectParam = sel;
-			const tracking::CorridorPlacement current = trackingConfig.placementFor(ids[sel]);
+			const tracking::CorridorPlacement current = session.getConfig().placementFor(ids[sel]);
 			if(sel != lastCorridorSelect || dragCorridor >= 0){
 				lastCorridorSelect = sel;
 				placeX0Param = current.x0;
@@ -841,41 +423,28 @@ void ofApp::update(){
 				placeY1Param = current.y1;
 			}else if(current.x0 != placeX0Param.get() || current.x1 != placeX1Param.get()
 			         || current.y0 != placeY0Param.get() || current.y1 != placeY1Param.get()){
-				tracking::CorridorPlacement & p = placementRef(ids[sel]);
+				tracking::CorridorPlacement p;
 				p.x0 = placeX0Param;
 				p.x1 = placeX1Param;
 				p.y0 = placeY0Param;
 				p.y1 = placeY1Param;
+				session.setPlacement(ids[sel], p);
 			}
 		}
 	}
 
-	// live tracking tuning: any slider / committed-lane / placement change
-	// goes to the worker, throttled so drags do not rebuild models on every
-	// pixel (placements need no rebuild — they are applied at publish time)
-	pushTrackingTuning();
-
-	if(settingsDirty && MobotixMjpegClient::nowMs() - settingsDirtySinceMs > kSettingsDebounceMs){
-		settingsDirty = false;
-		applyStreamSettings();
-	}
-
-	// periodic stats log (useful when running headless / from terminal)
+	// periodic stats log (useful when running from the terminal)
 	if(ofGetElapsedTimeMillis() - lastStatsLogMs > 5000){
 		lastStatsLogMs = ofGetElapsedTimeMillis();
-		const StreamStats stats = client.getStats();
+		const StreamStats stats = session.streamStats();
+		const SensorSnapshot & sensors = session.getSensors();
 		ofLogNotice("ofApp")
 			<< "[" << stats.state << "] decoded " << ofToString(stats.decodedFps, 1)
 			<< " fps, " << ofToString(stats.bytesPerSecond / (1024.0 * 1024.0), 2)
 			<< " MB/s, frames " << stats.framesDecoded
-			<< ", MultiSense " << ofToString(sensors.multiSenseLux(), 1) << " lx (LA2=" << sensors.la2
-			<< "), LXL=" << sensors.lxl << " LXR=" << sensors.lxr
-			<< ", PIR=" << sensors.pi2 << "%"
+			<< ", MultiSense " << ofToString(sensors.multiSenseLux(), 1) << " lx"
+			<< ", published " << session.resultRevision()
 			<< (stats.lastError.empty() ? "" : ", error: " + stats.lastError);
-	}
-
-	if(!autoshotPath.empty() && !autoshotDone && ofGetElapsedTimef() > autoshotSec){
-		autoshotDone = true;
 	}
 }
 
@@ -883,37 +452,26 @@ void ofApp::update(){
 void ofApp::draw(){
 	drawVideo();
 	drawRecordingIndicator();
-	drawSensorPanel();
 	drawStatsBar();
-	if(showComDumpParam) drawComDump();
 	gui.draw();
-	if(mode == AppMode::Playback) playbackGui.draw();
-	trackingGui.draw();
-
-	if(autoshotDone && !autoshotPath.empty()){
-		ofSaveScreen(autoshotPath);
-		ofLogNotice("ofApp") << "autoshot saved to " << autoshotPath << ", exiting";
-		autoshotPath.clear();
-		ofExit();
-	}
+	if(session.getMode() == Mode::Playback) playbackGui.draw();
+	editGui.draw();
 }
 
 //--------------------------------------------------------------
 void ofApp::drawVideo(){
-	const float barHeight = 64;
-	const float panelWidth = 320;
 	const float splitGap = 8;
 	// keep the image clear of the GUI panels on the left
-	const float guiWidth = std::max(gui.getShape().getRight(), trackingGui.getShape().getRight()) + splitGap;
-	const ofRectangle full(guiWidth, 0, ofGetWidth() - panelWidth - guiWidth, ofGetHeight() - barHeight);
+	const float guiWidth = std::max(gui.getShape().getRight(), editGui.getShape().getRight()) + splitGap;
+	const ofRectangle full(guiWidth, 0, ofGetWidth() - guiWidth, ofGetHeight() - kBarHeight);
 	// top: the lens-corrected image(s) with lane editor + overlay; bottom: the
 	// rectified lane views (motion mask + tracking, no camera pixels)
 	const ofRectangle viewport(full.x, full.y, full.width, full.height * 0.6f);
 	const ofRectangle resultView(full.x, viewport.getBottom() + splitGap,
 	                             full.width, full.height * 0.4f - splitGap);
 
-	const bool playback = (mode == AppMode::Playback);
-	const ofTexture & tex = playback ? playbackTexture : texture;
+	const bool playback = session.getMode() == Mode::Playback;
+	const ofTexture & tex = texture;
 
 	paneRects.clear();
 	laneResultRects.clear();
@@ -921,15 +479,15 @@ void ofApp::drawVideo(){
 	if(!tex.isAllocated()){
 		ofSetColor(160);
 		const std::string msg = playback
-			? "waiting for playback frame (" + player.getCurrentName() + ")"
-			: "waiting for stream: " + client.getStreamUrl();
+			? "waiting for playback frame (" + session.recordingName() + ")"
+			: "waiting for stream: " + session.streamUrl();
 		ofDrawBitmapString(msg, viewport.getCenter().x - 240, viewport.getCenter().y);
 		ofSetColor(255);
 		return;
 	}
 
 	ofSetColor(255);
-	const LensGeometry lensGeo = displayLens.geometry();
+	const LensGeometry & lensGeo = previewGeometry;
 	const bool geo = lensGeo.outPaneW > 0 && lensGeo.outPaneH > 0 && lensGeo.panes > 0
 		&& std::abs(tex.getWidth() - lensGeo.panes * lensGeo.outPaneW) < 1.5
 		&& std::abs(tex.getHeight() - lensGeo.outPaneH) < 1.5;
@@ -980,8 +538,6 @@ void ofApp::drawVideo(){
 		paneFitW.push_back(extW * fit);
 	}
 
-	syncEditLayout(static_cast<int>(paneRects.size()));
-
 	// lane result rects: one column per pane, the pane's lanes stacked in
 	// rows; each cell keeps the rectified lane's aspect
 	// Lane aspect is measured on the filled frame, not the extended mat,
@@ -1013,8 +569,8 @@ void ofApp::drawVideo(){
 	// output canvas (Lines-area proportions) centred in the result view
 	// with room around it so off-canvas placement parts stay visible
 	{
-		const float aspect = trackingConfig.canvas.height > 0
-			? static_cast<float>(trackingConfig.canvas.width) / trackingConfig.canvas.height : 1.0f;
+		const tracking::CanvasConfig & canvas = session.getConfig().canvas;
+		const float aspect = canvas.height > 0 ? static_cast<float>(canvas.width) / canvas.height : 1.0f;
 		float w = resultView.width * 0.62f;
 		float h = w / aspect;
 		if(h > resultView.height * 0.72f){ h = resultView.height * 0.72f; w = h * aspect; }
@@ -1041,7 +597,9 @@ void ofApp::drawCanvasView(){
 	const auto toScreen = [&](float cx, float cy){
 		return glm::vec2(c.x + cx * c.width, c.y + cy * c.height);
 	};
-	const std::vector<std::string> ids = editCorridorIds();
+	const tracking::TrackingConfig & cfg = session.getConfig();
+	const float arrowScale = session.arrowScale();
+	const std::vector<std::string> ids = session.corridorIds();
 	const int sel = ofClamp(corridorSelectParam.get(), 0, std::max(0, static_cast<int>(ids.size()) - 1));
 
 	ofPushStyle();
@@ -1059,14 +617,14 @@ void ofApp::drawCanvasView(){
 	ofNoFill();
 	ofSetColor(150);
 	ofDrawRectangle(c);
-	ofDrawBitmapStringHighlight("canvas " + ofToString(trackingConfig.canvas.width) + "x"
-		+ ofToString(trackingConfig.canvas.height) + (showResultParam ? "  result" : "  raw")
+	ofDrawBitmapStringHighlight("canvas " + ofToString(cfg.canvas.width) + "x"
+		+ ofToString(cfg.canvas.height) + (showResultParam ? "  result" : "  raw")
 		+ "  (0,0 top-left, 1,1 bottom-right)",
 		c.x + 6, c.y - 6, ofColor(0, 140), ofColor(200));
 
 	// placements
 	for(size_t i = 0; i < ids.size(); i++){
-		const tracking::CorridorPlacement p = trackingConfig.placementFor(ids[i]);
+		const tracking::CorridorPlacement p = cfg.placementFor(ids[i]);
 		const bool selected = static_cast<int>(i) == sel;
 		const ofColor col = corridorColor(ids[i]);
 		const glm::vec2 a = toScreen(std::min(p.x0, p.x1), std::min(p.y0, p.y1));
@@ -1106,13 +664,13 @@ void ofApp::drawCanvasView(){
 	// layers per object, each switchable: shape pixels, outline, box.
 	if(trackingParam){
 		for(const auto & cr : trackResults.corridors){
-			const tracking::CorridorPlacement p = trackingConfig.placementFor(cr.id);
+			const tracking::CorridorPlacement p = cfg.placementFor(cr.id);
 			const CorridorToScreen mapCanvas = [&](float s, float y, glm::vec2 & out){
 				out = toScreen(p.toCanvasX(s), p.toCanvasY(y));
 				return true;
 			};
 			for(const auto & obj : cr.objects){
-				if(!obj.confirmed && !showCandidatesParam) continue;
+				if(!obj.confirmed) continue;
 				const ShownGeom g = shownGeom(obj, showResultParam);
 				float x0, x1, y0, y1;
 				p.mapBox(g.x0, g.x1, g.y0, g.y1, x0, x1, y0, y1);
@@ -1125,7 +683,7 @@ void ofApp::drawCanvasView(){
 					for(const auto & q : obj.shape.outline) onCanvas.emplace_back(p.toCanvasX(q.first), p.toCanvasY(q.second));
 					const auto clipped = output::clipPolygonToCanvas(onCanvas);
 					drawShapeOutline(clipped, [&](float cx, float cy, glm::vec2 & out){ out = toScreen(cx, cy); return true; },
-					                 col, obj.confirmed ? 2 : 1, 40);
+					                 col, 2, 40);
 				}
 				// uncut box (dim) — shows what the placement cuts away
 				const glm::vec2 fa = toScreen(x0, y0), fb = toScreen(x1, y1);
@@ -1151,7 +709,7 @@ void ofApp::drawCanvasView(){
 				if(showBoxParam){
 					ofNoFill();
 					ofSetColor(col);
-					ofSetLineWidth(obj.confirmed ? 2 : 1);
+					ofSetLineWidth(2);
 					ofDrawRectangle(a.x, a.y, b.x - a.x, b.y - a.y);
 					ofSetLineWidth(1);
 					// A corridor-end tick only where the drawn box actually sits on
@@ -1174,14 +732,13 @@ void ofApp::drawCanvasView(){
 				const glm::vec2 ctr((a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f);
 				ofFill();
 				ofDrawCircle(ctr.x, ctr.y, 3);
-				float dx = obj.vx * p.spanX() * arrowScaleParam, dy = obj.vy * p.spanY() * arrowScaleParam;
+				float dx = obj.vx * p.spanX() * arrowScale, dy = obj.vy * p.spanY() * arrowScale;
 				const float len = std::hypot(dx, dy);
 				if(len > kMaxArrow){ dx *= kMaxArrow / len; dy *= kMaxArrow / len; }
 				ofDrawArrow(glm::vec3(ctr, 0), glm::vec3(ctr.x + dx * c.width, ctr.y + dy * c.height, 0), 5.0f);
 				std::string text = "#" + ofToString(obj.id) + " " + obj.label + " " + obj.phase
 					+ "  x=" + ofToString((x0 + x1) * 0.5f, 2) + " vx=" + ofToString(obj.vx * p.spanX(), 3);
 				if(obj.shape.valid && !obj.shape.source.empty()) text += "  shape:" + obj.shape.source;
-				if(!obj.confirmed) text += " ?";
 				ofDrawBitmapStringHighlight(text, a.x, a.y - 6, ofColor(0, 160), col);
 			}
 		}
@@ -1201,6 +758,7 @@ void ofApp::drawCanvasView(){
 void ofApp::drawTrackingOverlay(){
 	if(!trackingParam || !overlayParam) return;
 	if(paneRects.empty()) return;
+	const float arrowScale = session.arrowScale();
 
 	ofPushStyle();
 	std::vector<tracking::LaneMap> laneMaps(trackResults.lanes.size());
@@ -1222,7 +780,7 @@ void ofApp::drawTrackingOverlay(){
 
 	for(const auto & cr : trackResults.corridors){
 		for(const auto & obj : cr.objects){
-			if(!obj.confirmed && !showCandidatesParam) continue;
+			if(!obj.confirmed) continue;
 			const ShownGeom g = shownGeom(obj, showResultParam);
 			const ofColor col = objectColor(obj);
 			bool labelled = false;
@@ -1258,7 +816,7 @@ void ofApp::drawTrackingOverlay(){
 				};
 				if(showPixelsParam) drawShapeCells(obj.shape, mapLane, ofColor(col, 110));
 				if(showOutlineParam && obj.shape.valid){
-					drawShapeOutline(obj.shape.outline, mapLane, col, obj.confirmed ? 2 : 1, 40);
+					drawShapeOutline(obj.shape.outline, mapLane, col, 2, 40);
 				}
 
 				ofSetColor(col);
@@ -1266,7 +824,7 @@ void ofApp::drawTrackingOverlay(){
 				const glm::vec2 bBr = proj(lx1, g.y1), bBl = proj(lx0, g.y1);
 				if(showBoxParam){
 					ofNoFill();
-					ofSetLineWidth(obj.confirmed ? 2 : 1);
+					ofSetLineWidth(2);
 					ofDrawLine(bTl, bTr);
 					ofDrawLine(bTr, bBr);
 					ofDrawLine(bBr, bBl);
@@ -1297,8 +855,8 @@ void ofApp::drawTrackingOverlay(){
 					ofFill();
 					ofDrawCircle(c.x, c.y, 3);
 					const float span = lane.s1 - lane.s0;
-					float dx = (std::fabs(span) > 1e-6f ? obj.vx / span : obj.vx) * arrowScaleParam;
-					float dy = obj.vy * arrowScaleParam;
+					float dx = (std::fabs(span) > 1e-6f ? obj.vx / span : obj.vx) * arrowScale;
+					float dy = obj.vy * arrowScale;
 					const float len = std::hypot(dx, dy);
 					if(len > kMaxArrow){ dx *= kMaxArrow / len; dy *= kMaxArrow / len; }
 					const glm::vec2 tip = proj(lcx + dx, g.y + dy);
@@ -1309,7 +867,6 @@ void ofApp::drawTrackingOverlay(){
 					std::string text = "#" + ofToString(obj.id);
 					if(!obj.label.empty()) text += " " + obj.label;
 					text += " " + obj.phase + "  v=" + ofToString(obj.vx, 3);
-					if(!obj.confirmed) text += " ?";
 					ofDrawBitmapStringHighlight(text, bTl.x, bTl.y - 6, ofColor(0, 160), col);
 					labelled = true;
 				}
@@ -1390,6 +947,7 @@ void ofApp::drawLaneEditor(){
 // space. 0,0 = top-left / 1,1 = bottom-right of the lane.
 void ofApp::drawTrackingResults(){
 	if(laneResultRects.empty()) return;
+	const float arrowScale = session.arrowScale();
 
 	ofPushStyle();
 	for(size_t li = 0; li < laneResultRects.size(); li++){
@@ -1434,7 +992,7 @@ void ofApp::drawTrackingResults(){
 		for(const auto & cr : trackResults.corridors){
 			if(std::find(cr.lanes.begin(), cr.lanes.end(), workerLane) == cr.lanes.end()) continue;
 			for(const auto & obj : cr.objects){
-				if(!obj.confirmed && !showCandidatesParam) continue;
+				if(!obj.confirmed) continue;
 				const ShownGeom g = shownGeom(obj, showResultParam);
 				float lx0, lx1;
 				if(!lane.corridorRangeToLane(g.x0, g.x1, lx0, lx1)) continue;
@@ -1462,13 +1020,13 @@ void ofApp::drawTrackingResults(){
 				};
 				if(showPixelsParam) drawShapeCells(obj.shape, mapStrip, ofColor(col, 110));
 				if(showOutlineParam && obj.shape.valid){
-					drawShapeOutline(obj.shape.outline, mapStrip, col, obj.confirmed ? 2 : 1, 40);
+					drawShapeOutline(obj.shape.outline, mapStrip, col, 2, 40);
 				}
 
 				if(showBoxParam){
 					ofSetColor(col);
 					ofNoFill();
-					ofSetLineWidth(obj.confirmed ? 2 : 1);
+					ofSetLineWidth(2);
 					ofDrawRectangle(bx, by, bw, bh);
 					ofSetLineWidth(1);
 					float e0, e1;
@@ -1492,8 +1050,8 @@ void ofApp::drawTrackingResults(){
 					ofFill();
 					ofDrawCircle(cx, cy, 3);
 					const float span = lane.s1 - lane.s0;
-					float dx = (std::fabs(span) > 1e-6f ? obj.vx / span : obj.vx) * arrowScaleParam;
-					float dy = obj.vy * arrowScaleParam;
+					float dx = (std::fabs(span) > 1e-6f ? obj.vx / span : obj.vx) * arrowScale;
+					float dy = obj.vy * arrowScale;
 					const float len = std::hypot(dx, dy);
 					if(len > kMaxArrow){ dx *= kMaxArrow / len; dy *= kMaxArrow / len; }
 					ofDrawArrow(glm::vec3(cx, cy, 0), glm::vec3(cx + dx * r.width, cy + dy * r.height, 0), 5.0f);
@@ -1501,7 +1059,6 @@ void ofApp::drawTrackingResults(){
 				std::string text = "#" + ofToString(obj.id) + " " + obj.phase
 					+ "  s=" + ofToString(g.x, 2) + " w=" + ofToString(g.w, 2)
 					+ " v=" + ofToString(obj.vx, 3);
-				if(!obj.confirmed) text += " ?";
 				ofDrawBitmapStringHighlight(text, bx, by - 6, ofColor(0, 160), col);
 			}
 		}
@@ -1514,100 +1071,34 @@ void ofApp::drawTrackingResults(){
 void ofApp::drawRecordingIndicator(){
 	const float x = 250; // right of the gui panel
 	float y = 26;
-	if(recorder.isRecording()){
+	if(session.isRecording()){
+		const MjpegRecorder & rec = session.getRecorder();
 		const bool blinkOn = (static_cast<int>(ofGetElapsedTimef() * 2) % 2) == 0;
 		if(blinkOn){
 			ofSetColor(230, 40, 40);
 			ofDrawCircle(x, y - 4, 7);
 		}
-		const std::string label = "REC " + formatClock(recorder.getDurationMs())
-			+ "  " + ofToString(recorder.getFramesWritten()) + " frames  "
-			+ ofToString(recorder.getBytesWritten() / (1024.0 * 1024.0), 1) + " MB";
+		const std::string label = "REC " + formatClock(rec.getDurationMs())
+			+ "  " + ofToString(rec.getFramesWritten()) + " frames  "
+			+ ofToString(rec.getBytesWritten() / (1024.0 * 1024.0), 1) + " MB";
 		ofDrawBitmapStringHighlight(label, x + 14, y, ofColor(0, 180), ofColor(255, 90, 90));
 		y += 22;
 	}
-	if(motionExport){
-		const std::string label = "EXPORT " + ofFilePath::getFileName(motionExportPath)
-			+ "  " + ofToString(motionExport->frameCount()) + " frames";
+	if(session.isMotionExporting()){
+		const std::string label = "EXPORT " + ofFilePath::getFileName(session.motionExportFile())
+			+ "  " + ofToString(session.motionExportFrames()) + " frames";
 		ofDrawBitmapStringHighlight(label, x + 14, y, ofColor(0, 180), ofColor(120, 220, 160));
 	}
 	ofSetColor(255);
 }
 
 //--------------------------------------------------------------
-void ofApp::drawSensorPanel(){
-	const float panelWidth = 320;
-	const float x = ofGetWidth() - panelWidth;
-	const float barHeight = 64;
-	ofSetColor(0, 180);
-	ofDrawRectangle(x, 0, panelWidth, ofGetHeight() - barHeight);
-	ofSetColor(255);
-
-	float y = 30;
-	const float lx = x + 16;
-	ofDrawBitmapStringHighlight("SENSORS (" + camConfig.id + ")", lx, y);
-	y += 34;
-
-	// Mx-F-MSA MultiSense (M3) — the brightness-control source
-	ofPushMatrix();
-	ofTranslate(lx, y);
-	ofScale(2, 2);
-	ofDrawBitmapStringHighlight("MultiSense M3", 0, 0, ofColor(0, 0, 0, 0), ofColor(255, 210, 60));
-	ofDrawBitmapStringHighlight(formatLux(sensors.multiSenseLux()), 0, 18,
-	                            ofColor(0, 0, 0, 0), ofColor(255, 210, 60));
-	ofPopMatrix();
-	y += 60;
-	ofDrawBitmapString("raw LA2 = " + (sensors.la2 < 0 ? "n/a" : ofToString(sensors.la2)), lx, y);
-	y += 16;
-	ofDrawBitmapString("PIR  PI2 = " + (sensors.pi2 < 0 ? "n/a" : ofToString(sensors.pi2) + " %"), lx, y);
-	y += 16;
-	ofDrawBitmapString("temp TC2 = " + (sensors.tc2 < 0 ? "n/a" : ofToString(sensors.tc2)) + "  (" + formatTemp(sensors.multiSenseTempC()) + ")", lx, y);
-	y += 34;
-
-	ofDrawBitmapStringHighlight("Optical sensors", lx, y);
-	y += 22;
-	ofDrawBitmapString("left  LXL = " + (sensors.lxl < 0 ? "n/a" : ofToString(sensors.lxl)) + "  (" + formatLux(sensors.leftLux()) + ")", lx, y);
-	y += 16;
-	ofDrawBitmapString("right LXR = " + (sensors.lxr < 0 ? "n/a" : ofToString(sensors.lxr)) + "  (" + formatLux(sensors.rightLux()) + ")", lx, y);
-	y += 34;
-
-	ofDrawBitmapStringHighlight("Camera", lx, y);
-	y += 22;
-	ofDrawBitmapString("board TIN = " + (sensors.tin < 0 ? "n/a" : ofToString(sensors.tin)) + "  (" + formatTemp(sensors.boardTempC()) + ")", lx, y);
-	y += 16;
-	ofDrawBitmapString("cam fps FRJ = " + (sensors.frj < 0 ? "n/a" : ofToString(sensors.cameraFps(), 1)), lx, y);
-	y += 16;
-	ofDrawBitmapString("image = " + ofToString(sensors.width) + "x" + ofToString(sensors.height) + " " + sensors.cam, lx, y);
-	y += 34;
-
-	ofDrawBitmapStringHighlight("Tracking", lx, y);
-	y += 22;
-	ofDrawBitmapString("layout = " + (trackResults.layoutName.empty() ? std::string("-") : trackResults.layoutName)
-		+ "  lanes " + ofToString(trackResults.lanes.size())
-		+ (showResultParam ? "  data = result" : "  data = raw"), lx, y);
-	y += 16;
-	for(const auto & cr : trackResults.corridors){
-		int confirmed = 0;
-		for(const auto & o : cr.objects) if(o.confirmed) confirmed++;
-		ofDrawBitmapString(cr.id + " (" + cr.label + "): " + ofToString(confirmed) + " obj"
-			+ (cr.objects.size() > static_cast<size_t>(confirmed)
-				? " +" + ofToString(cr.objects.size() - confirmed) + " tentative" : ""), lx, y);
-		y += 16;
-	}
-	if(udp.isOpen()){
-		ofDrawBitmapString("udp " + udp.getHost() + ":" + ofToString(udp.getPort())
-			+ "  sent " + ofToString(udp.getSentCount()), lx, y);
-		y += 16;
-	}
-}
-
-//--------------------------------------------------------------
 void ofApp::drawStatsBar(){
-	const StreamStats stats = client.getStats();
-	const float barHeight = 64;
-	const float y = ofGetHeight() - barHeight;
+	const StreamStats stats = session.streamStats();
+	const SensorSnapshot & sensors = session.getSensors();
+	const float y = ofGetHeight() - kBarHeight;
 	ofSetColor(0, 200);
-	ofDrawRectangle(0, y, ofGetWidth(), barHeight);
+	ofDrawRectangle(0, y, ofGetWidth(), kBarHeight);
 
 	// tracking summary shared by both modes
 	std::string trackInfo;
@@ -1616,7 +1107,7 @@ void ofApp::drawStatsBar(){
 		for(const auto & c : trackResults.corridors){
 			for(const auto & o : c.objects) if(o.confirmed) objCount++;
 		}
-		trackInfo = "   trk[" + (trackResults.detectorName.empty() ? std::string("-") : trackResults.detectorName)
+		trackInfo = "   trk[" + (trackResults.layoutName.empty() ? std::string("-") : trackResults.layoutName)
 			+ (showResultParam ? " result" : " raw")
 			+ "] " + ofToString(objCount) + " obj"
 			+ " dec " + ofToString(trackResults.decodeMs, 1)
@@ -1625,16 +1116,16 @@ void ofApp::drawStatsBar(){
 			+ " shp " + ofToString(trackResults.shapeMs, 1) + " ms";
 	}
 
-	if(mode == AppMode::Playback){
-		const std::string line1 = "[playback] " + player.getCurrentName()
-			+ "   recording " + ofToString(player.getCurrentIndex() + 1)
-			+ "/" + ofToString(player.getCount());
+	if(session.getMode() == Mode::Playback){
+		const std::string line1 = "[playback] " + session.recordingName()
+			+ "   recording " + ofToString(session.recordingIndex() + 1)
+			+ "/" + ofToString(session.recordingCount());
 		const std::string line2 =
-			formatClock(player.getPositionMs()) + " / " + formatClock(player.getDurationMs())
-			+ "   frame " + ofToString(player.getFrameCursor()) + "/" + ofToString(player.getFrameCount())
-			+ "   dec " + ofToString(player.getLastDecodeMs(), 1) + " ms"
+			formatClock(session.positionSec() * 1000.0) + " / " + formatClock(session.durationSec() * 1000.0)
+			+ "   frame " + ofToString(session.frameCursor()) + "/" + ofToString(session.frameCount())
+			+ "   dec " + ofToString(session.playbackDecodeMs(), 1) + " ms"
 			+ trackInfo
-			+ (player.isPaused() ? "   PAUSED" : "")
+			+ (session.isPaused() ? "   PAUSED" : "")
 			+ "   SPACE play/pause   LEFT/RIGHT prev/next   UP/DOWN +/-1s   TAB back to live"
 			+ "   app " + ofToString(ofGetFrameRate(), 0) + " fps";
 		ofDrawBitmapStringHighlight(line1, 12, y + 24, ofColor(0, 0, 0, 0), ofColor(120, 180, 255));
@@ -1648,10 +1139,8 @@ void ofApp::drawStatsBar(){
 	else if(stats.state == "connecting" || stats.state == "reconnecting") stateColor = ofColor(255, 190, 60);
 	else if(!stats.lastError.empty()) stateColor = ofColor(240, 90, 90);
 
-	const double frameAgeMs = lastFrameReceivedMs > 0
-		? MobotixMjpegClient::nowMs() - lastFrameReceivedMs : -1;
-
-	std::string line1 = "[" + stats.state + "] " + client.getStreamUrl();
+	const double frameAgeMs = session.liveFrameAgeMs();
+	std::string line1 = "[" + stats.state + "] " + session.streamUrl();
 	if(!stats.lastError.empty()) line1 += "  error: " + stats.lastError;
 	std::string line2 =
 		"decoded " + ofToString(stats.decodedFps, 1) + " fps"
@@ -1659,9 +1148,10 @@ void ofApp::drawStatsBar(){
 		+ "   " + ofToString(stats.bytesPerSecond / (1024.0 * 1024.0), 2) + " MB/s"
 		+ "   frame age " + (frameAgeMs < 0 ? "n/a" : ofToString(frameAgeMs, 0) + " ms")
 		+ "   dec " + ofToString(stats.lastDecodeMs, 1) + " ms"
-		+ "   ->tex " + ofToString(lastUploadLatencyMs, 1) + " ms"
+		+ "   ->preview " + ofToString(session.liveFrameLatencyMs(), 1) + " ms"
 		+ "   frames " + ofToString(stats.framesDecoded)
 		+ " dropped " + ofToString(stats.framesDropped)
+		+ "   lux " + (sensors.la2 < 0 ? "n/a" : ofToString(sensors.multiSenseLux(), 1))
 		+ trackInfo
 		+ "   app " + ofToString(ofGetFrameRate(), 0) + " fps";
 
@@ -1671,46 +1161,25 @@ void ofApp::drawStatsBar(){
 }
 
 //--------------------------------------------------------------
-void ofApp::drawComDump(){
-	if(comDump.empty()) return;
-	// right of the gui panels (the tracking panel now occupies the old spot)
-	const float x = std::max(gui.getShape().getRight(), trackingGui.getShape().getRight()) + 10;
-	ofSetColor(0, 210);
-	ofDrawRectangle(x, 220, 420, ofGetHeight() - 300);
-	ofSetColor(180, 255, 180);
-	ofDrawBitmapString(comDump, x + 8, 240);
-	ofSetColor(255);
-}
-
-//--------------------------------------------------------------
 void ofApp::exit(){
-	previewParam.removeListener(this, &ofApp::onPreviewChanged);
-	qualityParam.removeListener(this, &ofApp::onQualityChanged);
 	recordParam.removeListener(this, &ofApp::onRecordChanged);
 	exportParam.removeListener(this, &ofApp::onExportChanged);
 	playbackParam.removeListener(this, &ofApp::onPlaybackChanged);
 	trackingParam.removeListener(this, &ofApp::onTrackingChanged);
-	detectorParam.removeListener(this, &ofApp::onDetectorChanged);
-	halfResParam.removeListener(this, &ofApp::onHalfResChanged);
-	udpParam.removeListener(this, &ofApp::onUdpChanged);
 	reconnectButton.removeListener(this, &ofApp::onReconnectPressed);
-	saveTrackingButton.removeListener(this, &ofApp::onSaveTrackingPressed);
+	saveButton.removeListener(this, &ofApp::onSavePressed);
 	playParam.removeListener(this, &ofApp::onPlayChanged);
 	playheadParam.removeListener(this, &ofApp::onPlayheadChanged);
 	prevFrameButton.removeListener(this, &ofApp::onPrevFramePressed);
 	nextFrameButton.removeListener(this, &ofApp::onNextFramePressed);
 	prevRecordingButton.removeListener(this, &ofApp::onPrevRecordingPressed);
 	nextRecordingButton.removeListener(this, &ofApp::onNextRecordingPressed);
-	stopRecording();
-	stopMotionExport();
-	client.stop();
-	player.close();
-	trackingManager.stop();
-	udp.close();
+	session.stop();
 }
 
 //--------------------------------------------------------------
 void ofApp::keyPressed(int key){
+	const bool playback = session.getMode() == Mode::Playback;
 	if((key == OF_KEY_BACKSPACE || key == OF_KEY_DEL)
 	   && anchorLane >= 0 && anchorLane < static_cast<int>(editLayout.lanes.size())){
 		tracking::LaneConfig & lane = editLayout.lanes[anchorLane];
@@ -1729,14 +1198,8 @@ void ofApp::keyPressed(int key){
 	}
 	if(key == 'r'){
 		onReconnectPressed();
-	}else if(key == 'p'){
-		previewParam = !previewParam;
-	}else if(key == 'c'){
-		showComDumpParam = !showComDumpParam;
-	}else if(key == 's'){
-		saveScreenshot();
 	}else if(key == ' '){
-		if(mode == AppMode::Playback) playParam = !playParam;
+		if(playback) playParam = !playParam;
 		else recordParam = !recordParam;
 	}else if(key == 'e'){
 		exportParam = !exportParam;
@@ -1756,8 +1219,6 @@ void ofApp::keyPressed(int key){
 		showBoxParam = !showBoxParam;
 	}else if(key == 'q'){
 		showResultParam = !showResultParam;
-	}else if(key == '?'){
-		showCandidatesParam = !showCandidatesParam;
 	}else if(key == '['){
 		if(laneSelectParam > laneSelectParam.getMin()) laneSelectParam = laneSelectParam - 1;
 	}else if(key == ']'){
@@ -1775,9 +1236,9 @@ void ofApp::keyPressed(int key){
 	}else if(key == OF_KEY_LEFT){
 		onPrevRecordingPressed();
 	}else if(key == OF_KEY_UP){
-		if(mode == AppMode::Playback) player.seekBy(1000);
+		session.seekBy(1.0);
 	}else if(key == OF_KEY_DOWN){
-		if(mode == AppMode::Playback) player.seekBy(-1000);
+		session.seekBy(-1.0);
 	}
 }
 
@@ -1791,8 +1252,8 @@ void ofApp::keyPressed(int key){
 
 void ofApp::mousePressed(int x, int y, int){
 	if(!overlayParam) return; // handles are hidden -> nothing to grab
-	if(gui.getShape().inside(x, y) || trackingGui.getShape().inside(x, y)) return;
-	if(mode == AppMode::Playback && playbackGui.getShape().inside(x, y)) return;
+	if(gui.getShape().inside(x, y) || editGui.getShape().inside(x, y)) return;
+	if(session.getMode() == Mode::Playback && playbackGui.getShape().inside(x, y)) return;
 
 	float bestD2 = kFrameHandleHitRadius * kFrameHandleHitRadius;
 	dragLane = -1;
@@ -1868,7 +1329,7 @@ void ofApp::mousePressed(int x, int y, int){
 			tracking::LaneConfig & lane = editLayout.lanes[insLane];
 			const ofRectangle & pane = paneRects[lane.pane];
 			float ux, uy;
-			clampLaneDrag(displayLens.geometry(), pane, x, y, ux, uy);
+			clampLaneDrag(previewGeometry, pane, x, y, ux, uy);
 			const int at = lane.insertStation(insEdge, insSeg, insT, ux, uy);
 			if(at >= 0){
 				dragLane = insLane;
@@ -1897,8 +1358,9 @@ bool ofApp::mousePressCanvas(int x, int y){
 	dragCorridor = -1;
 	dragPlaceHandle = -1;
 	if(canvasRect.width <= 0 || !canvasViewRect.inside(x, y)) return false;
-	const std::vector<std::string> ids = editCorridorIds();
+	const std::vector<std::string> ids = session.corridorIds();
 	if(ids.empty()) return false;
+	const tracking::TrackingConfig & cfg = session.getConfig();
 	const int sel = ofClamp(corridorSelectParam.get(), 0, static_cast<int>(ids.size()) - 1);
 	const float cx = (x - canvasRect.x) / canvasRect.width;
 	const float cy = (y - canvasRect.y) / canvasRect.height;
@@ -1908,7 +1370,7 @@ bool ofApp::mousePressCanvas(int x, int y){
 	for(int pass = 0; pass < 2 && dragCorridor < 0; pass++){
 		for(size_t i = 0; i < ids.size(); i++){
 			if((pass == 0) != (static_cast<int>(i) == sel)) continue;
-			const tracking::CorridorPlacement p = trackingConfig.placementFor(ids[i]);
+			const tracking::CorridorPlacement p = cfg.placementFor(ids[i]);
 			const float hx[4] = {p.x0, p.x1, p.x1, p.x0}, hy[4] = {p.y0, p.y0, p.y1, p.y1};
 			for(int h = 0; h < 4; h++){
 				const float sx = canvasRect.x + hx[h] * canvasRect.width;
@@ -1926,7 +1388,7 @@ bool ofApp::mousePressCanvas(int x, int y){
 	for(int pass = 0; pass < 2 && dragCorridor < 0; pass++){
 		for(size_t i = 0; i < ids.size(); i++){
 			if((pass == 0) != (static_cast<int>(i) == sel)) continue;
-			const tracking::CorridorPlacement p = trackingConfig.placementFor(ids[i]);
+			const tracking::CorridorPlacement p = cfg.placementFor(ids[i]);
 			if(cx >= std::min(p.x0, p.x1) && cx <= std::max(p.x0, p.x1)
 			   && cy >= std::min(p.y0, p.y1) && cy <= std::max(p.y0, p.y1)){
 				dragCorridor = static_cast<int>(i);
@@ -1942,13 +1404,13 @@ bool ofApp::mousePressCanvas(int x, int y){
 }
 
 void ofApp::mouseDragCanvas(int x, int y){
-	const std::vector<std::string> ids = editCorridorIds();
+	const std::vector<std::string> ids = session.corridorIds();
 	if(dragCorridor < 0 || dragCorridor >= static_cast<int>(ids.size()) || canvasRect.width <= 0) return;
 	// placements may leave the canvas (that cuts the corridor) but stay
 	// within the slider range
 	const float cx = ofClamp((x - canvasRect.x) / canvasRect.width, -1.0f, 2.0f);
 	const float cy = ofClamp((y - canvasRect.y) / canvasRect.height, -1.0f, 2.0f);
-	tracking::CorridorPlacement & p = placementRef(ids[dragCorridor]);
+	tracking::CorridorPlacement p = session.getConfig().placementFor(ids[dragCorridor]);
 	switch(dragPlaceHandle){
 		case 0: p.x0 = cx; p.y0 = cy; break;
 		case 1: p.x1 = cx; p.y0 = cy; break;
@@ -1964,8 +1426,7 @@ void ofApp::mouseDragCanvas(int x, int y){
 		}
 		default: break;
 	}
-	// the change reaches the worker through pushTrackingTuning() (no
-	// rebuild — placements are applied when results are published)
+	session.setPlacement(ids[dragCorridor], p); // applied at publish time, no rebuild
 }
 
 void ofApp::mouseDragged(int x, int y, int){
@@ -1978,10 +1439,8 @@ void ofApp::mouseDragged(int x, int y, int){
 	if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) return;
 	const ofRectangle & pane = paneRects[lane.pane];
 	if(pane.width <= 0 || pane.height <= 0) return;
-	// stations stay inside the recovered picture (the bright frame plus
-	// the dim border). Past that there is no sensor pixel.
 	float ux, uy;
-	clampLaneDrag(displayLens.geometry(), pane, x, y, ux, uy);
+	clampLaneDrag(previewGeometry, pane, x, y, ux, uy);
 	lane.setStation(dragEdge, dragStation, ux, uy);
 }
 
@@ -2004,80 +1463,14 @@ void ofApp::mouseReleased(int, int, int){
 }
 
 //--------------------------------------------------------------
-// recording & playback
+// gui panels and listeners
 
-void ofApp::startRecording(){
-	if(recorder.isRecording()) return;
-	if(!recorder.start(recordingsDir)){
-		recordParam = false;
-		return;
-	}
-	// frames reach the recorder through the permanent raw-frame tap
-}
-
-void ofApp::stopRecording(){
-	if(!recorder.isRecording()) return;
-	recorder.stop();
-}
-
-void ofApp::startMotionExport(){
-	stopMotionExport(); // a start always opens a fresh file
-	motionExportSource = currentSourceName();
-	ofDirectory::createDirectory(recordingsDir, false, true);
-	motionExportPath = ofFilePath::join(recordingsDir,
-		"motion_" + motionExportSource + "_" + ofGetTimestampString("%Y-%m-%d_%H-%M-%S") + ".json");
-	// 30 fps is only the fallback for a file too short to measure its own rate
-	motionExport = std::make_unique<output::MotionPathRecording>(
-		motionExportSource, 30.0, trackingConfig.canvas.width, trackingConfig.canvas.height,
-		output::MotionPathRecording::Style::Editor);
-	ofLogNotice("ofApp") << "motion export started -> " << motionExportPath;
-}
-
-void ofApp::stopMotionExport(){
-	if(!motionExport) return;
-	const std::unique_ptr<output::MotionPathRecording> rec = std::move(motionExport);
-	if(rec->frameCount() == 0){
-		ofLogNotice("ofApp") << "motion export discarded (no frames): " << motionExportPath;
-		return;
-	}
-	if(rec->save(motionExportPath)){
-		ofLogNotice("ofApp") << "motion export written: " << motionExportPath
-		                     << " (" << rec->frameCount() << " frames)";
-	}else{
-		ofLogError("ofApp") << "failed to write motion export " << motionExportPath;
-	}
-}
-
-void ofApp::enterPlayback(){
-	if(mode == AppMode::Playback) return;
-	if(recordParam) recordParam = false; // stops an active recording
-	if(!player.scan(recordingsDir)){
-		ofLogWarning("ofApp") << "no recordings to play in " << recordingsDir;
-		playbackParam = false; // stay live (nested listener call is a no-op)
-		return;
-	}
-	playbackSeenFrameId = 0;
-	mode = AppMode::Playback;
-	playParam = true; // scan() starts playing; keep the toggle in step
-	layoutGuiPanels();
-	trackingManager.reset(); // fresh background model / tracks for the recording
-}
-
-void ofApp::exitPlayback(){
-	if(mode == AppMode::Live) return;
-	mode = AppMode::Live;
-	player.close();
-	playbackTexture.clear();
-	layoutGuiPanels();
-	trackingManager.reset();
-}
-
-// Stream panel on top; in playback mode the transport panel sits under
-// it and the tracking panel moves down below that. The transport panel
-// only listens to the mouse while it is shown — ofxGui would otherwise
-// keep hit-testing the hidden widgets.
+// Main panel on top; in playback mode the transport panel sits under it
+// and the edit panel moves down below that. The transport panel only
+// listens to the mouse while it is shown — ofxGui would otherwise keep
+// hit-testing the hidden widgets.
 void ofApp::layoutGuiPanels(){
-	const bool playback = (mode == AppMode::Playback);
+	const bool playback = session.getMode() == Mode::Playback;
 	if(playback != playbackGuiActive){
 		if(playback) playbackGui.registerMouseEvents();
 		else playbackGui.unregisterMouseEvents();
@@ -2088,108 +1481,71 @@ void ofApp::layoutGuiPanels(){
 		playbackGui.setPosition(10, y);
 		y = playbackGui.getShape().getBottom() + 8;
 	}
-	trackingGui.setPosition(10, y);
+	editGui.setPosition(10, y);
 }
 
 void ofApp::onPlayChanged(bool & value){
-	player.setPaused(!value);
+	if(value) session.play();
+	else session.pause();
 }
 
 void ofApp::onPlayheadChanged(float & value){
 	if(playheadSync) return; // mirrored from the player, not a scrub
-	if(mode == AppMode::Playback) player.seekTo(value * 1000.0);
+	session.seekTo(value);
 }
 
 void ofApp::onPrevFramePressed(){
-	if(mode == AppMode::Playback) player.stepFrame(-1);
+	session.stepFrame(-1);
 }
 
 void ofApp::onNextFramePressed(){
-	if(mode == AppMode::Playback) player.stepFrame(1);
+	session.stepFrame(1);
 }
 
 void ofApp::onPrevRecordingPressed(){
-	if(mode != AppMode::Playback) return;
-	player.previous();
-	trackingManager.reset();
+	session.previousRecording();
 }
 
 void ofApp::onNextRecordingPressed(){
-	if(mode != AppMode::Playback) return;
-	player.next();
-	trackingManager.reset();
-}
-
-//--------------------------------------------------------------
-void ofApp::saveScreenshot(){
-	const std::string filename = "screenshot_" + ofGetTimestampString("%Y-%m-%d_%H-%M-%S") + ".png";
-	ofSaveScreen(filename);
-	ofLogNotice("ofApp") << "screenshot saved to bin/data/" << filename;
-}
-
-//--------------------------------------------------------------
-void ofApp::onPreviewChanged(bool &){
-	settingsDirty = true;
-	settingsDirtySinceMs = MobotixMjpegClient::nowMs();
-}
-
-void ofApp::onQualityChanged(int &){
-	if(!previewParam) return; // quality only affects preview streams
-	settingsDirty = true;
-	settingsDirtySinceMs = MobotixMjpegClient::nowMs();
+	session.nextRecording();
 }
 
 void ofApp::onRecordChanged(bool & value){
 	if(value){
-		if(recorder.isRecording()) return;
-		if(mode == AppMode::Playback){
-			ofLogWarning("ofApp") << "recording only works in live mode";
-			recordParam = false;
-			return;
-		}
-		startRecording();
+		if(!session.startRecording()) recordParam = false; // nested listener call is a no-op
 	}else{
-		stopRecording();
+		session.stopRecording();
 	}
 }
 
 void ofApp::onExportChanged(bool & value){
-	if(value) startMotionExport();
-	else stopMotionExport();
+	if(value) session.startMotionExport();
+	else session.stopMotionExport();
 }
 
 void ofApp::onPlaybackChanged(bool & value){
 	if(value){
-		enterPlayback();
+		if(recordParam) recordParam = false; // stops an active recording
+		if(!session.setMode(Mode::Playback)){
+			playbackParam = false; // stay live
+			return;
+		}
+		playParam = true; // scan() starts playing; keep the toggle in step
 	}else{
-		exitPlayback();
+		session.setMode(Mode::Live);
 	}
+	texture.clear();
+	layoutGuiPanels();
 }
 
 void ofApp::onTrackingChanged(bool & value){
-	trackingManager.setEnabled(value);
-	if(value) trackingManager.reset(); // fresh background model on re-enable
-}
-
-void ofApp::onDetectorChanged(int & value){
-	trackingManager.setDetectorType(value == 2 ? "yolo" : value == 1 ? "bgs" : "flow");
-}
-
-void ofApp::onHalfResChanged(bool & value){
-	// takes effect on the next frame; no stream restart needed
-	client.setDecodeScale(value ? 2 : 1);
-	player.setDecodeScale(value ? 2 : 1);
-}
-
-void ofApp::onUdpChanged(bool & value){
-	if(value){
-		if(!udp.isOpen() && !udp.open(udpHost, udpPort)) udpParam = false;
-	}else{
-		udp.close();
-	}
+	session.setTrackingEnabled(value);
 }
 
 void ofApp::onReconnectPressed(){
-	settingsDirty = false;
-	applyStreamSettings();
+	session.reconnect();
+}
+
+void ofApp::onSavePressed(){
+	session.saveConfig();
 }

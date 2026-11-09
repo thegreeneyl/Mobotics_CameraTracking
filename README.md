@@ -1,14 +1,17 @@
 # YOUniverse_CameraTracking
 
-Standalone openFrameworks 0.12.1 test app for integrating the Mobotix Mx-S74A
-cameras (motion + brightness sensors) into the YOUniverse system. It pulls the
-authenticated live MJPEG stream, shows both optical modules side by side, and
-displays the raw Mx-F-MSA (MultiSense) brightness value parsed from the JPEG
-metadata of every frame.
+Standalone openFrameworks 0.12.1 app for the Mobotix Mx-S74A camera on the
+YOUniverse facade: it pulls the authenticated live MJPEG stream, tracks
+trains and boats in configured corridors and publishes them as
+motion-path.v1 frames on an output canvas.
 
-This app is deliberately independent of `YOUniverse_Steuerung` — it exists to
-validate camera ingest before any production integration. The
-`src/mobotix/` classes have no UI dependencies so Steuerung can reuse them later.
+Everything that does the work sits behind one GUI-free class,
+`src/session/CameraTrackingSession` — stream, recording, playback, the
+tracking worker, config load/save, the editor motion-file export and the
+newest result as JSON (`resultJson()`). `ofApp` is only the window around
+it (ofxGui, preview, lane editor, result views) and is temporary: the
+production home is `YOUniverse_Steuerung`. The port is tracked in
+[PORT_TO_STEUERUNG.md](PORT_TO_STEUERUNG.md).
 
 ## Hardware
 
@@ -30,15 +33,31 @@ make RunRelease
 
 Configuration: copy `bin/data/config/config.example.json` to
 `bin/data/config/config.json` (gitignored) and fill in the camera password.
-Only the first camera with `"enabled": true` is used in v1; the second CPU
-entry is a stub for later.
+Only the first camera with `"enabled": true` is used.
+
+### Config document
+
+`config.json` has exactly four top-level keys, and "save config.json" in
+the window writes the whole document back from memory in that shape:
+
+| Key | Content |
+| --- | --- |
+| `cameras[]` | `id`, `enabled`, `host`, `user`, `password`, `stream`, `fps`, `preview`, `previewSize`, `quality` |
+| `recordingsDir` | recordings folder, relative to `bin/data` |
+| `display` | `decodeScale` (1 full, 2 DCT half-size display decode), `arrowScale` (overlay velocity arrows) |
+| `tracking` | `enabled`, `analysisReduce`, `laneMaxWidth`, `laneMinHeight`, `lens`, `flow`, `tracker` (incl. `trailLen`), `shape` (incl. `model`), `smoothing`, `canvas`, `corridors`, `layouts` |
+
+Everything in it is edited in the file and takes effect on restart, with
+two exceptions that the window edits and saves: the lane anchors
+(`layouts[].lanes[]`) and the corridor placements
+(`corridors.<id>.placement`). There are no tuning sliders. Older documents
+with `output`, `tracking.detector`, `tracking.bgs`, `tracking.yolo` or
+`tracking.overlay` still load (the overlay values fold into
+`display.arrowScale` / `tracker.trailLen`); the next save drops them.
 
 ### Keys / GUI
 
 - `r` — reconnect (also GUI button)
-- `p` — toggle preview (downscaled) stream
-- `c` — toggle raw JPEG COM metadata dump
-- `s` — save a screenshot to `bin/data/`
 - `t` — toggle object tracking
 - `o` — toggle the tracking debug overlay
 - `m` — show the detector's motion mask behind the rectified lane views
@@ -47,14 +66,12 @@ entry is a stub for later.
   pixels currently attributed to it (`x`, off by default), its smoothed
   outline (`n`) and its bounding box (`b`). Each is independent; see
   *Object outline*
-- `q` — result data (default) / raw tracker data. Result is what UDP and
-  the motion export send. For a boat the box and the center are the
-  outline's bounds; the arrow is still the flow velocity, drawn from that
-  center. Raw draws the flow box the tracker measures with. Trains stay on
-  the flow box in both, because the outline covers only part of a train.
-  See *Result and raw*
-- `?` — show candidates (unconfirmed tracks). Off by default; see
-  *Candidates and verified objects*
+- `q` — result data (default) / raw tracker data. Result is what
+  `resultJson()` and the motion export carry. For a boat the box and the
+  center are the outline's bounds; the arrow is still the flow velocity,
+  drawn from that center. Raw draws the flow box the tracker measures
+  with. Trains stay on the flow box in both, because the outline covers
+  only part of a train. See *Result and raw*
 - `[` / `]` — select the previous / next lane for editing
 - `v` — result view: output canvas (default) / rectified lane strips
 - `,` / `.` — select the previous / next corridor for placing on the canvas
@@ -65,35 +82,21 @@ entry is a stub for later.
 - `TAB` — toggle LIVE / PLAYBACK mode
 - `LEFT` / `RIGHT` — previous / next recording (playback mode, wraps)
 - `UP` / `DOWN` — seek +/-1 s within the current recording (playback mode)
-- GUI: preview toggle, JPEG quality (preview only), COM dump toggle,
-  record toggle, export toggle, playback-mode toggle, tracking/overlay/mask/detections
-  toggles, the three result layers (`shape pixels`, `shape outline`,
-  `bounding box`), the `result data (q)` toggle, the `candidates (?)` toggle, result view switch (0 canvas / 1 lane strips), detector switch
-  (0 flow / 1 bgs / 2 yolo), half-res display decode toggle, UDP publish
-  toggle
-- Playback panel (playback mode only, between the stream and tracking
+- GUI "camera tracking" panel: playback-mode, record and export toggles,
+  tracking/overlay toggles, `image scale`, the mask/detections toggles,
+  the three result layers (`shape pixels`, `shape outline`, `bounding
+  box`), the `result data (q)` toggle, result view switch (0 canvas / 1
+  lane strips) and the reconnect button
+- Playback panel (playback mode only, between the main and edit
   panels): `play` toggle, `playhead` slider to scrub, `prev frame` /
   `next frame` to step one frame (also while paused — the stepped frame
   goes through tracking and the export like any other), `prev recording` /
   `next recording`
-- Tracking panel (below the stream panel): lens correction at the top
-  (`lens correct`, `fov deg`, `k1`, `k2`, `balance`, optical center — see
-  *Lens correction*), lane selector with the selected
-  lane's corridor range `s0`/`s1`, corridor selector with the selected
-  corridor's canvas placement `place x0/x1/y0/y1` (see *Canvas placement*
-  below), live sliders for the flow detector
-  (`minFlowPx`, `ema`, `busyThresh`, MOG2 on/off + `varThreshold`, closing
-  kernel, `minAreaFrac`, `minCoherence`, `minSpeed`, `mergeGapFrac`), the
-  tracker (`confirmFrames`, `maxMisses`, `gateGapFrac`, `absorbGapFrac`,
-  `mergeFrames`, `reacquireMs`, `velMeasNoise`, trail length), the shape
-  estimator (`shape 0mask 1fg 2model`, `ema`, `threshold`, `padX`, `padY`,
-  `simplify`), YOLO thresholds and the overlay arrow scale. Changes reach the tracking worker
-  within ~250 ms — tweak while watching the overlay. "save to config.json"
-  writes the current values (plus the layouts, canvas and corridor
-  placements) back into the `tracking` section of the loaded config file;
-  nothing else in the file is touched. The sliders edit the *base*
-  `flow`/`tracker` blocks; per-corridor parameter overrides
-  (`tracking.corridors.<id>.flow/.tracker`) stay as they are in the file.
+- Edit panel: lane selector with the selected lane's corridor range
+  `s0`/`s1`, corridor selector with the selected corridor's canvas
+  placement `place x0/x1/y0/y1` (see *Canvas placement* below) and "save
+  config.json", which writes the whole document (see *Config document*).
+  Lens, detector, tracker, shape and smoothing values are config-only.
 - Lane editor: every lane of the active layout is a strip on its pane
   (the selected lane is highlighted; grabbing a point selects that lane;
   overlay must be visible). The strip has a top border and a bottom border.
@@ -135,8 +138,7 @@ in `config.json`, default `recordings`, created on demand; each recording
 gets a fresh timestamp). A JSON sidecar (`rec_<same-stamp>.json`) with
 per-frame `{offset, size, tMs}` entries is written on stop, so playback is
 paced exactly like the original stream. No re-encoding — the JPEG COM
-sensor metadata stays intact, and the sensor panel keeps working during
-playback.
+sensor metadata stays intact.
 
 Playback (`TAB`) starts with the most recent recording, plays it to the end,
 then cycles onward through all recordings newest to oldest (wrapping).
@@ -145,13 +147,11 @@ steps single frames (a paused recording does not cycle on). While in playback mo
 keeps running in the background but is ignored; `TAB` returns to it
 instantly. Entering playback stops an active recording first.
 
-Headless check: `CAMTRACK_AUTOSHOT=/tmp/shot.png ./YOUniverse_CameraTracking`
-streams for ~8 s (`CAMTRACK_AUTOSHOT_SEC` to change), saves a screenshot,
-and exits. Stats are logged every 5 s. Add `CAMTRACK_AUTOPLAYBACK=1` to
-start in playback mode instead (verifies recording playback + tracking
-without a reachable camera); `CAMTRACK_RECORDINGS=<dir>` then picks the
-recordings folder, so a folder holding one symlinked recording plays
-exactly that one.
+Stats are logged every 5 s. `CAMTRACK_AUTOPLAYBACK=1` starts in playback
+mode (recording playback + tracking without a reachable camera);
+`CAMTRACK_RECORDINGS=<dir>` then picks the recordings folder, so a folder
+holding one symlinked recording plays exactly that one.
+`CAMTRACK_AUTOEXPORT=1` starts a motion export at launch.
 
 ## Stream ingest (what was chosen and why)
 
@@ -216,13 +216,12 @@ own center. One coefficient set is shared (the modules are the same lens).
 | `balance` | 0 fills the frame (the invalid corners are cropped), 1 keeps every source pixel (black corners) |
 | `centerX`, `centerY` | optical center as a fraction of the pane, when the bow is not symmetric |
 
-The sliders are the first rows of the tracking panel and reach both the
-picture and the tracker immediately. "save to config.json" writes them.
-`fovDeg` 170 is the starting point for this lens: on
+The values are config-only (`tracking.lens`, read at startup) and reach
+both the picture and the tracker. `fovDeg` 170 is the starting point for this lens: on
 `rec_2026-09-23_14-18-08` it takes the viaduct's bow (about 116 px of sag
 on a 1920-wide frame) down to a few pixels. What is left of the slope is
 perspective — the track is not square to the camera — and no lens model
-removes that. Drag `fov deg` while a train is in frame until the deck is a
+removes that. Adjust `fovDeg` with a train in frame until the deck is a
 straight line. Lane corners placed before the correction was
 turned on sat on the distorted image and will miss the viaduct until you
 drag them back onto it.
@@ -233,7 +232,7 @@ and a lane anchor can be dragged into it. `0..1` is still the bright
 frame, so lanes already placed do not move; a point past that is simply
 out in the dim border. The tracker samples those pixels, so a corridor
 pulled past the frame sees a boat or train there. Past the last real
-pixel the border is black and nothing is tracked. The stream panel's
+pixel the border is black and nothing is tracked. The main panel's
 `image scale` only changes how large that picture is drawn (1 fits the
 border, 1.5 is the default). It does not change the lens or the tracking.
 
@@ -251,7 +250,7 @@ upright rectangle (at most `laneMaxWidth` px wide, at least
 `laneMinHeight` px high). Along-track position in that rectangle is the
 centreline length, so a bend keeps its share of the width. The lane view
 below the video, the detector and everything published (corridor `x`/`y`,
-the canvas box, UDP, the motion file) stay on that flat rectangle. The
+the canvas box, `resultJson()`, the motion file) stay on that flat rectangle. The
 overlay on the photo maps them back through the same slices, so the box
 follows the curve on screen and is rectangular in the result.
 A **corridor** is the physical path an object follows (`train`, `boat`,
@@ -282,7 +281,7 @@ per second"; a mirrored placement flips its sign). The uncut corridor
 values travel along as `corridor: {x, y, w, h, vx, vy}`. Placements are
 applied when results are published — changing them never restarts the
 detector or the tracks — and are edited on the canvas view (mouse) or the
-`place` sliders; "save to config.json" stores them.
+`place` sliders; "save config.json" stores them.
 
 A **layout** is the set of lanes for one camera view: `panes` (1 = single
 module, 2 = BOTH side by side) selects it, an optional `recordings` filter
@@ -408,9 +407,9 @@ the signed pixels; a train entering behind a corridor-long one is only a
 few percent) — is cut into a +x and a −x part — each sign's seed
 pixels grown by the closing kernel inside the component and off the other
 sign's pixels — and each part is measured on its own. Single-direction
-components are untouched. `bgs` (plain MOG2) and
-`yolo` (ONNX via OpenCV DNN, model in `bin/data/models/`, falls back to
-flow when missing) are still selectable for comparison.
+components are untouched. Flow is the only detector; the experimental
+plain-MOG2 and YOLO-as-detector variants were removed (the YOLO
+segmentation model lives on as the shape estimator's silhouette source).
 
 ### Tracker
 
@@ -538,12 +537,10 @@ in the same frame. Candidates are what the water glitter is: a few frames
 of motion, no hull, dead after `tentativeMaxMisses` misses (default 3).
 They are not a second tracker — suppressing their creation would blind
 `hiddenRear` (an object appearing from behind one already verified) and
-id reacquisition. The overlay hides them unless `candidates (?)` is on
-(`?` key, GUI toggle, off by default); the status line still counts them
-(`+N tentative`). The batch contact sheets keep drawing them (a tuning
-artefact). Nothing else does: the output smoother, the UDP stream to the
-control software, the editor export and the motion file all drop
-`!confirmed`. Measured on all eleven annotated recordings (shipped
+id reacquisition. The window never draws them; the batch contact sheets
+keep drawing them (a tuning artefact, with a ` ?` suffix). Nothing else
+does: the output smoother, `resultJson()`, the editor export and the
+motion file all drop `!confirmed`. Measured on all eleven annotated recordings (shipped
 config, old layouts for the September set): 40–140 candidates per
 recording, almost all of them in the boat corridor, and not one
 confirmed outside an annotated window — the 31 confirmed tracks are
@@ -778,9 +775,7 @@ yolo export model=yolov8n-seg.pt format=onnx imgsz=192,640 opset=12 simplify=Tru
 # -> yolov8n-seg.onnx, copy to bin/data/models/ and set tracking.shape.model
 ```
 
-`model`, `modelInputW/H` are read at startup; everything else in
-`tracking.shape` is live (GUI sliders for `source`, `ema`, `threshold`,
-`padX`, `padY`, `simplify`) and can be overridden per corridor
+`tracking.shape` is read at startup and can be overridden per corridor
 (`tracking.corridors.<id>.shape`). Limits: at night (IR, the train is a row
 of lit windows) the model mostly fails and the mask fallback gives the
 detector's bar rather than a silhouette — the boat still segments well; the model sees
@@ -817,8 +812,8 @@ job is that whatever is published never jumps — nothing feeds back.
 ### Result and raw
 
 `q` (GUI: `result data`) switches every view between the published result
-and the tracker's own box. Default is the result, which is also what UDP
-and the motion export send.
+and the tracker's own box. Default is the result, which is also what
+`resultJson()` and the motion export carry.
 
 For a **boat**, once the drawn outline is a real silhouette and not the
 rectangle stand-in, the published box is that outline's bounds and the
@@ -885,11 +880,18 @@ polygon `[[x, y], …]` in canvas coordinates, clipped to the canvas like the
 box; empty until the shape has its first observation or when
 `tracking.shape.enabled` is false), the uncut corridor-normalized `corridor
 {x, y, w, h, vx, vy}` and, for overlays, the back-projected `panes[]` boxes.
-`view` is the corridor id. With
-`output.udp.enabled` the app sends one datagram per analysed frame to
-`output.udp.host:port` (toggle in the GUI); the batch runner writes the
-same frames under `{"kind": "recording"}` (`tools/eval/score.py` reads
-`view`, `class` and `clipped` from them).
+`view` is the corridor id.
+
+**`resultJson()`** on `CameraTrackingSession` is the newest such frame
+(`frame` counts up from 1 per session, `fps` is the camera's configured
+rate or, when that is 0, the recording's frame spacing / the measured
+stream rate, `camera` is `"live"` or the recording name). It is rebuilt
+on the main thread each time the tracking worker publishes a new
+revision — `resultRevision()` tells a consumer when to read it. There is
+no network output; the host application decides what to do with the
+object. The batch runner writes the same frames under
+`{"kind": "recording"}` (`tools/eval/score.py` reads `view`, `class` and
+`clipped` from them).
 
 **Export motion (`e`)** writes a file for the facade editor instead: the
 same canvas-space objects cut down to what its parser reads — root
@@ -908,30 +910,45 @@ next one, so each file is one continuous take with stable ids.
 The debug overlay (`o`) draws per object, in a stable per-id color: the
 shape pixels (`x`), the outline (`n`) and the bounding box (`b`) — each per
 lane it is visible in — plus center point, velocity arrow (1 s
-lookahead × `overlay.arrowScale`), fading trail, and `#id label phase
-speed shape:<source>`. With `result data` on (the default) the box and
-the center are the published ones; `q` shows the flow box instead. Candidates (unconfirmed tracks) are hidden unless
-`candidates (?)` is on, and when shown are dimmed with a `?` — see
-*Candidates and verified objects*. The batch contact sheets and lane
-strips draw the outline together with the box, candidates included.
+lookahead × `display.arrowScale`), fading trail (`tracker.trailLen`
+frames), and `#id label phase speed shape:<source>`. With `result data`
+on (the default) the box and the center are the published ones; `q`
+shows the flow box instead. Only confirmed objects are drawn — see
+*Candidates and verified objects*. The batch contact sheets draw the
+outline together with the box, candidates included.
 
 ### Threading & decode
 
-The main thread only uploads textures and draws. Raw JPEG bytes are the
-currency between threads; each consumer decodes what it needs:
+The main thread runs `CameraTrackingSession::update()` (poll the newest
+frame, lens-correct it, poll the newest results, build `resultJson()`,
+feed the export) and then draws. Raw JPEG bytes are the currency between
+threads; each consumer decodes what it needs:
 
 | Thread | Work |
 |---|---|
 | stream thread | curl receive, JPEG framing, COM parse, display decode |
 | playback thread | sidecar pacing, disk reads, display decode |
-| tracking thread | own reduced decode (DCT-domain, `tracking.analysisReduce`, grayscale for flow/BGS, BGR for YOLO), lane warps, detectors + trackers |
-| main thread | texture upload, UI, overlay |
+| tracking thread | own reduced decode (DCT-domain, `tracking.analysisReduce`, grayscale for flow, BGR when the shape model is on), lane warps, detectors + trackers |
+| main thread | session update, texture upload, UI, overlay |
 
 All hand-offs are latest-only slots (drop stale, never queue). Display
-decode uses `cv::imdecode` (libjpeg-turbo); `display.decodeScale: 2` decodes
-at half size in the DCT domain (quarter cost, still larger than the
-on-screen panes — overlay coordinates are normalized, so unaffected). The
-stats bar shows per-stage timings (`dec`, `det`, `trk`).
+decode uses Apple ImageIO (`util/JpegDecode`); `display.decodeScale: 2`
+decodes at half size in the DCT domain (quarter cost, still larger than
+the on-screen panes — overlay coordinates are normalized, so unaffected).
+The stats bar shows per-stage timings (`dec`, `det`, `trk`, `shp`).
+
+### Source layout
+
+| Folder | Content | Moves to Steuerung |
+|---|---|---|
+| `src/session/` | `CameraTrackingSession` — the whole module behind one class | yes |
+| `src/mobotix/` | MJPEG client, JPEG COM parser, camera types | yes |
+| `src/recording/` | `MjpegRecorder`, `MjpegPlayer` (`RecordingReader` is batch-only) | player + recorder |
+| `src/tracking/` | lens → lane warp → flow detector → grouping → tracker → shape → smoothing, config JSON | yes |
+| `src/util/` | lens corrector, JPEG decode | yes |
+| `src/output/` | motion-path.v1 builder + recording writer | yes |
+| `src/batch/`, `tools/eval/` | headless evaluation harness | stays here |
+| `src/ofApp.*` | the temporary ofxGui window | rewritten in Steuerung's UI |
 
 ## Brightness / sensor values
 
@@ -949,7 +966,9 @@ firmware against `/control/camerainfo?text`:
 | `FRJ` | Camera-reported frame rate | fps = FRJ / 10 |
 
 Every stream frame carries these values, so no separate polling is needed.
-`JpegCommentParser` extracts them; toggle "show COM dump" to see the raw text.
+`JpegCommentParser` extracts them into `SensorSnapshot`
+(`CameraTrackingSession::getSensors()`); the stats bar shows the camera
+fps and the MultiSense lux, and the 5 s log line carries the lux too.
 
 ## Notes / next steps
 
@@ -959,5 +978,6 @@ Every stream frame carries these values, so no separate polling is needed.
 - Motion events (Video Motion on M1/M2, PIR on M3) are the next phase:
   camera-side events via IP Notify / MQTT / `event_env` (illumination source
   `cam2` = M3) rather than polling.
-- Second S74 (west brightness): add its entry in `config.json` and extend the
-  app to run one `MobotixMjpegClient` per camera.
+- Second S74 (west brightness): add its entry to `cameras[]` and extend the
+  session to run one `MobotixMjpegClient` per camera.
+- The port into `YOUniverse_Steuerung`: [PORT_TO_STEUERUNG.md](PORT_TO_STEUERUNG.md).

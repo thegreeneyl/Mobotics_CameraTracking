@@ -10,14 +10,13 @@
 #include <thread>
 #include <vector>
 
-#include "BgsDetector.h"
 #include "FlowMotionDetector.h"
+#include "IDetector.h"
 #include "MultiObjectTracker.h"
 #include "OutputSmoother.h"
 #include "ShapeEstimator.h"
 #include "LaneWarp.h"
 #include "TrackingTypes.h"
-#include "YoloDetector.h"
 #include "../util/LensCorrector.h"
 
 namespace tracking {
@@ -34,26 +33,25 @@ struct CorridorConfig {
 	std::map<std::string, double> shape;
 };
 
+// The whole `tracking` section of the config file. Everything in here is
+// read from the file; only the layouts (lane anchors) and the corridor
+// placements are edited at runtime. See TrackingConfigJson.h.
 struct TrackingConfig {
 	bool enabled = true;
-	std::string detector = "flow"; // "flow" | "bgs" | "yolo"
 	// DCT-domain reduction of the source JPEG for analysis (1|2|4|8).
 	// 2 => a 3840x1080 frame is analysed at 1920x540 (960x540 per module).
 	int analysisReduce = 2;
-	// Undistortion applied to every frame before the lane warp. The same
-	// coefficients are what the GUI shows, so lane quads live in the
-	// corrected image.
+	// Undistortion applied to every frame before the lane warp. Lane
+	// anchors live in the corrected image.
 	LensCorrection lens;
 	// Rectified lane images are at most this wide (px) and at least this
 	// tall; the lane keeps its aspect unless the height floor kicks in.
 	int laneMaxWidth = 800;
 	int laneMinHeight = 64;
-	FlowDetectorConfig flow;
-	BgsConfig bgs;
+	FlowDetectorConfig flow; // the one detector (per lane)
 	TrackerConfig tracker;
 	ShapeConfig shape; // per-object silhouette (see ShapeEstimator)
 	SmoothConfig smoothing; // publisher-side smoothing (see OutputSmoother)
-	YoloConfig yolo;
 	std::vector<LayoutConfig> layouts;
 	std::vector<CorridorConfig> corridors;
 	CanvasConfig canvas; // output canvas proportions (Lines area 832x442)
@@ -82,12 +80,11 @@ struct TrackingConfig {
 // the UI). The worker does its OWN reduced decode, picks the layout for the
 // frame (pane count from the aspect ratio: width >= 2*height means the
 // side-by-side "BOTH" view; source name for layout filters), undistorts
-// each pane, warps every lane quad to an upright rectangle, runs one
-// detector per lane, maps the
-// detections to corridor coordinates, groups blobs of one object across
-// lanes, runs one tracker per corridor and finally estimates each tracked
-// object's silhouette (ShapeEstimator). Publishes a TrackingResults
-// snapshot per analysed frame.
+// each pane, warps every lane quad to an upright rectangle, runs one flow
+// detector per lane, maps the detections to corridor coordinates, groups
+// blobs of one object across lanes, runs one tracker per corridor and
+// finally estimates each tracked object's silhouette (ShapeEstimator).
+// Publishes a TrackingResults snapshot per analysed frame.
 //
 // No UI dependencies (same rule as src/mobotix/).
 class TrackingManager {
@@ -100,19 +97,14 @@ public:
 	void setEnabled(bool e){ enabled = e; }
 	bool isEnabled() const { return enabled; }
 
-	// "flow", "bgs" or "yolo". YOLO is loaded lazily on the worker thread;
-	// if the model cannot be loaded it logs a warning and falls back to flow.
-	void setDetectorType(const std::string & type);
-	std::string getDetectorType() const;
-
 	// Source identity for layout matching. A change rebuilds the pipeline.
 	void setSourceName(const std::string & name);
 
-	// Live tuning from the GUI, applied on the worker before the next
-	// frame: flow / bgs / tracker values, corridor overrides, YOLO
-	// thresholds and the layouts. `enabled`, `detector` and
-	// `analysisReduce` are not touched (atomics / startup-only). Changed
-	// lane geometry rebuilds the pipeline (background models + tracks).
+	// Runtime config change, applied on the worker before the next frame:
+	// layouts, corridor placements and overrides, and the tuning blocks.
+	// `enabled` and `analysisReduce` are not touched (atomic /
+	// startup-only). Changed lane geometry rebuilds the pipeline
+	// (background models + tracks); a placement change does not.
 	void setLiveConfig(const TrackingConfig & config);
 
 	// Any thread. tMs is the frame timestamp (steady clock for live,
@@ -167,7 +159,6 @@ private:
 	void retargetMaps(int originX, int originY);
 	void applyPendingConfig(); // worker thread only
 	void applyParams();        // push cfg params into live detectors/trackers
-	std::unique_ptr<IDetector> makeDetector(const std::string & corridorId);
 	static double nowMs();
 
 	TrackingConfig cfg;
@@ -182,7 +173,6 @@ private:
 	std::thread worker;
 	std::atomic<bool> running{false};
 	std::atomic<bool> enabled{true};
-	std::atomic<int> detectorKind{0}; // 0 flow, 1 bgs, 2 yolo
 	std::atomic<bool> resetRequested{false};
 
 	// latest-only input slot
@@ -198,8 +188,6 @@ private:
 	std::string layoutName;
 	int builtPanes = 0, builtPaneW = 0, builtPaneH = 0;
 	int builtOriginX = 0, builtOriginY = 0;
-	int builtKind = -1;
-	bool yoloUnavailable = false;
 	double lastTMs = -1;
 	LensCorrector lensCorrector;
 	ShapeEstimator shapes;

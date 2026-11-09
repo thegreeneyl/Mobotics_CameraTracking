@@ -1,19 +1,23 @@
 #pragma once
 
-#include <atomic>
-#include <memory>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 #include "ofMain.h"
 #include "ofxGui.h"
 
-#include "mobotix/MobotixMjpegClient.h"
-#include "mobotix/MobotixTypes.h"
-#include "output/MotionPathWriter.h"
-#include "output/UdpSender.h"
-#include "recording/MjpegPlayer.h"
-#include "recording/MjpegRecorder.h"
-#include "tracking/TrackingManager.h"
+#include "session/CameraTrackingSession.h"
 
+// The stand-alone window around CameraTrackingSession: draws the preview,
+// the lane editor, the tracking overlay and the result views, and offers
+// the few operator controls that are not config-only — anchor and
+// placement editing, save, reconnect, view toggles, live/playback with a
+// transport, record and motion export.
+//
+// This is a temporary shell: the Steuerung build replaces it with a view
+// in its own UI system (see PORT_TO_STEUERUNG.md). Only this file and
+// ofApp.cpp use ofxGui.
 class ofApp : public ofBaseApp {
 public:
 	void setup() override;
@@ -26,72 +30,22 @@ public:
 	void mouseReleased(int x, int y, int button) override;
 
 private:
-	enum class AppMode { Live, Playback };
-
-	void loadConfig();
-	void applyStreamSettings();
 	void drawVideo();
 	void drawTrackingOverlay();
 	void drawLaneEditor();
 	void drawTrackingResults();
 	void drawCanvasView();
 	void drawRecordingIndicator();
-	void drawSensorPanel();
 	void drawStatsBar();
-	void drawComDump();
 
-	// camera
-	CameraConfig camConfig;
-	MobotixMjpegClient client;
+	CameraTrackingSession session;
 
-	// latest frame state
+	// preview (lens-corrected frame from the session) and newest results
 	ofTexture texture;
-	// Latest decoded frame before lens correction, so a slider drag rewarps
-	// the picture without waiting for the next JPEG.
-	ofPixels rawFrame;
-	AppMode rawFrameMode = AppMode::Live;
-	LensCorrector displayLens;
-	LensCorrection shownLens;
-	SensorSnapshot sensors;
-	std::string comDump;
-	uint64_t lastSeenFrameId = 0;
-	double lastFrameReceivedMs = 0;   // client steady-clock ms
-	double lastUploadLatencyMs = 0;   // receive-complete -> texture upload
-
-	// recording & playback
-	// mode is atomic: the raw-frame taps read it on the stream / playback
-	// threads to decide where frames go.
-	std::atomic<AppMode> mode{AppMode::Live};
-	std::string recordingsDir; // absolute
-	MjpegRecorder recorder;
-	MjpegPlayer player;
-	ofTexture playbackTexture;
-	uint64_t playbackSeenFrameId = 0;
-	double playbackFrameTMs = 0;
-	void startRecording();
-	void stopRecording();
-	void enterPlayback();
-	void exitPlayback();
-	std::string currentSourceName() const;
-
-	// motion-path export: one editor-shaped JSON file per start, fed by the
-	// tracking results in both modes — independent of the MJPEG recorder,
-	// which taps raw JPEG bytes. A source change (live <-> playback, next
-	// recording) closes the file and opens a new one.
-	std::unique_ptr<output::MotionPathRecording> motionExport;
-	std::string motionExportPath;   // absolute, written on stop
-	std::string motionExportSource; // currentSourceName() when it was opened
-	void startMotionExport();
-	void stopMotionExport();
-
-	// tracking (worker thread; fed by the raw-frame taps of client/player)
-	tracking::TrackingManager trackingManager;
-	tracking::TrackingConfig trackingConfig; // loaded config + committed lane edits
+	LensGeometry previewGeometry;
+	uint64_t previewRev = 0;
 	tracking::TrackingResults trackResults;
-	uint64_t trackResultsRevision = 0;
-	int displayDecodeScale = 2;      // config display.decodeScale
-	float overlayArrowScale = 1.0f;  // load buffer for tracking.overlay.arrowScale
-	std::string lastSourceName;
+	uint64_t trackResultsRev = 0;
 	// screen rects of the module panes, rebuilt every drawVideo()
 	std::vector<ofRectangle> paneRects;
 	// one result view per lane (index = lane index in the edited layout)
@@ -99,12 +53,11 @@ private:
 	std::vector<ofTexture> laneMaskTex;
 
 	// lane editing. editLayout is what the mouse edits and what is drawn;
-	// committedLayout is the last valid state handed to the worker (updated
-	// on mouse release, only when every strip slice is convex) and written
-	// back into trackingConfig.layouts.
+	// it is re-seeded from the session when the resolved layout changes
+	// and committed back (session.setLayout) on mouse release, only when
+	// every strip slice is convex.
 	tracking::LayoutConfig editLayout;
-	tracking::LayoutConfig committedLayout;
-	int editPaneCount = 0;
+	uint64_t seenLayoutRev = 0;
 	int dragLane = -1;
 	int dragEdge = -1;     // 0 = top border, 1 = bottom border
 	int dragStation = -1;  // index along that border
@@ -112,39 +65,24 @@ private:
 	int anchorEdge = -1;
 	int anchorStation = -1;
 	int lastLaneSelect = -1;
-	bool laneSliderSync = false;
-	void syncEditLayout(int paneCount);
+	void syncEditLayout();
 	void commitLayout();
 
 	// corridor placement editing on the output canvas (result view 0).
-	// Placements live directly in trackingConfig.corridors; a corridor the
-	// layout uses without a config entry gets one on first edit.
 	ofRectangle canvasRect;     // screen rect of the canvas itself
 	ofRectangle canvasViewRect; // the surrounding area (off-canvas parts show here)
-	std::vector<std::string> editCorridorIds() const;
-	tracking::CorridorPlacement & placementRef(const std::string & id);
-	int dragCorridor = -1;    // index into editCorridorIds()
+	int dragCorridor = -1;    // index into session.corridorIds()
 	int dragPlaceHandle = -1; // 0..3 corner (TL,TR,BR,BL), 4 = body
 	float dragGrabX = 0, dragGrabY = 0; // body drag: grab point offset (canvas units)
 	int lastCorridorSelect = -1;
 	bool mousePressCanvas(int x, int y);
 	void mouseDragCanvas(int x, int y);
 
-	// UDP publishing (output.udp in config.json)
-	output::UdpSender udp;
-	bool udpEnabled = false;
-	std::string udpHost = "127.0.0.1";
-	int udpPort = 8765;
-	int udpFrameIndex = 0;
-
-	// gui
+	// main panel: source, record/export, view toggles
 	ofxPanel gui;
-	ofParameter<bool> previewParam{"preview (downscale)", false};
-	ofParameter<int> qualityParam{"jpeg quality (preview)", 60, 10, 90};
-	ofParameter<bool> showComDumpParam{"show COM dump", false};
+	ofParameter<bool> playbackParam{"playback mode (TAB)", false};
 	ofParameter<bool> recordParam{"record (SPACE)", false};
 	ofParameter<bool> exportParam{"export motion (e)", false};
-	ofParameter<bool> playbackParam{"playback mode (TAB)", false};
 	ofParameter<bool> trackingParam{"tracking (t)", true};
 	ofParameter<bool> overlayParam{"overlay (o)", true};
 	// View zoom of the corrected picture. 1 fits the dim border in the
@@ -159,17 +97,11 @@ private:
 	// Result (default): the published box and center. For a boat that is
 	// the outline's bounds. Raw: the flow box the tracker measures with.
 	ofParameter<bool> showResultParam{"result data (q)", true};
-	// candidates: tracks that have not passed the confirmation gates yet
-	// (drawn with a " ?" suffix). Never published; shown only for tuning.
-	ofParameter<bool> showCandidatesParam{"candidates (?)", false};
 	ofParameter<int> resultViewParam{"result 0canvas 1lanes (v)", 0, 0, 1};
-	ofParameter<int> detectorParam{"detector 0flow 1bgs 2yolo", 0, 0, 2};
-	ofParameter<bool> halfResParam{"half-res decode", true};
-	ofParameter<bool> udpParam{"udp publish", false};
 	ofxButton reconnectButton;
 
-	// playback transport (shown in playback mode only, under the stream
-	// panel; the tracking panel moves down to make room)
+	// playback transport (shown in playback mode only, under the main
+	// panel; the edit panel moves down to make room)
 	ofxPanel playbackGui;
 	ofParameter<bool> playParam{"play (SPACE)", true};
 	ofParameter<float> playheadParam{"playhead s", 0, 0, 1};
@@ -187,16 +119,8 @@ private:
 	void onPrevRecordingPressed();
 	void onNextRecordingPressed();
 
-	// tracking tuning gui (values loaded from config.json, pushed live to
-	// the worker, written back by the save button — never by gui.xml)
-	ofxPanel trackingGui;
-	ofParameter<bool> lensEnabledParam{"lens correct", true};
-	ofParameter<float> lensFovParam{"lens fov deg", 170, 70, 175};
-	ofParameter<float> lensK1Param{"lens k1", 0, -0.8f, 0.8f};
-	ofParameter<float> lensK2Param{"lens k2", 0, -0.5f, 0.5f};
-	ofParameter<float> lensBalanceParam{"lens balance 0fill 1full", 0, 0, 1};
-	ofParameter<float> lensCenterXParam{"lens center x", 0.5f, 0.3f, 0.7f};
-	ofParameter<float> lensCenterYParam{"lens center y", 0.5f, 0.3f, 0.7f};
+	// edit panel: lane anchors and corridor placement, saved to config.json
+	ofxPanel editGui;
 	ofParameter<int> laneSelectParam{"lane (edit) [ ]", 0, 0, 7};
 	ofParameter<float> laneS0Param{"lane s0", 0, 0, 1};
 	ofParameter<float> laneS1Param{"lane s1", 1, 0, 1};
@@ -205,63 +129,14 @@ private:
 	ofParameter<float> placeX1Param{"place x1", 1, -1, 2};
 	ofParameter<float> placeY0Param{"place y0", 0, -1, 2};
 	ofParameter<float> placeY1Param{"place y1", 1, -1, 2};
-	ofParameter<float> flowMinFlowParam{"flow minFlowPx", 0.6f, 0.1f, 4};
-	ofParameter<float> flowEmaParam{"flow ema", 0.5f, 0.05f, 1};
-	ofParameter<float> flowBusyThreshParam{"flow busyThresh", 0.35f, 0.05f, 1};
-	ofParameter<bool> flowUseMogParam{"flow useMog2", true};
-	ofParameter<float> flowMogVarParam{"flow mogVarThreshold", 24, 4, 100};
-	ofParameter<float> flowCloseWParam{"flow closeWFrac", 0.04f, 0, 0.3f};
-	ofParameter<float> flowCloseHParam{"flow closeHFrac", 0.3f, 0, 1};
-	ofParameter<float> flowMinAreaParam{"flow minAreaFrac", 0.003f, 0, 0.05f};
-	ofParameter<float> flowMinCoherenceParam{"flow minCoherence", 0.45f, 0, 1};
-	ofParameter<float> flowMinSpeedParam{"flow minSpeed", 0.01f, 0, 0.1f};
-	ofParameter<float> flowMergeGapParam{"flow mergeGapFrac", 0.15f, 0, 0.5f};
-	ofParameter<int> trkConfirmParam{"trk confirmFrames", 4, 1, 30};
-	ofParameter<int> trkMaxMissesParam{"trk maxMisses", 20, 1, 90};
-	ofParameter<float> trkGateGapParam{"trk gateGapFrac", 0.1f, 0.01f, 0.5f};
-	ofParameter<float> trkAbsorbGapParam{"trk absorbGapFrac", 0.15f, 0, 0.5f};
-	ofParameter<int> trkMergeFramesParam{"trk mergeFrames", 6, 1, 30};
-	ofParameter<float> trkReacquireMsParam{"trk reacquireMs", 2000, 0, 20000};
-	ofParameter<float> trkVelMeasNoiseParam{"trk velMeasNoise", 6e-4f, 1e-5f, 1e-2f};
-	ofParameter<int> trkTrailParam{"trk trailFrames", 30, 0, 120};
-	ofParameter<int> shapeSourceParam{"shape 0mask 1fg 2model", 2, 0, 2};
-	ofParameter<float> shapeEmaParam{"shape ema", 0.25f, 0.02f, 1};
-	ofParameter<float> shapeThreshParam{"shape threshold", 0.5f, 0.1f, 0.9f};
-	ofParameter<float> shapePadXParam{"shape padX", 0.04f, 0, 0.3f};
-	ofParameter<float> shapePadYParam{"shape padY", 0.15f, 0, 0.6f};
-	ofParameter<float> shapeSimplifyParam{"shape simplify cells", 0.5f, 0, 4};
-	ofParameter<float> yoloConfParam{"yolo confThreshold", 0.35f, 0.05f, 0.95f};
-	ofParameter<float> yoloNmsParam{"yolo nmsThreshold", 0.45f, 0.05f, 0.95f};
-	ofParameter<float> arrowScaleParam{"overlay arrowScale", 1, 0, 5};
-	ofxButton saveTrackingButton;
-	// live push of tuning changes (throttled in update())
-	tracking::TrackingConfig currentTrackingTuning() const;
-	void loadGuiFromConfig();
-	void pushTrackingTuning();
-	void onSaveTrackingPressed();
-	tracking::TrackingConfig pushedTuning;
-	double lastTuningPushMs = 0;
-	std::string configPath; // the config file that was loaded (save target)
+	ofxButton saveButton;
 
-	// debounced restart when stream params change
-	bool settingsDirty = false;
-	double settingsDirtySinceMs = 0;
-
-	// diagnostics
-	void saveScreenshot();
 	double lastStatsLogMs = 0;
-	std::string autoshotPath; // CAMTRACK_AUTOSHOT env: save screenshot + quit
-	float autoshotSec = 8.0f; // CAMTRACK_AUTOSHOT_SEC
-	bool autoshotDone = false;
 
-	void onPreviewChanged(bool & value);
-	void onQualityChanged(int & value);
 	void onRecordChanged(bool & value);
 	void onExportChanged(bool & value);
 	void onPlaybackChanged(bool & value);
 	void onTrackingChanged(bool & value);
-	void onDetectorChanged(int & value);
-	void onHalfResChanged(bool & value);
-	void onUdpChanged(bool & value);
 	void onReconnectPressed();
+	void onSavePressed();
 };
