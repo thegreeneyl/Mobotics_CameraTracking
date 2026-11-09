@@ -14,6 +14,17 @@ Stays here, does not move: UDP output, ofxGui, the BGS and YOLO detectors (all
 already deleted), the batch runner (`src/batch/`), `recording/RecordingReader.*`
 and `tools/eval/`. Do not bring any of them back in Steuerung.
 
+## Already in Steuerung
+
+The Tracking tab is already there, between Schedule and Log.
+`CameraTrackingView` is registered and draws an empty state; `layout.json`
+has the node and `views.cameraTracking`. Do not add a second tab. How that
+view has to grow — widgets, zoom, scroll, keyboard, and where `stop()`
+goes — is
+[docs/CAMERA_TRACKING.md](../YOUniverse_Steuerung/docs/CAMERA_TRACKING.md).
+Follow it together with the checklist. Where the two differ, the Steuerung
+document wins.
+
 ## Checklist
 
 - [ ] **1. Copy the source folders** into `YOUniverse_Steuerung/src`, keeping
@@ -41,16 +52,20 @@ and `tools/eval/`. Do not bring any of them back in Steuerung.
 - [ ] **6. Own a `CameraTrackingSession` on Steuerung's `ofApp`**, like
   `DeviceManager`. `load()` + `start()` at the end of `initialLoad()`,
   `update()` in `ofApp::update()` before `playbackController.update(...)`,
-  `stop()` in `exit()`. The tracking worker thread must never touch OpenGL —
+  `stop()` in the quit callback registered in `ofApp::setup`
+  (`appState.setQuitCallback`), beside `syncEngine.shutdown()`.
+  `ofApp::exit()` only intercepts the window close and must not stop the
+  session. The tracking worker thread must never touch OpenGL —
   only the main thread uploads `takePreview()` pixels into a texture.
 - [ ] **7. Hand the session to `UILayout`** through a setter
   (`setCameraTrackingSession(CameraTrackingSession*)`), the same pattern as
   `setAppState`.
-- [ ] **8. Add `src/ui/CameraTrackingView`** drawing with `UIPanel`, `UITheme`
-  and `UIControls` (`drawButton`, `drawCheckbox`). No ofxGui, no
-  `ofParameter`. Register `"cameraTracking"` in `UILayout::drawView` next to
-  the existing view branches, add a View node plus a `views.cameraTracking`
-  block to `bin/data/config/layout.json`.
+- [ ] **8. Fill `src/ui/CameraTrackingView`.** The class, the
+  `"cameraTracking"` branch in `UILayout::drawView`, the Tracking tab and
+  `views.cameraTracking` already exist and draw an empty state. Replace
+  that drawing with `UIPanel`, `UITheme` and `UIControls` (`drawButton`,
+  `drawCheckbox`). No ofxGui, no `ofParameter`. Widget, zoom, scroll and
+  keyboard rules are in Steuerung's `docs/CAMERA_TRACKING.md`.
 - [ ] **9. Rebuild the operator surface** on that view, calling the session
   only: lane anchors and `s0`/`s1` (hit-test in `UIPanel::toLocal`, keep the
   edited `LayoutConfig` in the view, re-seed it when `layoutRevision()`
