@@ -1,455 +1,455 @@
 {
   "cameras": [
     {
-      "id": "north_dual",
       "enabled": true,
-      "host": "192.168.178.230",
-      "user": "admin",
-      "password": "",
-      "stream": "full",
       "fps": 0,
+      "host": "192.168.178.230",
+      "id": "north_dual",
+      "password": "",
       "preview": false,
       "previewSize": "1280x720",
-      "quality": 60
+      "quality": 60,
+      "stream": "full",
+      "user": "admin"
     }
   ],
-  "recordingsDir": "recordings",
   "display": {
-    "decodeScale": 2,
-    "arrowScale": 1.0
+    "arrowScale": 1.0,
+    "decodeScale": 2
   },
+  "recordingsDir": "recordings",
   "tracking": {
-    "enabled": true,
     "analysisReduce": 2,
-    "laneMaxWidth": 800,
-    "laneMinHeight": 96,
-    "lens": {
-      "enabled": true,
-      "fovDeg": 170,
-      "k1": 0,
-      "k2": 0,
-      "k3": 0,
-      "k4": 0,
-      "balance": 0,
-      "centerX": 0.5,
-      "centerY": 0.5
-    },
-    "flow": {
-      "preset": 1,
-      "flowEma": 0.5,
-      "minFlowPx": 0.6,
-      "sparkleRatio": 0.85,
-      "busyAlpha": 0.04,
-      "busyThresh": 0.35,
-      "useMog2": true,
-      "mogHistory": 300,
-      "mogVarThreshold": 24,
-      "mogDilatePx": 7,
-      "morphOpenPx": 3,
-      "closeWFrac": 0.04,
-      "closeHFrac": 0.3,
-      "minAreaFrac": 0.003,
-      "minWidthFrac": 0.02,
-      "minHeightFrac": 0.1,
-      "minCoherence": 0.45,
-      "minSpeed": 0.01,
-      "maxSpeed": 1.5,
-      "mergeGapFrac": 0.15,
-      "mergeAngleDeg": 40,
-      "mergeSpeedRatio": 3,
-      "mergeLateralOverlap": 0.25,
-      "dirSplit": true,
-      "dirSplitMinFrac": 0.05,
-      "lockAxis": false,
-      "maxDetections": 8,
-      "edgeMarginPx": 3
-    },
-    "tracker": {
-      "confirmFrames": 4,
-      "maxMisses": 20,
-      "tentativeMaxMisses": 3,
-      "minSpeedConfirm": 0.004,
-      "gateGapFrac": 0.1,
-      "gateLateral": 0.2,
-      "velAngleDeg": 80,
-      "velScale": 0.1,
-      "absorbGapFrac": 0.15,
-      "absorbLateral": 0.4,
-      "absorbSpeedRatio": 3.0,
-      "shadowSuppress": true,
-      "shadowGapFrac": 0.15,
-      "shadowLateral": 0.25,
-      "stopSpeed": 0.04,
-      "stoppedHoldMs": 60000,
-      "stopEdgeFrac": 0.15,
-      "sizeJumpTrust": 0.6,
-      "sizeJumpNoiseGain": 25,
-      "mergeGapFrac": 0.1,
-      "mergeVelTol": 0.03,
-      "mergeFrames": 6,
-      "reacquireMs": 2000,
-      "reacquireGapFrac": 0.15,
-      "lockAxis": false,
-      "posMeasNoise": 0.001,
-      "velMeasNoise": 0.0006,
-      "posProcNoise": 4e-06,
-      "velProcNoise": 0.003,
-      "clippedMeasNoise": 1e-07,
-      "flowGain": 1.0,
-      "flowGainLearn": true,
-      "flowGainWindow": 8,
-      "flowGainSamples": 32,
-      "flowGainMin": 0.6,
-      "flowGainMax": 2.0,
-      "flowGainAlpha": 0.15,
-      "maxDtSec": 5,
-      "stopMinWidthFrac": 0.15,
-      "clipFrames": 3,
-      "edgeRule": true,
-      "edgeBirthFrac": 0.08,
-      "edgeGraceMs": 2000,
-      "minConfirmLen": 0,
-      "modelGate": true,
-      "modelGateOtherHits": 3,
-      "modelLostMs": 8000,
-      "coastOccluded": true,
-      "occludedMaxMs": 30000,
-      "occludedGateGrow": 0.05,
-      "shapeBox": true,
-      "shapeBoxMaxAge": 6,
-      "shapeBoxTrim": 0.25,
-      "shapeShrink": false,
-      "shapeShrinkFrames": 8,
-      "hiddenRear": true,
-      "trailLen": 30
-    },
-    "shape": {
-      "enabled": true,
-      "source": 2,
-      "model": "models/yolov8n-seg-192x640.onnx",
-      "modelInputW": 640,
-      "modelInputH": 192,
-      "modelConf": 0.25,
-      "modelMinIou": 0.3,
-      "modelMaskThresh": 0.5,
-      "modelPad": 0.25,
-      "modelMaxAspect": 6.5,
-      "modelTileOverlap": 0.15,
-      "modelEveryN": 2,
-      "modelHoldFrames": 45,
-      "modelMaxPerFrame": 2,
-      "fallbackEma": 0.06,
-      "gridW": 96,
-      "gridH": 32,
-      "ema": 0.25,
-      "threshold": 0.5,
-      "padX": 0.04,
-      "padY": 0.15,
-      "simplify": 0.5,
-      "closeCells": 1,
-      "confirmedOnly": true,
-      "modelClassGate": true,
-      "modelTentative": true
-    },
-    "smoothing": {
-      "enabled": true,
-      "boxRate": 0.25,
-      "outlineVertices": 32,
-      "outlineAlpha": 0.3,
-      "fadeInMs": 300,
-      "fadeOutMs": 400
-    },
     "canvas": {
-      "width": 832,
-      "height": 442
+      "height": 442,
+      "width": 832
     },
     "corridors": {
-      "train": {
-        "label": "train",
-        "flow": {
-          "lockAxis": true,
-          "mergeGapFrac": 0.25,
-          "mergeAngleDeg": 60,
-          "minHeightFrac": 0.25,
-          "preset": 2,
-          "fillWFrac": 0.02,
-          "fillHFrac": 0.35
-        },
-        "tracker": {
-          "lockAxis": true,
-          "absorbGapFrac": 0.25,
-          "mergeGapFrac": 0.15,
-          "stoppedHoldMs": 120000,
-          "edgeBirthFrac": 0.2,
-          "minConfirmLen": 0.12
-        },
-        "placement": {
-          "x0": 0,
-          "x1": 1,
-          "y0": 0.15,
-          "y1": 0.4
-        }
-      },
       "boat": {
-        "label": "boat",
         "flow": {
-          "minSpeed": 0.005,
-          "mogVarThreshold": 30.0,
-          "mogDilatePx": 3,
-          "closeWFrac": 0.03,
           "closeHFrac": 0.06,
-          "mergeLateralOverlap": 0.4,
-          "minFlowPx": 0.3,
-          "minAreaFrac": 0.01,
-          "minHeightFrac": 0.15,
+          "closeWFrac": 0.03,
+          "fillHFrac": 0.2,
           "fillWFrac": 0.02,
-          "fillHFrac": 0.2
+          "mergeLateralOverlap": 0.4,
+          "minAreaFrac": 0.01,
+          "minFlowPx": 0.3,
+          "minHeightFrac": 0.15,
+          "minSpeed": 0.005,
+          "mogDilatePx": 3,
+          "mogVarThreshold": 30.0
         },
-        "tracker": {
-          "reacquireMs": 15000,
-          "reacquireGapFrac": 0.3,
-          "stoppedHoldMs": 20000,
-          "shadowGapFrac": 0.4,
-          "shadowLateral": 2.0,
-          "absorbSpeedRatio": 1.4,
-          "shapeBoxTrim": 0.45,
-          "shapeShrink": true,
-          "stopEnabled": false,
-          "confirmFrames": 20,
-          "flowGainLearn": false
-        },
+        "label": "boat",
         "placement": {
           "x0": 0,
           "x1": 1,
           "y0": 0.55,
           "y1": 0.95
+        },
+        "tracker": {
+          "absorbSpeedRatio": 1.4,
+          "confirmFrames": 20,
+          "flowGainLearn": false,
+          "reacquireGapFrac": 0.3,
+          "reacquireMs": 15000,
+          "shadowGapFrac": 0.4,
+          "shadowLateral": 2.0,
+          "shapeBoxTrim": 0.45,
+          "shapeShrink": true,
+          "stopEnabled": false,
+          "stoppedHoldMs": 20000
+        }
+      },
+      "train": {
+        "flow": {
+          "fillHFrac": 0.35,
+          "fillWFrac": 0.02,
+          "lockAxis": true,
+          "mergeAngleDeg": 60,
+          "mergeGapFrac": 0.25,
+          "minHeightFrac": 0.25,
+          "preset": 2
+        },
+        "label": "train",
+        "placement": {
+          "x0": 0,
+          "x1": 1,
+          "y0": 0.15,
+          "y1": 0.4
+        },
+        "tracker": {
+          "absorbGapFrac": 0.25,
+          "edgeBirthFrac": 0.2,
+          "lockAxis": true,
+          "mergeGapFrac": 0.15,
+          "minConfirmLen": 0.12,
+          "stoppedHoldMs": 120000
         }
       }
     },
+    "enabled": true,
+    "flow": {
+      "busyAlpha": 0.04,
+      "busyThresh": 0.35,
+      "closeHFrac": 0.3,
+      "closeWFrac": 0.04,
+      "dirSplit": true,
+      "dirSplitMinFrac": 0.05,
+      "edgeMarginPx": 3,
+      "flowEma": 0.5,
+      "lockAxis": false,
+      "maxDetections": 8,
+      "maxSpeed": 1.5,
+      "mergeAngleDeg": 40,
+      "mergeGapFrac": 0.15,
+      "mergeLateralOverlap": 0.25,
+      "mergeSpeedRatio": 3,
+      "minAreaFrac": 0.003,
+      "minCoherence": 0.45,
+      "minFlowPx": 0.6,
+      "minHeightFrac": 0.1,
+      "minSpeed": 0.01,
+      "minWidthFrac": 0.02,
+      "mogDilatePx": 7,
+      "mogHistory": 300,
+      "mogVarThreshold": 24,
+      "morphOpenPx": 3,
+      "preset": 1,
+      "sparkleRatio": 0.85,
+      "useMog2": true
+    },
+    "laneMaxWidth": 800,
+    "laneMinHeight": 96,
     "layouts": [
       {
-        "name": "single",
-        "panes": 1,
-        "recordings": [],
         "lanes": [
           {
+            "corridor": "train",
             "id": "train",
             "pane": 0,
-            "corridor": "train",
             "quad": [
               [
-                0.08,
-                0.12
+                0.21317980910006185,
+                0.1965636266681265
               ],
               [
-                0.86,
-                0.125
+                0.7623600454433443,
+                0.18146967731386968
               ],
               [
-                0.86,
-                0.24
+                0.7713177216681192,
+                0.27169750889875127
               ],
               [
-                0.08,
-                0.25
+                0.20380321427988363,
+                0.29396638425025556
               ]
             ],
             "s0": 0.0,
             "s1": 1.0
           },
           {
+            "corridor": "boat",
             "id": "boat",
             "pane": 0,
-            "corridor": "boat",
             "quad": [
               [
-                0.33,
-                0.36
+                0.3379779415610941,
+                0.3439622677099444
               ],
               [
-                1.0,
-                0.36
+                0.8294686395757136,
+                0.392671148513724
               ],
               [
-                1.0,
-                1.0
+                0.8066435680466979,
+                0.8582299213568387
               ],
               [
-                0.52,
-                1.0
+                0.5175575804107541,
+                1.000266139006353
               ]
             ],
             "s0": 0.0,
             "s1": 1.0
           }
-        ]
+        ],
+        "name": "single",
+        "panes": 1,
+        "recordings": []
       },
       {
+        "lanes": [
+          {
+            "corridor": "train",
+            "id": "train",
+            "pane": 0,
+            "quad": [
+              [
+                0.1978355877465025,
+                0.29233907553207183
+              ],
+              [
+                0.7667629448821782,
+                0.2700086891785948
+              ],
+              [
+                0.7700531590938123,
+                0.4076671037067018
+              ],
+              [
+                0.19422667339261362,
+                0.4167231544968853
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 1.0
+          },
+          {
+            "corridor": "boat",
+            "id": "boat",
+            "pane": 0,
+            "quad": [
+              [
+                0.35136204865747395,
+                0.500347956747758
+              ],
+              [
+                0.8316522267638368,
+                0.48486346803947755
+              ],
+              [
+                0.8066435680466979,
+                0.8582299213568387
+              ],
+              [
+                0.5430294955104199,
+                0.9980323258271572
+              ]
+            ],
+            "s0": 0.0,
+            "s1": 1.0
+          }
+        ],
         "name": "single_low",
         "panes": 1,
         "recordings": [
           "14-18-08"
-        ],
-        "lanes": [
-          {
-            "id": "train",
-            "pane": 0,
-            "corridor": "train",
-            "quad": [
-              [
-                0.063,
-                0.243
-              ],
-              [
-                0.85,
-                0.241
-              ],
-              [
-                0.84,
-                0.4
-              ],
-              [
-                0.072,
-                0.4
-              ]
-            ],
-            "s0": 0.0,
-            "s1": 1.0
-          },
-          {
-            "id": "boat",
-            "pane": 0,
-            "corridor": "boat",
-            "quad": [
-              [
-                0.35,
-                0.5
-              ],
-              [
-                1.0,
-                0.48
-              ],
-              [
-                1.0,
-                1.0
-              ],
-              [
-                0.55,
-                1.0
-              ]
-            ],
-            "s0": 0.0,
-            "s1": 1.0
-          }
         ]
       },
       {
-        "name": "dual",
-        "panes": 2,
-        "recordings": [],
         "lanes": [
           {
+            "corridor": "train",
             "id": "train_M1",
             "pane": 0,
-            "corridor": "train",
             "quad": [
               [
-                0.24,
-                0.27
+                0.280300101979329,
+                0.27272662269721437
               ],
               [
-                1.0,
-                0.13
+                0.8171371119639913,
+                0.2264392696491742
               ],
               [
-                1.0,
-                0.23
+                0.8236609188691141,
+                0.2963511120594725
               ],
               [
-                0.24,
-                0.37
+                0.2748225714842865,
+                0.368491336747075
               ]
             ],
             "s0": 0.0,
             "s1": 0.58
           },
           {
+            "corridor": "train",
             "id": "train_M2",
             "pane": 1,
-            "corridor": "train",
             "quad": [
               [
-                0.0,
-                0.19
+                0.1796555866430187,
+                0.2678821080866945
               ],
               [
-                0.64,
-                0.085
+                0.6216306947183158,
+                0.08049264677735776
               ],
               [
-                0.64,
-                0.165
+                0.6271791280115755,
+                0.1459108399419578
               ],
               [
-                0.0,
-                0.3
+                0.17369488692855325,
+                0.3475832308792524
               ]
             ],
             "s0": 0.37,
             "s1": 1.0
           },
           {
+            "corridor": "boat",
             "id": "boat_M1",
             "pane": 0,
-            "corridor": "boat",
             "quad": [
               [
-                0.0,
-                0.45
+                0.16948686402120658,
+                0.4616649393288724
               ],
               [
-                0.42,
-                0.5
+                0.41619640358927773,
+                0.500347956747758
               ],
               [
-                0.32,
-                1.0
+                0.3558628158719467,
+                0.9697728791335527
               ],
               [
-                0.0,
-                0.62
+                0.1708427376238534,
+                0.5928068580092186
               ]
             ],
             "s0": 0.0,
             "s1": 0.32
           },
           {
+            "corridor": "boat",
             "id": "boat_M2",
             "pane": 1,
-            "corridor": "boat",
             "quad": [
               [
-                0.05,
-                0.33
+                0.18874790816907402,
+                0.36271680164103476
               ],
               [
-                0.85,
-                0.31
+                0.7709699539069885,
+                0.3287038811843808
               ],
               [
-                0.8,
-                0.62
+                0.7492576386441089,
+                0.6166715509954719
               ],
               [
-                0.05,
-                0.9
+                0.2033415618175719,
+                0.80902406665443
               ]
             ],
             "s0": 0.4,
             "s1": 1.0
           }
-        ]
+        ],
+        "name": "dual",
+        "panes": 2,
+        "recordings": []
       }
-    ]
+    ],
+    "lens": {
+      "centerX": 0.5,
+      "centerY": 0.5,
+      "enabled": true,
+      "fovDeg": 92.55,
+      "frameFovDeg": 0.0,
+      "k1": 0.146,
+      "k2": -0.143,
+      "k3": 0.0,
+      "k4": 0.0
+    },
+    "shape": {
+      "closeCells": 1,
+      "confirmedOnly": true,
+      "ema": 0.25,
+      "enabled": true,
+      "fallbackEma": 0.06,
+      "gridH": 32,
+      "gridW": 96,
+      "model": "models/yolov8n-seg-192x640.onnx",
+      "modelClassGate": true,
+      "modelConf": 0.25,
+      "modelEveryN": 2,
+      "modelHoldFrames": 45,
+      "modelInputH": 192,
+      "modelInputW": 640,
+      "modelMaskThresh": 0.5,
+      "modelMaxAspect": 6.5,
+      "modelMaxPerFrame": 2,
+      "modelMinIou": 0.3,
+      "modelPad": 0.25,
+      "modelTentative": true,
+      "modelTileOverlap": 0.15,
+      "padX": 0.04,
+      "padY": 0.15,
+      "simplify": 0.5,
+      "source": 2,
+      "threshold": 0.5
+    },
+    "smoothing": {
+      "boxRate": 0.25,
+      "enabled": true,
+      "fadeInMs": 300,
+      "fadeOutMs": 400,
+      "outlineAlpha": 0.3,
+      "outlineVertices": 32
+    },
+    "tracker": {
+      "absorbGapFrac": 0.15,
+      "absorbLateral": 0.4,
+      "absorbSpeedRatio": 3.0,
+      "clipFrames": 3,
+      "clippedMeasNoise": 1e-07,
+      "coastOccluded": true,
+      "confirmFrames": 4,
+      "edgeBirthFrac": 0.08,
+      "edgeGraceMs": 2000,
+      "edgeRule": true,
+      "flowGain": 1.0,
+      "flowGainAlpha": 0.15,
+      "flowGainLearn": true,
+      "flowGainMax": 2.0,
+      "flowGainMin": 0.6,
+      "flowGainSamples": 32,
+      "flowGainWindow": 8,
+      "gateGapFrac": 0.1,
+      "gateLateral": 0.2,
+      "hiddenRear": true,
+      "lockAxis": false,
+      "maxDtSec": 5,
+      "maxMisses": 20,
+      "mergeFrames": 6,
+      "mergeGapFrac": 0.1,
+      "mergeVelTol": 0.03,
+      "minConfirmLen": 0,
+      "minSpeedConfirm": 0.004,
+      "modelGate": true,
+      "modelGateOtherHits": 3,
+      "modelLostMs": 8000,
+      "occludedGateGrow": 0.05,
+      "occludedMaxMs": 30000,
+      "posMeasNoise": 0.001,
+      "posProcNoise": 4e-06,
+      "reacquireGapFrac": 0.15,
+      "reacquireMs": 2000,
+      "shadowGapFrac": 0.15,
+      "shadowLateral": 0.25,
+      "shadowSuppress": true,
+      "shapeBox": true,
+      "shapeBoxMaxAge": 6,
+      "shapeBoxTrim": 0.25,
+      "shapeShrink": false,
+      "shapeShrinkFrames": 8,
+      "sizeJumpNoiseGain": 25,
+      "sizeJumpTrust": 0.6,
+      "stopEdgeFrac": 0.15,
+      "stopMinWidthFrac": 0.15,
+      "stopSpeed": 0.04,
+      "stoppedHoldMs": 60000,
+      "tentativeMaxMisses": 3,
+      "trailLen": 30,
+      "velAngleDeg": 80,
+      "velMeasNoise": 0.0006,
+      "velProcNoise": 0.003,
+      "velScale": 0.1
+    }
   }
 }

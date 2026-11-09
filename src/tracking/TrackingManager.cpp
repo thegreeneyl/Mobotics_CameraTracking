@@ -429,9 +429,8 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	const double decodeMs = nowMs() - t0;
 
 	// Pane count comes from the source (the corrector), not from the
-	// extended frame: a tall recovered border can drop a side-by-side
-	// frame under the 2:1 test. UV 0..1 is the filled frame; the mat
-	// around it is the recovered border.
+	// output size: a wide filled frame is still one pane. UV 0..1 is
+	// that frame.
 	const LensGeometry g = lensCorrector.geometry();
 	const int paneCount = std::max(1, g.panes);
 	const int outW = g.outPaneW > 0 ? g.outPaneW : full.cols / paneCount;

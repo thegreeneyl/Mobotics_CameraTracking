@@ -118,7 +118,7 @@ public:
 	// Newest lens-corrected display frame, copied when its revision is newer
 	// than lastSeenRevision. Unallocated pixels mean "nothing to show"
 	// (right after a mode switch). geometry is the pane geometry of that
-	// frame (filled frame inside the recovered border).
+	// frame (the filled frame is the whole pane).
 	bool takePreview(ofPixels & pixels, LensGeometry & geometry, uint64_t & lastSeenRevision) const;
 	// Newest full tracking snapshot (lanes, detections, corridors, masks).
 	bool takeResults(tracking::TrackingResults & results, uint64_t & lastSeenRevision) const;

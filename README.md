@@ -104,8 +104,7 @@ with `output`, `tracking.detector`, `tracking.bgs`, `tracking.yolo` or
   (or double-click it) to add an anchor anywhere along that edge; the other
   border gets the matching point, and you drag either one. **Delete** or
   **Backspace** removes the selected anchor (not the four corners). Anchors
-  can be dragged into the dim border around the picture (sensor pixels the
-  lens crop had dropped). Only pixels inside a lane are analysed. Each slice between anchors is
+  stay inside the picture. Only pixels inside a lane are analysed. Each slice between anchors is
   perspective-warped into the next section of one upright rectangle before
   detection, so a lane can follow a curve and the tracking view below is
   still flat. A crossed/collapsed slice turns red and is ignored until it
@@ -211,30 +210,27 @@ own center. One coefficient set is shared (the modules are the same lens).
 | Key | Meaning |
 | --- | --- |
 | `enabled` | off copies the camera frame through |
-| `fovDeg` | horizontal field of view of one pane, in degrees. This is the strength: raise it until the viaduct is a straight line. Too high and the line bends the other way and the corners stretch |
-| `k1`..`k4` | how the lens differs from an equidistant fisheye. Leave at 0 until `fovDeg` alone cannot straighten the line |
-| `balance` | 0 fills the frame (the invalid corners are cropped), 1 keeps every source pixel (black corners) |
+| `fovDeg` | horizontal field of view of one pane, in degrees. This is the lens, not a crop: the Mx-O-M7SA-8DN050 modules are about 93°. Too high and the edges stretch |
+| `k1`..`k4` | how the lens differs from an equidistant fisheye. These take out the bow `fovDeg` alone leaves |
+| `frameFovDeg` | horizontal field of the picture, in degrees. 0 spans the whole sensor: the full width of the center row and the full height of the center column, square pixels, so the picture is wider than the sensor's own aspect. A smaller value narrows it and stays inside the sensor |
 | `centerX`, `centerY` | optical center as a fraction of the pane, when the bow is not symmetric |
 
-The values are config-only (`tracking.lens`, read at startup) and reach
-both the picture and the tracker. `fovDeg` 170 is the starting point for this lens: on
-`rec_2026-09-23_14-18-08` it takes the viaduct's bow (about 116 px of sag
-on a 1920-wide frame) down to a few pixels. What is left of the slope is
-perspective — the track is not square to the camera — and no lens model
-removes that. Adjust `fovDeg` with a train in frame until the deck is a
-straight line. Lane corners placed before the correction was
-turned on sat on the distorted image and will miss the viaduct until you
-drag them back onto it.
+The picture is that rectangle and nothing around it. It does not keep the
+sensor's aspect ratio: with this lens the center row is about a third
+wider than a 16:9 crop of the same height, and the corners of the sensor
+that flare past the rectangle are dropped. Lane UV `0..1` is this
+rectangle. A config saved before `frameFovDeg` existed still has its
+anchors in the old 16:9 crop; loading it moves them across, and the next
+save writes the key. `balance` is no longer read.
 
-Filling the frame (`balance` 0) throws away a band of the sensor, mostly
-toward the corners. That band is drawn dimmed around the bright picture,
-and a lane anchor can be dragged into it. `0..1` is still the bright
-frame, so lanes already placed do not move; a point past that is simply
-out in the dim border. The tracker samples those pixels, so a corridor
-pulled past the frame sees a boat or train there. Past the last real
-pixel the border is black and nothing is tracked. The main panel's
-`image scale` only changes how large that picture is drawn (1 fits the
-border, 1.5 is the default). It does not change the lens or the tracking.
+The values are config-only (`tracking.lens`, read at startup) and reach
+both the picture and the tracker. `fovDeg` 92.55 with `k1` 0.146 and
+`k2` -0.143 is the fit for this lens: the viaduct anchors, which follow
+the deck, sit on a straight line to about 1.5 px. What is left of the
+slope is perspective — the track is not square to the camera — and no
+lens model removes that. The main panel's `image scale` only changes how
+large that picture is drawn (1 fits it in the video area). It does not
+change the lens or the tracking.
 
 ### Lanes and corridors
 

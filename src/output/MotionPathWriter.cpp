@@ -115,8 +115,7 @@ std::vector<MotionObject> fromTrackingResults(const tracking::TrackingResults & 
 			// only the photo-space bound of that rectangle after the strip
 			// warp (one homography, or one per slice when the lane curves).
 			// Pane boxes stay in filled-frame UV (0..1), which is where the
-			// lanes are stored. A box that reaches into the recovered
-			// border is simply outside 0..1.
+			// lanes are stored. A box past the picture is outside 0..1.
 			const float uvW = res.lensInnerW > 0 ? static_cast<float>(res.lensInnerW)
 			                                     : (res.analysisW > 0 ? static_cast<float>(res.analysisW) : 1.0f);
 			const float uvH = res.lensInnerH > 0 ? static_cast<float>(res.lensInnerH)

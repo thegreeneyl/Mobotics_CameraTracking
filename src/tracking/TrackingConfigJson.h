@@ -30,7 +30,9 @@ struct LoadedTrackingConfig {
 // app). Older documents are still read: `tracking.overlay` (arrowScale,
 // trailFrames) is folded into display.arrowScale / tracker.trailLen, and
 // `tracking.detector`, `tracking.bgs`, `tracking.yolo` are ignored. None of
-// those keys is ever written again.
+// those keys is ever written again. A lens without `frameFovDeg` still has
+// its lane anchors in the old 16:9 crop; they are moved into the sensor
+// frame on load, and `lens.balance` is ignored.
 LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
                                         const std::function<std::string(const std::string &)> & resolvePath);
 

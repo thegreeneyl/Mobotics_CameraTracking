@@ -98,9 +98,9 @@ void loadFrameTexture(ofTexture & tex, const ofPixels & pixels){
 	tex.loadData(pixels);
 }
 
-// Draws one corrected pane. paneOut is the bright filled frame (lane UV
-// 0..1). The recovered border around it is veiled, so the pixels the crop
-// had thrown away stay visible without taking over the picture.
+// Draws one corrected pane. The filled frame is the whole pane (lane UV
+// 0..1). A border, if one is ever present, is veiled so it stays visible
+// without taking over the picture.
 void drawCorrectedPane(const ofTexture & tex, float texX, float texW, float texH,
                        float x, float y, float w, float h,
                        int innerX, int innerY, int innerW, int innerH,
@@ -130,8 +130,7 @@ void drawCorrectedPane(const ofTexture & tex, float texX, float texW, float texH
 	ofSetColor(255);
 }
 
-// Stations stay inside the recovered picture (the bright frame plus the
-// dim border). Past that there is no sensor pixel.
+// Stations stay inside the picture. Past that there is no sensor pixel.
 void clampLaneDrag(const LensGeometry & g, const ofRectangle & pane, int x, int y, float & u, float & v){
 	u = pane.width > 0 ? (x - pane.x) / pane.width : 0.0f;
 	v = pane.height > 0 ? (y - pane.y) / pane.height : 0.0f;
@@ -500,7 +499,7 @@ void ofApp::drawVideo(){
 	const int innerW = geo ? lensGeo.innerW : static_cast<int>(extW);
 	const int innerH = geo ? lensGeo.innerH : static_cast<int>(extH);
 
-	// 1 fits the whole corrected picture, border included. Higher values
+	// 1 fits the whole corrected picture. Higher values
 	// enlarge it around the center and clip to the video area.
 	const float zoom = std::max(1.0f, imageScaleParam.get());
 	std::vector<float> paneFitW;

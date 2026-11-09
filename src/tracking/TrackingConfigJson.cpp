@@ -11,8 +11,8 @@ namespace tracking {
 namespace {
 float clamp01(float v){ return std::min(1.0f, std::max(0.0f, v)); }
 
-// Lane stations: 0..1 is the filled frame, outside it is the recovered
-// border. A hard stop only rejects a corrupt file.
+// Lane stations: 0..1 is the filled frame. A hard stop only rejects a
+// corrupt file.
 float clampPaneUv(float v){ return std::min(5.0f, std::max(-4.0f, v)); }
 
 bool parseQuad(const ofJson & arr, FrameQuad & quad){
@@ -122,6 +122,8 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 	if(!root.contains("tracking") || !root["tracking"].is_object()) return out;
 	const auto & t = root["tracking"];
 
+	const bool legacyFrame = !(t.contains("lens") && t["lens"].is_object()
+	                          && t["lens"].contains("frameFovDeg"));
 	c.enabled = t.value("enabled", true);
 	c.analysisReduce = t.value("analysisReduce", 2);
 	c.laneMaxWidth = t.value("laneMaxWidth", 800);
@@ -134,9 +136,12 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 		c.lens.k2 = l.value("k2", c.lens.k2);
 		c.lens.k3 = l.value("k3", c.lens.k3);
 		c.lens.k4 = l.value("k4", c.lens.k4);
-		c.lens.balance = l.value("balance", c.lens.balance);
+		c.lens.frameFovDeg = l.value("frameFovDeg", 0.0f);
 		c.lens.centerX = l.value("centerX", c.lens.centerX);
 		c.lens.centerY = l.value("centerY", c.lens.centerY);
+		if(l.contains("balance")){
+			ofLogNotice("TrackingConfig") << "lens.balance is ignored; the frame spans the sensor";
+		}
 	}
 
 	if(t.contains("flow")) applyParams(t["flow"], c.flow, setFlowParam, "flow");
@@ -240,6 +245,30 @@ LoadedTrackingConfig loadTrackingConfig(const ofJson & root,
 			c.layouts.push_back(l);
 		}
 	}
+	// Anchors saved before frameFovDeg sit in the old 16:9 crop. Move them
+	// once, with the lens this file already has; the next save writes the key.
+	if(legacyFrame){
+		int moved = 0;
+		for(LayoutConfig & layout : c.layouts){
+			for(LaneConfig & lane : layout.lanes){
+				auto fix = [&](std::array<float, 2> & pt){
+					float u = pt[0], v = pt[1];
+					if(!migrateBalanceUv(c.lens, u, v)) return;
+					pt[0] = u;
+					pt[1] = v;
+					moved++;
+				};
+				for(auto & pt : lane.quad.pts) fix(pt);
+				for(auto & pt : lane.top) fix(pt);
+				for(auto & pt : lane.bottom) fix(pt);
+				lane.syncQuadEnds();
+			}
+		}
+		if(moved){
+			ofLogNotice("TrackingConfig")
+				<< "moved " << moved << " lane anchors from the 16:9 crop into the sensor frame";
+		}
+	}
 	return out;
 }
 
@@ -260,7 +289,7 @@ ofJson trackingJson(const TrackingConfig & cfg){
 		{"k2", cfg.lens.k2},
 		{"k3", cfg.lens.k3},
 		{"k4", cfg.lens.k4},
-		{"balance", cfg.lens.balance},
+		{"frameFovDeg", cfg.lens.frameFovDeg},
 		{"centerX", cfg.lens.centerX},
 		{"centerY", cfg.lens.centerY},
 	};
