@@ -199,8 +199,10 @@ struct LaneConfig {
 	void setStation(int edge, int index, float x, float y){
 		materializeBorders();
 		if(index < 0 || index >= static_cast<int>(top.size())) return;
-		x = std::min(1.0f, std::max(0.0f, x));
-		y = std::min(1.0f, std::max(0.0f, y));
+		// 0..1 is the filled frame. Outside it is the recovered lens border.
+		// The editor clamps to the real border; this only stops a runaway value.
+		x = std::min(5.0f, std::max(-4.0f, x));
+		y = std::min(5.0f, std::max(-4.0f, y));
 		(edge == 0 ? top : bottom)[static_cast<size_t>(index)] = {x, y};
 		syncQuadEnds();
 	}
@@ -218,8 +220,8 @@ struct LaneConfig {
 		};
 		auto nt = lerp(top[static_cast<size_t>(seg)], top[static_cast<size_t>(seg + 1)], t);
 		auto nb = lerp(bottom[static_cast<size_t>(seg)], bottom[static_cast<size_t>(seg + 1)], t);
-		x = std::min(1.0f, std::max(0.0f, x));
-		y = std::min(1.0f, std::max(0.0f, y));
+		x = std::min(5.0f, std::max(-4.0f, x));
+		y = std::min(5.0f, std::max(-4.0f, y));
 		if(edge == 0) nt = {x, y};
 		else nb = {x, y};
 		const int at = seg + 1;
@@ -461,8 +463,12 @@ struct TrackingResults {
 	double detectMs = 0;  // detector cost (all lanes)
 	double trackMs = 0;   // tracker cost (all corridors)
 	double shapeMs = 0;   // shape estimator cost (incl. segmentation model)
-	int analysisW = 0;    // per-pane analysis resolution (px)
+	int analysisW = 0;    // extended pane size the warp samples (px)
 	int analysisH = 0;
+	// Filled frame inside that pane. Lane UV 0..1 is this rect; a station
+	// in the recovered border is outside 0..1. Zero inner size means the
+	// pane is the filled frame (no border).
+	int lensInnerX = 0, lensInnerY = 0, lensInnerW = 0, lensInnerH = 0;
 	std::string detectorName; // "flow" | "bgs" | "yolo"
 	uint64_t revision = 0;    // increments per published frame
 };

@@ -333,7 +333,20 @@ std::unique_ptr<IDetector> TrackingManager::makeDetector(const std::string & cor
 	}
 }
 
-void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH){
+void TrackingManager::retargetMaps(int originX, int originY){
+	const float iw = static_cast<float>(builtPaneW);
+	const float ih = static_cast<float>(builtPaneH);
+	for(auto & lp : lanes){
+		const int w = lp.laneW, h = lp.laneH;
+		lp.map = LaneMap::build(lp.lane, iw, ih, static_cast<float>(originX), static_cast<float>(originY));
+		if(w > 0 && h > 0) lp.map.prepare(w, h);
+		lp.homography = lp.map.paneToLane;
+	}
+	builtOriginX = originX;
+	builtOriginY = originY;
+}
+
+void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH, int originX, int originY){
 	lanes.clear();
 	corridors.clear();
 
@@ -364,7 +377,8 @@ void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH){
 		// Rectified size: the strip's centreline length and mean height, cap
 		// the width, floor the height (a thin viaduct band would otherwise
 		// end up a few pixels tall and starve the flow estimator).
-		lp.map = LaneMap::build(lane, static_cast<float>(paneW), static_cast<float>(paneH));
+		lp.map = LaneMap::build(lane, static_cast<float>(paneW), static_cast<float>(paneH),
+		                        static_cast<float>(originX), static_cast<float>(originY));
 		lp.map.rectifiedSize(cfg.laneMaxWidth, cfg.laneMinHeight, paneH, lp.laneW, lp.laneH);
 		lp.map.prepare(lp.laneW, lp.laneH);
 		lp.homography = lp.map.paneToLane;
@@ -402,6 +416,8 @@ void TrackingManager::rebuildPipelines(int paneCount, int paneW, int paneH){
 	builtPanes = paneCount;
 	builtPaneW = paneW;
 	builtPaneH = paneH;
+	builtOriginX = originX;
+	builtOriginY = originY;
 	lastTMs = -1;
 	ofLogNotice("TrackingManager")
 		<< "layout '" << layoutName << "' for " << paneCount << " pane(s), "
@@ -468,14 +484,24 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	}
 	const double decodeMs = nowMs() - t0;
 
-	// Side-by-side dual-module frames are twice as wide as tall.
-	const int paneCount = full.cols >= full.rows * 2 ? 2 : 1;
-	const int paneW = full.cols / paneCount;
-	const int paneH = full.rows;
+	// Pane count comes from the source (the corrector), not from the
+	// extended frame: a tall recovered border can drop a side-by-side
+	// frame under the 2:1 test. UV 0..1 is the filled frame; the mat
+	// around it is the recovered border.
+	const LensGeometry g = lensCorrector.geometry();
+	const int paneCount = std::max(1, g.panes);
+	const int outW = g.outPaneW > 0 ? g.outPaneW : full.cols / paneCount;
+	const int outH = g.outPaneH > 0 ? g.outPaneH : full.rows;
+	const int innerW = g.innerW > 0 ? g.innerW : outW;
+	const int innerH = g.innerH > 0 ? g.innerH : outH;
+	const int originX = g.innerW > 0 ? g.innerX : 0;
+	const int originY = g.innerW > 0 ? g.innerY : 0;
 
 	if(resetRequested.exchange(false)) builtPanes = 0;
-	if(builtPanes != paneCount || builtPaneW != paneW || builtPaneH != paneH || builtKind != wantKind){
-		rebuildPipelines(paneCount, paneW, paneH);
+	if(builtPanes != paneCount || builtPaneW != innerW || builtPaneH != innerH || builtKind != wantKind){
+		rebuildPipelines(paneCount, innerW, innerH, originX, originY);
+	}else if(builtOriginX != originX || builtOriginY != originY){
+		retargetMaps(originX, originY);
 	}
 	const double dtSec = lastTMs < 0 ? 1.0 / 30.0 : (tMs - lastTMs) / 1000.0;
 	if(lastTMs >= 0 && (tMs < lastTMs || tMs - lastTMs > kMaxGapMs)){
@@ -500,7 +526,10 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	std::vector<std::vector<Detection>> laneDets(lanes.size());
 	for(size_t i = 0; i < lanes.size(); i++){
 		LanePipeline & lp = lanes[i];
-		const cv::Mat pane = full(cv::Rect(lp.lane.pane * paneW, 0, paneW, paneH));
+		const cv::Rect paneRoi(lp.lane.pane * outW, 0, outW, outH);
+		if(paneRoi.x < 0 || paneRoi.width <= 0 || paneRoi.height <= 0
+		   || paneRoi.x + paneRoi.width > full.cols || paneRoi.y + paneRoi.height > full.rows) continue;
+		const cv::Mat pane = full(paneRoi);
 		cv::Mat laneImg;
 		lp.map.warp(pane, laneImg, cv::INTER_LINEAR);
 
@@ -587,7 +616,7 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 			inputs[i].laneW = lanes[i].laneW;
 			inputs[i].laneH = lanes[i].laneH;
 		}
-		shapes.beginFrame(fullBgr, paneW, paneH, ++frameCounter);
+		shapes.beginFrame(fullBgr, outW, outH, ++frameCounter);
 		for(size_t ci = 0; ci < res.corridors.size() && ci < corridors.size(); ci++){
 			CorridorResult & cr = res.corridors[ci];
 			const ShapeConfig scfg = cfg.shapeFor(cr.id);
@@ -618,8 +647,12 @@ bool TrackingManager::processFrame(const uint8_t * data, size_t size, double tMs
 	res.detectMs = detectMs;
 	res.trackMs = trackMs;
 	res.shapeMs = shapeMs;
-	res.analysisW = paneW;
-	res.analysisH = paneH;
+	res.analysisW = outW;
+	res.analysisH = outH;
+	res.lensInnerX = originX;
+	res.lensInnerY = originY;
+	res.lensInnerW = innerW;
+	res.lensInnerH = innerH;
 	res.detectorName = kindName(builtKind);
 	return true;
 }

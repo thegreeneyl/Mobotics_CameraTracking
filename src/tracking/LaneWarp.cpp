@@ -26,7 +26,7 @@ LaneConfig fullPane(){
 
 } // namespace
 
-LaneMap LaneMap::build(const LaneConfig & laneIn, float paneW, float paneH){
+LaneMap LaneMap::build(const LaneConfig & laneIn, float paneW, float paneH, float originX, float originY){
 	LaneMap map;
 	if(paneW < 1.0f) paneW = 1.0f;
 	if(paneH < 1.0f) paneH = 1.0f;
@@ -64,10 +64,10 @@ LaneMap LaneMap::build(const LaneConfig & laneIn, float paneW, float paneH){
 		seg.u1 = acc[static_cast<size_t>(i + 1)];
 		const cv::Point2f src[4] = {{seg.u0, 0}, {seg.u1, 0}, {seg.u1, 1}, {seg.u0, 1}};
 		const cv::Point2f dst[4] = {
-			{top[i][0] * paneW, top[i][1] * paneH},
-			{top[i + 1][0] * paneW, top[i + 1][1] * paneH},
-			{bottom[i + 1][0] * paneW, bottom[i + 1][1] * paneH},
-			{bottom[i][0] * paneW, bottom[i][1] * paneH}};
+			{originX + top[i][0] * paneW, originY + top[i][1] * paneH},
+			{originX + top[i + 1][0] * paneW, originY + top[i + 1][1] * paneH},
+			{originX + bottom[i + 1][0] * paneW, originY + bottom[i + 1][1] * paneH},
+			{originX + bottom[i][0] * paneW, originY + bottom[i][1] * paneH}};
 		seg.unitToPane = cv::getPerspectiveTransform(src, dst);
 	}
 	map.ok = !map.segs.empty() && !map.segs[0].unitToPane.empty();

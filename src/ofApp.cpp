@@ -157,6 +157,47 @@ void loadFrameTexture(ofTexture & tex, const ofPixels & pixels){
 
 // The picture on screen is the lens-corrected frame. src stays untouched
 // so the same pixels can be rewarped when the sliders move.
+
+// Draws one corrected pane. paneOut is the bright filled frame (lane UV
+// 0..1). The recovered border around it is veiled, so the pixels the crop
+// had thrown away stay visible without taking over the picture.
+void drawCorrectedPane(const ofTexture & tex, float texX, float texW, float texH,
+                       float x, float y, float w, float h,
+                       int innerX, int innerY, int innerW, int innerH,
+                       ofRectangle & paneOut){
+	ofSetColor(255);
+	tex.drawSubsection(x, y, w, h, texX, 0, texW, texH);
+	const bool ghost = innerW > 0 && innerH > 0 && texW > 0 && texH > 0
+		&& (innerX > 0 || innerY > 0 || innerX + innerW < texW - 0.5f || innerY + innerH < texH - 0.5f);
+	if(!ghost){
+		paneOut.set(x, y, w, h);
+		return;
+	}
+	const float sx = w / texW;
+	const float sy = h / texH;
+	paneOut.set(x + innerX * sx, y + innerY * sy, innerW * sx, innerH * sy);
+	ofEnableAlphaBlending();
+	ofSetColor(0, 0, 0, 150);
+	ofFill();
+	const float left = paneOut.x - x;
+	const float right = (x + w) - paneOut.getRight();
+	const float top = paneOut.y - y;
+	const float bottom = (y + h) - paneOut.getBottom();
+	if(left > 0.5f) ofDrawRectangle(x, y, left, h);
+	if(right > 0.5f) ofDrawRectangle(paneOut.getRight(), y, right, h);
+	if(top > 0.5f) ofDrawRectangle(paneOut.x, y, paneOut.width, top);
+	if(bottom > 0.5f) ofDrawRectangle(paneOut.x, paneOut.getBottom(), paneOut.width, bottom);
+	ofSetColor(255);
+}
+
+void clampLaneDrag(const LensGeometry & g, const ofRectangle & pane, int x, int y, float & u, float & v){
+	u = pane.width > 0 ? (x - pane.x) / pane.width : 0.0f;
+	v = pane.height > 0 ? (y - pane.y) / pane.height : 0.0f;
+	float u0, v0, u1, v1;
+	g.uvLimits(u0, v0, u1, v1);
+	u = std::min(u1, std::max(u0, u));
+	v = std::min(v1, std::max(v0, v));
+}
 void uploadCorrected(ofTexture & tex, const ofPixels & src, LensCorrector & corr){
 	if(!src.isAllocated()) return;
 	const int w = static_cast<int>(src.getWidth());
@@ -281,6 +322,7 @@ void ofApp::setup(){
 	gui.add(playbackParam);
 	gui.add(trackingParam);
 	gui.add(overlayParam);
+	gui.add(imageScaleParam);
 	gui.add(showMaskParam);
 	gui.add(showDetectionsParam);
 	gui.add(showPixelsParam);
@@ -887,45 +929,65 @@ void ofApp::drawVideo(){
 	}
 
 	ofSetColor(255);
-	const bool splitBoth = tex.getWidth() >= tex.getHeight() * 2;
+	const LensGeometry lensGeo = displayLens.geometry();
+	const bool geo = lensGeo.outPaneW > 0 && lensGeo.outPaneH > 0 && lensGeo.panes > 0
+		&& std::abs(tex.getWidth() - lensGeo.panes * lensGeo.outPaneW) < 1.5
+		&& std::abs(tex.getHeight() - lensGeo.outPaneH) < 1.5;
+	const bool splitBoth = geo ? lensGeo.panes >= 2 : tex.getWidth() >= tex.getHeight() * 2;
+	const float extW = geo ? static_cast<float>(lensGeo.outPaneW)
+	                       : tex.getWidth() / (splitBoth ? 2.0f : 1.0f);
+	const float extH = geo ? static_cast<float>(lensGeo.outPaneH) : tex.getHeight();
+	const int innerX = geo ? lensGeo.innerX : 0;
+	const int innerY = geo ? lensGeo.innerY : 0;
+	const int innerW = geo ? lensGeo.innerW : static_cast<int>(extW);
+	const int innerH = geo ? lensGeo.innerH : static_cast<int>(extH);
 
+	// 1 fits the whole corrected picture, border included. Higher values
+	// enlarge it around the center and clip to the video area.
+	const float zoom = std::max(1.0f, imageScaleParam.get());
+	std::vector<float> paneFitW;
+	beginScissor(viewport);
 	if(splitBoth){
 		// one BOTH frame = M1 | M2 side by side; draw as two panes with a gap
-		const float halfW = tex.getWidth() / 2.0f;
-		const float texH = tex.getHeight();
 		const float gap = 4;
 		const float paneW = (viewport.width - gap) / 2.0f;
-		const float scale = std::min(paneW / halfW, viewport.height / texH);
-		const float drawW = halfW * scale;
-		const float drawH = texH * scale;
+		const float fit = std::min(paneW / extW, viewport.height / extH);
+		const float drawW = extW * fit * zoom;
+		const float drawH = extH * fit * zoom;
 		const float y = viewport.y + (viewport.height - drawH) / 2.0f;
 		const float x0 = viewport.x + (paneW - drawW) / 2.0f;
 		const float x1 = viewport.x + paneW + gap + (paneW - drawW) / 2.0f;
-		tex.drawSubsection(x0, y, drawW, drawH, 0, 0, halfW, texH);
-		tex.drawSubsection(x1, y, drawW, drawH, halfW, 0, halfW, texH);
-		paneRects.emplace_back(x0, y, drawW, drawH); // module 0 (M1)
-		paneRects.emplace_back(x1, y, drawW, drawH); // module 1 (M2)
+		ofRectangle r0, r1;
+		drawCorrectedPane(tex, 0, extW, extH, x0, y, drawW, drawH, innerX, innerY, innerW, innerH, r0);
+		drawCorrectedPane(tex, extW, extW, extH, x1, y, drawW, drawH, innerX, innerY, innerW, innerH, r1);
+		paneRects.push_back(r0); // module 0 (M1)
+		paneRects.push_back(r1); // module 1 (M2)
+		paneFitW.push_back(extW * fit);
+		paneFitW.push_back(extW * fit);
 		ofSetColor(200);
-		ofDrawBitmapString("M1 (left)", x0 + 6, y + 16);
-		ofDrawBitmapString("M2 (right)", x1 + 6, y + 16);
+		ofDrawBitmapString("M1 (left)", r0.x + 6, r0.y + 16);
+		ofDrawBitmapString("M2 (right)", r1.x + 6, r1.y + 16);
 		ofSetColor(255);
 	}else{
-		const float scale = std::min(viewport.width / tex.getWidth(),
-		                             viewport.height / tex.getHeight());
-		const float drawW = tex.getWidth() * scale;
-		const float drawH = tex.getHeight() * scale;
+		const float fit = std::min(viewport.width / extW, viewport.height / extH);
+		const float drawW = extW * fit * zoom;
+		const float drawH = extH * fit * zoom;
 		const float x = viewport.x + (viewport.width - drawW) / 2.0f;
 		const float y = viewport.y + (viewport.height - drawH) / 2.0f;
-		tex.draw(x, y, drawW, drawH);
-		paneRects.emplace_back(x, y, drawW, drawH); // single module
+		ofRectangle r;
+		drawCorrectedPane(tex, 0, extW, extH, x, y, drawW, drawH, innerX, innerY, innerW, innerH, r);
+		paneRects.push_back(r); // single module
+		paneFitW.push_back(extW * fit);
 	}
 
 	syncEditLayout(static_cast<int>(paneRects.size()));
 
 	// lane result rects: one column per pane, the pane's lanes stacked in
 	// rows; each cell keeps the rectified lane's aspect
-	const float texPaneW = tex.getWidth() / paneRects.size();
-	const float texPaneH = tex.getHeight();
+	// Lane aspect is measured on the filled frame, not the extended mat,
+	// so a lane that stays inside 0..1 keeps the size it had before.
+	const float texPaneW = innerW > 0 ? static_cast<float>(innerW) : tex.getWidth() / paneRects.size();
+	const float texPaneH = innerH > 0 ? static_cast<float>(innerH) : tex.getHeight();
 	std::vector<int> rowsInPane(paneRects.size(), 0);
 	for(const auto & lane : editLayout.lanes){
 		if(lane.pane >= 0 && lane.pane < static_cast<int>(rowsInPane.size())) rowsInPane[lane.pane]++;
@@ -939,7 +1001,7 @@ void ofApp::drawVideo(){
 		const float cellH = (resultView.height - splitGap * (rows - 1)) / rows;
 		const float cellY = resultView.y + rowCursor[lane.pane]++ * (cellH + splitGap);
 		const float aspect = lane.aspect(texPaneW, texPaneH);
-		float w = paneRects[lane.pane].width;
+		float w = paneFitW[lane.pane];
 		float h = w / aspect;
 		if(h > cellH){ h = cellH; w = h * aspect; }
 		if(h < 40){ h = std::min(40.0f, cellH); }
@@ -962,6 +1024,7 @@ void ofApp::drawVideo(){
 
 	drawTrackingOverlay();
 	drawLaneEditor();
+	endScissor();
 	if(resultViewParam == 0) drawCanvasView();
 	else drawTrackingResults();
 }
@@ -1804,8 +1867,8 @@ void ofApp::mousePressed(int x, int y, int){
 		if(insLane >= 0){
 			tracking::LaneConfig & lane = editLayout.lanes[insLane];
 			const ofRectangle & pane = paneRects[lane.pane];
-			const float ux = ofClamp((x - pane.x) / pane.width, 0, 1);
-			const float uy = ofClamp((y - pane.y) / pane.height, 0, 1);
+			float ux, uy;
+			clampLaneDrag(displayLens.geometry(), pane, x, y, ux, uy);
 			const int at = lane.insertStation(insEdge, insSeg, insT, ux, uy);
 			if(at >= 0){
 				dragLane = insLane;
@@ -1915,10 +1978,11 @@ void ofApp::mouseDragged(int x, int y, int){
 	if(lane.pane < 0 || lane.pane >= static_cast<int>(paneRects.size())) return;
 	const ofRectangle & pane = paneRects[lane.pane];
 	if(pane.width <= 0 || pane.height <= 0) return;
-	// stations stay inside the pane
-	lane.setStation(dragEdge, dragStation,
-	                ofClamp((x - pane.x) / pane.width, 0, 1),
-	                ofClamp((y - pane.y) / pane.height, 0, 1));
+	// stations stay inside the recovered picture (the bright frame plus
+	// the dim border). Past that there is no sensor pixel.
+	float ux, uy;
+	clampLaneDrag(displayLens.geometry(), pane, x, y, ux, uy);
+	lane.setStation(dragEdge, dragStation, ux, uy);
 }
 
 void ofApp::mouseReleased(int, int, int){

@@ -26,7 +26,12 @@ struct LaneMap {
 	bool ok = false;
 
 	// Geometry only (toPane). An unwarpable strip falls back to the full pane.
-	static LaneMap build(const LaneConfig & lane, float paneW, float paneH);
+	// paneW/paneH are the pixel size of lane UV 0..1 (the filled frame).
+	// originX/Y is that frame's top-left in the mat warp() samples, so a
+	// station past 0..1 lands in the recovered border. Both default to a
+	// mat that is the filled frame itself.
+	static LaneMap build(const LaneConfig & lane, float paneW, float paneH,
+	                     float originX = 0, float originY = 0);
 
 	// Rectified pixel size, same rules as the old quad (cap width, floor height).
 	void rectifiedSize(int maxW, int minH, int paneLimitH, int & w, int & h) const;

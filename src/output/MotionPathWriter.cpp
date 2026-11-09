@@ -114,22 +114,29 @@ std::vector<MotionObject> fromTrackingResults(const tracking::TrackingResults & 
 			// stays rectangular in corridor/canvas space; this pane box is
 			// only the photo-space bound of that rectangle after the strip
 			// warp (one homography, or one per slice when the lane curves).
-			const float paneW = res.analysisW > 0 ? static_cast<float>(res.analysisW) : 1.0f;
-			const float paneH = res.analysisH > 0 ? static_cast<float>(res.analysisH) : 1.0f;
+			// Pane boxes stay in filled-frame UV (0..1), which is where the
+			// lanes are stored. A box that reaches into the recovered
+			// border is simply outside 0..1.
+			const float uvW = res.lensInnerW > 0 ? static_cast<float>(res.lensInnerW)
+			                                     : (res.analysisW > 0 ? static_cast<float>(res.analysisW) : 1.0f);
+			const float uvH = res.lensInnerH > 0 ? static_cast<float>(res.lensInnerH)
+			                                     : (res.analysisH > 0 ? static_cast<float>(res.analysisH) : 1.0f);
+			const float originX = res.lensInnerW > 0 ? static_cast<float>(res.lensInnerX) : 0.0f;
+			const float originY = res.lensInnerW > 0 ? static_cast<float>(res.lensInnerY) : 0.0f;
 			for(int li : cr.lanes){
 				if(li < 0 || li >= static_cast<int>(res.lanes.size())) continue;
 				const tracking::LaneConfig & lane = res.lanes[li].lane;
 				float lx0, lx1;
 				if(!lane.corridorRangeToLane(o.x0, o.x1, lx0, lx1)) continue;
-				const tracking::LaneMap map = tracking::LaneMap::build(lane, paneW, paneH);
+				const tracking::LaneMap map = tracking::LaneMap::build(lane, uvW, uvH, originX, originY);
 				const cv::Rect2f b = map.paneBounds(lx0, lx1, o.y0, o.y1);
 				if(b.width <= 0 || b.height <= 0) continue;
 				MotionObject::PaneBox pb;
 				pb.pane = lane.pane;
-				pb.x = b.x / paneW;
-				pb.y = b.y / paneH;
-				pb.w = b.width / paneW;
-				pb.h = b.height / paneH;
+				pb.x = (b.x - originX) / uvW;
+				pb.y = (b.y - originY) / uvH;
+				pb.w = b.width / uvW;
+				pb.h = b.height / uvH;
 				mo.panes.push_back(pb);
 			}
 			out.push_back(std::move(mo));

@@ -66,13 +66,40 @@ cv::Scalar colorForId(int id){
 	return cv::Scalar(b * 255, g * 255, r * 255);
 }
 
+// Filled-frame UV inside a corrected image. Falls back to the whole pane
+// when the geometry does not belong to this image (a different decode size).
+struct UvFrame {
+	float ox = 0, oy = 0, uw = 1, uh = 1, pw = 1, ph = 1;
+};
+
+UvFrame uvFrame(const cv::Mat & img, int paneCount, const LensGeometry & g){
+	UvFrame f;
+	const bool match = g.panes == paneCount && g.outPaneW > 0 && g.outPaneH > 0
+		&& g.innerW > 0 && g.innerH > 0
+		&& img.cols == g.panes * g.outPaneW && img.rows == g.outPaneH;
+	if(match){
+		f.ox = static_cast<float>(g.innerX);
+		f.oy = static_cast<float>(g.innerY);
+		f.uw = static_cast<float>(g.innerW);
+		f.uh = static_cast<float>(g.innerH);
+		f.pw = static_cast<float>(g.outPaneW);
+		f.ph = static_cast<float>(g.outPaneH);
+	}else{
+		f.pw = static_cast<float>(img.cols) / std::max(1, paneCount);
+		f.ph = static_cast<float>(img.rows);
+		f.uw = f.pw;
+		f.uh = f.ph;
+	}
+	return f;
+}
+
 // Draws the tracked objects of one snapshot onto a BGR thumbnail of the
 // frame. Corridor coordinates are mapped back into each lane and projected
 // onto the photo through the lane quad. Raw detections are drawn thin.
-void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tSec){
+void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tSec, const LensGeometry & lens){
 	const int paneCount = std::max(1, res.paneCount);
-	const float paneW = static_cast<float>(img.cols) / paneCount;
-	const float paneH = static_cast<float>(img.rows);
+	const UvFrame fr = uvFrame(img, paneCount, lens);
+	const float paneW = fr.pw;
 
 	std::vector<tracking::LaneMap> laneMaps(res.lanes.size());
 	const auto projectLane = [&](const tracking::LaneMap & map, float paneOffset, float u, float v){
@@ -82,12 +109,12 @@ void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tS
 	};
 	for(size_t li = 0; li < res.lanes.size(); li++){
 		const tracking::LaneConfig & lane = res.lanes[li].lane;
-		laneMaps[li] = tracking::LaneMap::build(lane, paneW, paneH);
+		laneMaps[li] = tracking::LaneMap::build(lane, fr.uw, fr.uh, fr.ox, fr.oy);
 		const float paneOffset = lane.pane * paneW;
 		std::vector<std::array<float, 2>> top, bottom;
 		lane.borders(top, bottom);
 		const auto pt = [&](const std::array<float, 2> & p){
-			return cv::Point2f(paneOffset + p[0] * paneW, p[1] * paneH);
+			return cv::Point2f(paneOffset + fr.ox + p[0] * fr.uw, fr.oy + p[1] * fr.uh);
 		};
 		for(size_t i = 0; i + 1 < top.size(); i++){
 			cv::line(img, pt(top[i]), pt(top[i + 1]), cv::Scalar(60, 210, 255), 1, cv::LINE_AA);
@@ -182,15 +209,16 @@ void drawOverlay(cv::Mat & img, const tracking::TrackingResults & res, double tS
 // Detector's-eye view for one snapshot: per lane the rectified strip (as the
 // detector sees it, at mask resolution) with the raw detections drawn, and
 // the fused motion mask below it. Lanes are stacked vertically.
-cv::Mat stripSheet(const cv::Mat & frame, const tracking::TrackingResults & res){
+cv::Mat stripSheet(const cv::Mat & frame, const tracking::TrackingResults & res, const LensGeometry & lens){
 	const int paneCount = std::max(1, res.paneCount);
-	const float paneW = static_cast<float>(frame.cols) / paneCount;
-	const float paneH = static_cast<float>(frame.rows);
+	const UvFrame fr = uvFrame(frame, paneCount, lens);
+	const float paneW = fr.pw;
+	const float paneH = fr.ph;
 	std::vector<cv::Mat> rows;
 	int width = 0;
 	for(const auto & ld : res.lanes){
 		if(ld.maskW <= 0 || ld.maskH <= 0) continue;
-		tracking::LaneMap map = tracking::LaneMap::build(ld.lane, paneW, paneH);
+		tracking::LaneMap map = tracking::LaneMap::build(ld.lane, fr.uw, fr.uh, fr.ox, fr.oy);
 		map.prepare(ld.maskW, ld.maskH);
 		const cv::Mat pane = frame(cv::Rect(ld.lane.pane * static_cast<int>(paneW), 0,
 		                                    static_cast<int>(paneW), static_cast<int>(paneH)));
@@ -364,7 +392,7 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 			if(jpegdecode::decodeToBgrMat(jpeg.data(), jpeg.size(), bgr, 4)){
 				cv::Mat corrected;
 				sheetLens.apply(bgr, corrected);
-				drawOverlay(corrected, res, tSec);
+				drawOverlay(corrected, res, tSec, sheetLens.geometry());
 				bgr = corrected;
 				thumbs.push_back(bgr);
 			}
@@ -376,7 +404,7 @@ int runRecording(const Options & opts, const tracking::LoadedTrackingConfig & lo
 				cv::Mat corrected;
 				sheetLens.apply(bgr, corrected);
 				ofDirectory::createDirectory(stripDir, false, true);
-				saveBgr(stripSheet(corrected, res), ofFilePath::join(stripDir,
+				saveBgr(stripSheet(corrected, res, sheetLens.geometry()), ofFilePath::join(stripDir,
 					reader.name() + "_" + ofToString(tSec, 1, 6, '0') + ".jpg"));
 			}
 		}

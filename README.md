@@ -100,8 +100,9 @@ entry is a stub for later.
   With only the four corners it is the old quad. **Shift-click** a border
   (or double-click it) to add an anchor anywhere along that edge; the other
   border gets the matching point, and you drag either one. **Delete** or
-  **Backspace** removes the selected anchor (not the four corners). Only
-  pixels inside a lane are analysed. Each slice between anchors is
+  **Backspace** removes the selected anchor (not the four corners). Anchors
+  can be dragged into the dim border around the picture (sensor pixels the
+  lens crop had dropped). Only pixels inside a lane are analysed. Each slice between anchors is
   perspective-warped into the next section of one upright rectangle before
   detection, so a lane can follow a curve and the tracking view below is
   still flat. A crossed/collapsed slice turns red and is ignored until it
@@ -225,6 +226,16 @@ removes that. Drag `fov deg` while a train is in frame until the deck is a
 straight line. Lane corners placed before the correction was
 turned on sat on the distorted image and will miss the viaduct until you
 drag them back onto it.
+
+Filling the frame (`balance` 0) throws away a band of the sensor, mostly
+toward the corners. That band is drawn dimmed around the bright picture,
+and a lane anchor can be dragged into it. `0..1` is still the bright
+frame, so lanes already placed do not move; a point past that is simply
+out in the dim border. The tracker samples those pixels, so a corridor
+pulled past the frame sees a boat or train there. Past the last real
+pixel the border is black and nothing is tracked. The stream panel's
+`image scale` only changes how large that picture is drawn (1 fits the
+border, 1.5 is the default). It does not change the lens or the tracking.
 
 ### Lanes and corridors
 

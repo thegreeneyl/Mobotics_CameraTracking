@@ -162,7 +162,9 @@ private:
 	};
 
 	void threadFn();
-	void rebuildPipelines(int paneCount, int paneW, int paneH);
+	void rebuildPipelines(int paneCount, int paneW, int paneH, int originX, int originY);
+	// Lens margin moved: rebuild the warps in place. Tracks stay.
+	void retargetMaps(int originX, int originY);
 	void applyPendingConfig(); // worker thread only
 	void applyParams();        // push cfg params into live detectors/trackers
 	std::unique_ptr<IDetector> makeDetector(const std::string & corridorId);
@@ -195,6 +197,7 @@ private:
 	std::vector<CorridorPipeline> corridors;
 	std::string layoutName;
 	int builtPanes = 0, builtPaneW = 0, builtPaneH = 0;
+	int builtOriginX = 0, builtOriginY = 0;
 	int builtKind = -1;
 	bool yoloUnavailable = false;
 	double lastTMs = -1;

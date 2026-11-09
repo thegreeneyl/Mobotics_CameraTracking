@@ -11,13 +11,17 @@ namespace tracking {
 namespace {
 float clamp01(float v){ return std::min(1.0f, std::max(0.0f, v)); }
 
+// Lane stations: 0..1 is the filled frame, outside it is the recovered
+// border. A hard stop only rejects a corrupt file.
+float clampPaneUv(float v){ return std::min(5.0f, std::max(-4.0f, v)); }
+
 bool parseQuad(const ofJson & arr, FrameQuad & quad){
 	if(!arr.is_array() || arr.size() != 4) return false;
 	FrameQuad q;
 	for(int i = 0; i < 4; i++){
 		if(!arr[i].is_array() || arr[i].size() < 2) return false;
-		q.pts[i][0] = clamp01(arr[i][0].get<float>());
-		q.pts[i][1] = clamp01(arr[i][1].get<float>());
+		q.pts[i][0] = clampPaneUv(arr[i][0].get<float>());
+		q.pts[i][1] = clampPaneUv(arr[i][1].get<float>());
 	}
 	quad = q;
 	return true;
@@ -35,7 +39,7 @@ bool parsePolyline(const ofJson & arr, std::vector<std::array<float, 2>> & pts){
 	out.reserve(arr.size());
 	for(const auto & p : arr){
 		if(!p.is_array() || p.size() < 2) return false;
-		out.push_back({clamp01(p[0].get<float>()), clamp01(p[1].get<float>())});
+		out.push_back({clampPaneUv(p[0].get<float>()), clampPaneUv(p[1].get<float>())});
 	}
 	pts = std::move(out);
 	return true;

@@ -147,6 +147,9 @@ private:
 	ofParameter<bool> playbackParam{"playback mode (TAB)", false};
 	ofParameter<bool> trackingParam{"tracking (t)", true};
 	ofParameter<bool> overlayParam{"overlay (o)", true};
+	// View zoom of the corrected picture. 1 fits the dim border in the
+	// video area; higher crops that border and makes the bright frame larger.
+	ofParameter<float> imageScaleParam{"image scale", 1.5f, 1.0f, 3.0f};
 	ofParameter<bool> showMaskParam{"motion mask (m)", true};
 	ofParameter<bool> showDetectionsParam{"raw detections (d)", true};
 	// the three result layers per tracked object, each switchable

@@ -31,23 +31,66 @@ struct LensCorrection {
 	bool operator!=(const LensCorrection & o) const { return !(*this == o); }
 };
 
+// One corrected pane. Lane UV 0..1 is the filled frame (what balance crops
+// to): innerX/innerY is that frame's top-left inside the output pane, and
+// innerW/innerH is its size. The output is larger when the sensor still had
+// pixels outside that crop; those pixels are the border around the inner
+// rect. A disabled correction is the source pane with no border.
+struct LensGeometry {
+	int panes = 1;
+	int outPaneW = 0;
+	int outPaneH = 0;
+	int innerX = 0;
+	int innerY = 0;
+	int innerW = 0;
+	int innerH = 0;
+
+	bool hasMargin() const {
+		return innerW > 0 && innerH > 0 && outPaneW > 0 && outPaneH > 0
+			&& (innerX > 0 || innerY > 0 || innerX + innerW < outPaneW || innerY + innerH < outPaneH);
+	}
+
+	// Image UV that still lands inside the output. 0..1 is the filled frame.
+	void uvLimits(float & u0, float & v0, float & u1, float & v1) const {
+		if(innerW <= 0 || innerH <= 0){
+			u0 = v0 = 0.0f;
+			u1 = v1 = 1.0f;
+			return;
+		}
+		u0 = -static_cast<float>(innerX) / static_cast<float>(innerW);
+		v0 = -static_cast<float>(innerY) / static_cast<float>(innerH);
+		u1 = static_cast<float>(outPaneW - innerX) / static_cast<float>(innerW);
+		v1 = static_cast<float>(outPaneH - innerY) / static_cast<float>(innerH);
+	}
+};
+
 // Not thread-safe: one instance per thread (the display thread and the
 // tracking worker each keep their own). Maps are cached for the pane size.
+// apply() writes an image of panes * geometry().outPaneW by outPaneH.
 class LensCorrector {
 public:
 	void set(const LensCorrection & correction){ params = correction; }
 
 	const LensCorrection & get() const { return params; }
 
-	// Writes the corrected frame into dst (same size and type as src).
-	// A disabled correction copies src through.
+	// Valid after apply(). Identity (no border) until the first successful
+	// correction, and whenever correction is disabled or the map fails.
+	const LensGeometry & geometry() const { return geom; }
+
+	// Writes the corrected frame into dst. The filled frame sits at
+	// geometry().innerX/innerY inside each pane; the border around it is
+	// sensor content the filled crop would have dropped (black where the
+	// sensor has no pixel). A disabled correction copies src through.
 	void apply(const cv::Mat & src, cv::Mat & dst);
 
 private:
 	void ensureMaps(int paneW, int paneH);
+	static LensGeometry identity(int panes, int paneW, int paneH);
 
 	LensCorrection params;
 	LensCorrection built;
+	LensGeometry builtGeom; // matches map1/map2
+	LensGeometry geom;      // published by the last apply()
 	int builtW = 0;
 	int builtH = 0;
 	cv::Mat map1, map2;

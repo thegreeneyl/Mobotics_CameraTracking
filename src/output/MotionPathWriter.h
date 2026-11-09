@@ -42,8 +42,9 @@ struct MotionObject {
 	// lane), uncut — extra field for debugging / consumers that re-place.
 	struct CorridorBox { float x = 0, y = 0, w = 0, h = 0, vx = 0, vy = 0; };
 	CorridorBox corridor;
-	// Per-pane back-projection [pane, x, y, w, h] in pane UV (0..1) for
-	// overlay/debug — extra field, ignored by the motion-path.v1 parser.
+	// Per-pane back-projection [pane, x, y, w, h] in filled-frame UV
+	// (0..1; outside that is the recovered lens border) for overlay/debug
+	// — extra field, ignored by the motion-path.v1 parser.
 	struct PaneBox { int pane = 0; float x = 0, y = 0, w = 0, h = 0; };
 	std::vector<PaneBox> panes;
 	// Silhouette as a closed polygon on the canvas (same space as bbox,
