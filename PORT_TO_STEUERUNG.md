@@ -96,10 +96,10 @@ Where the two differ, the Steuerung document wins.
 - [x] **11. Poll `resultJson()` on the main thread** (read when
   `resultRevision()` changes) and leave it unused by the manifest. Do not open
   a socket for it.
-- [ ] **12. Linux later.** macOS can ship first. `util/JpegDecode.*` is Apple
-  ImageIO; before a Linux build of Steuerung, replace that one implementation
-  with libjpeg-turbo. Callers (`MobotixMjpegClient`, `MjpegPlayer`,
-  `TrackingManager`) stay as they are.
+- [x] **12. Linux JPEG decode.** `util/JpegDecode.*` is ImageIO on macOS and
+  libjpeg-turbo on Linux (`libturbojpeg0-dev`, linked from Steuerung's
+  `config.make`). Callers (`MobotixMjpegClient`, `MjpegPlayer`,
+  `TrackingManager`) are unchanged.
 - [x] **13. Build Steuerung and check** (macOS; live stream and export still need a reachable camera): live stream, playback of a copied
   recording, an anchor edit saved back into `trackingConfig.json`, a motion
   export file in `recordingsDir`, and `resultJson()` changing when a new
