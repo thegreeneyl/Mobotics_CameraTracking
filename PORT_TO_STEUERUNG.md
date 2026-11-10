@@ -16,40 +16,47 @@ and `tools/eval/`. Do not bring any of them back in Steuerung.
 
 ## Already in Steuerung
 
-The Tracking tab is already there, between Schedule and Log.
-`CameraTrackingView` is registered and draws an empty state; `layout.json`
-has the node and `views.cameraTracking`. Do not add a second tab. How that
-view has to grow — widgets, zoom, scroll, keyboard, and where `stop()`
-goes — is
+The port is done on macOS. The Tracking tab (between Brightness and Log) is
+a three-pane split drawn by `CameraTrackingView`; the Brightness tab
+(between Schedule and Tracking) drives the Art-Net gain from the MultiSense
+readings. What is where, how the config was split, and what is still to be
+exercised against a live camera is
 [docs/CAMERA_TRACKING.md](../YOUniverse_Steuerung/docs/CAMERA_TRACKING.md).
-Follow it together with the checklist. Where the two differ, the Steuerung
-document wins.
+Where the two differ, the Steuerung document wins.
 
 ## Checklist
 
-- [ ] **1. Copy the source folders** into `YOUniverse_Steuerung/src`, keeping
+- [x] **1. Copy the source folders** into `YOUniverse_Steuerung/src`, keeping
   the folder names so the existing relative includes still resolve:
   `mobotix/`, `recording/MjpegPlayer.*` and `recording/MjpegRecorder.*`,
   `tracking/`, `util/`, `output/MotionPathWriter.*`,
   `session/CameraTrackingSession.*`. None of these includes ofxGui, textures or
   OpenGL.
-- [ ] **2. Add `ofxOpenCv`** to Steuerung's `addons.make`. Do not add `ofxGui`.
+- [x] **2. Add `ofxOpenCv`** to Steuerung's `addons.make`. Do not add `ofxGui`.
   Both apps share this openFrameworks tree, so the OpenCV that already links
   `SegModel` (cv::dnn) is the one to use.
-- [ ] **3. Copy the shape model** `bin/data/models/yolov8n-seg-192x640.onnx`
+- [x] **3. Copy the shape model** `bin/data/models/yolov8n-seg-192x640.onnx`
   into Steuerung's `bin/data/models/`. `tracking.shape.model` in the config
   stays a data-relative path.
-- [ ] **4. Copy the recordings** that are then in CameraTracking's
+- [x] **4. Copy the recordings** that are then in CameraTracking's
   `bin/data/recordings/` into Steuerung's `bin/data/recordings/` — they are the
   debug library for playback. Do not copy `recordings-old/`. Gitignore the
   directory if the files are large, as CameraTracking does.
-- [ ] **5. Copy the cleaned config** `bin/data/config/config.json` to
-  Steuerung's `bin/data/config/trackingConfig.json` (the name can still
-  change). Do not merge it into Steuerung's `config.json`. Load it with
-  `session.load("config/trackingConfig.json")`; the same path is the save
-  target. Revisit the `single_low` layout filter `recordings: ["14-18-08"]` if
-  that take is no longer in the library.
-- [ ] **6. Own a `CameraTrackingSession` on Steuerung's `ofApp`**, like
+- [x] **5. Split the config** instead of copying it whole. Steuerung already
+  has homes for two of its parts, so `bin/data/config/config.json` was taken
+  apart: the camera (`ip`, `user`, `stream`, `fps`, `preview`, `previewSize`,
+  `quality`, `cameraId`) is the `role: "tracking"` entry in Steuerung's
+  `devices.json`; the password is in the gitignored
+  `config/secrets.json` (`cameras.<cameraId>.password`,
+  `secrets.example.json` is the template); `recordingsDir` is
+  `tracking.recordingsDir` in Steuerung's `config.json`; `display` and
+  `tracking` are the committed `config/trackingConfig.json`, loaded with
+  `session.load("config/trackingConfig.json")` and the only thing
+  `saveConfig()` writes. The lux curve for the facade level is a separate
+  committed `config/brightness.json`. Nothing was merged into Steuerung's
+  `config.json` beyond the one path. See Steuerung's
+  `bin/data/CONFIGURATION.md`.
+- [x] **6. Own a `CameraTrackingSession` on Steuerung's `ofApp`**, like
   `DeviceManager`. `load()` + `start()` at the end of `initialLoad()`,
   `update()` in `ofApp::update()` before `playbackController.update(...)`,
   `stop()` in the quit callback registered in `ofApp::setup`
@@ -57,41 +64,43 @@ document wins.
   `ofApp::exit()` only intercepts the window close and must not stop the
   session. The tracking worker thread must never touch OpenGL —
   only the main thread uploads `takePreview()` pixels into a texture.
-- [ ] **7. Hand the session to `UILayout`** through a setter
+- [x] **7. Hand the session to `UILayout`** through a setter
   (`setCameraTrackingSession(CameraTrackingSession*)`), the same pattern as
   `setAppState`.
-- [ ] **8. Fill `src/ui/CameraTrackingView`.** The class, the
+- [x] **8. Fill `src/ui/CameraTrackingView`.** The class, the
   `"cameraTracking"` branch in `UILayout::drawView`, the Tracking tab and
   `views.cameraTracking` already exist and draw an empty state. Replace
   that drawing with `UIPanel`, `UITheme` and `UIControls` (`drawButton`,
   `drawCheckbox`). No ofxGui, no `ofParameter`. Widget, zoom, scroll and
   keyboard rules are in Steuerung's `docs/CAMERA_TRACKING.md`.
-- [ ] **9. Rebuild the operator surface** on that view, calling the session
+- [x] **9. Rebuild the operator surface** on that view, calling the session
   only: lane anchors and `s0`/`s1` (hit-test in `UIPanel::toLocal`, keep the
   edited `LayoutConfig` in the view, re-seed it when `layoutRevision()`
   changes, commit with `setLayout()` on mouse-up); corridor placement (drag
   calls `setPlacement()`); save (`saveConfig()`); reconnect; the view toggles
   (overlay, motion mask, raw detections, shape pixels, outline, box, result vs
-  raw, canvas vs lanes). Preview pixels and pane geometry come from
+  raw, canvas vs lanes); the MultiSense brightness from `getSensors()`
+  (top-right lux, live and playback — recordings keep it in the JPEG
+  comment). Preview pixels and pane geometry come from
   `takePreview()`, overlay data from `takeResults()`. The drawing code in
   CameraTracking's `ofApp.cpp` (`drawVideo`, `drawCanvasView`,
   `drawTrackingOverlay`, `drawLaneEditor`, `drawTrackingResults`) is the
   reference for the geometry.
-- [ ] **10. Rebuild live / playback / record / export as a transport**, not
+- [x] **10. Rebuild live / playback / record / export as a transport**, not
   checkboxes: play, pause, scrub, step, previous / next recording, record,
   export. They map to `setMode()`, `play()`, `pause()`, `seekTo()`,
   `stepFrame()`, `previousRecording()` / `nextRecording()`,
   `startRecording()` / `stopRecording()`, `startMotionExport()` /
   `stopMotionExport()`; position and duration from `positionSec()` /
   `durationSec()`.
-- [ ] **11. Poll `resultJson()` on the main thread** (read when
+- [x] **11. Poll `resultJson()` on the main thread** (read when
   `resultRevision()` changes) and leave it unused by the manifest. Do not open
   a socket for it.
 - [ ] **12. Linux later.** macOS can ship first. `util/JpegDecode.*` is Apple
   ImageIO; before a Linux build of Steuerung, replace that one implementation
   with libjpeg-turbo. Callers (`MobotixMjpegClient`, `MjpegPlayer`,
   `TrackingManager`) stay as they are.
-- [ ] **13. Build Steuerung and check**: live stream, playback of a copied
+- [x] **13. Build Steuerung and check** (macOS; live stream and export still need a reachable camera): live stream, playback of a copied
   recording, an anchor edit saved back into `trackingConfig.json`, a motion
   export file in `recordingsDir`, and `resultJson()` changing when a new
   tracking revision arrives.
