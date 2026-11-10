@@ -46,10 +46,10 @@ Where the two differ, the Steuerung document wins.
   has homes for two of its parts, so `bin/data/config/config.json` was taken
   apart: the camera (`ip`, `user`, `stream`, `fps`, `preview`, `previewSize`,
   `quality`, `cameraId`) is the `role: "tracking"` entry in Steuerung's
-  `devices.json`; the password is in the gitignored
-  `config/secrets.json` (`cameras.<cameraId>.password`,
-  `secrets.example.json` is the template); `recordingsDir` is
-  `tracking.recordingsDir` in Steuerung's `config.json`; `display` and
+  `devices.json`; the password is `tracking.cameras.<cameraId>.password`
+  in Steuerung's `config.json`, beside the API key that file already
+  carries; `recordingsDir` is
+  `tracking.recordingsDir` in the same `config.json`; `display` and
   `tracking` are the committed `config/trackingConfig.json`, loaded with
   `session.load("config/trackingConfig.json")` and the only thing
   `saveConfig()` writes. The lux curve for the facade level is a separate
